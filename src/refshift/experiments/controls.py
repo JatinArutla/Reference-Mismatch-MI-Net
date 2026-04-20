@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from copy import deepcopy
-from refshift.experiments.common import load_dataset_yaml, load_graphs, get_subject_data
+from refshift.experiments.common import load_dataset_yaml, load_graphs, get_subject_data, print_acc_table
 from refshift.training.supervised import TrainConfig, _prepare_fixed, fit_fixed_atcnet, predict_metrics
 from refshift.utils.io import save_csv, save_yaml
 from refshift.preprocessing.filters import bandpass_filter_trials
@@ -16,6 +16,7 @@ def run_controls(repo_root: Path, dataset_id: str, cache_root: str, out_dir: str
     subjects = subjects or list(ds_spec['subjects_default'])
     neighbor_map, partner_map = load_graphs(repo_root, ds_spec)
     rows = []
+    print('\n=== Running preprocessing controls ===')
     for subj in subjects:
         Xtr, ytr, Xte, yte, ch_names = get_subject_data(cache_root, dataset_id, ds_spec, int(subj))
         n_classes = int(len(np.unique(np.concatenate([ytr, yte]))))
@@ -42,5 +43,8 @@ def run_controls(repo_root: Path, dataset_id: str, cache_root: str, out_dir: str
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
     save_csv(df, out/'metrics_subject.csv')
-    save_csv(df.groupby('control', as_index=False)['acc'].mean(), out/'control_summary.csv')
+    summary_df = df.groupby('control', as_index=False)['acc'].mean().rename(columns={'control':'train_mode','acc':'acc_mean'})
+    save_csv(summary_df.rename(columns={'train_mode':'control','acc_mean':'acc'}), out/'control_summary.csv')
     save_yaml(cfg.__dict__, out/'config.yaml')
+    print('\n=== Control summary ===')
+    print_acc_table(summary_df.assign(test_mode='control'), row_key='train_mode', col_key='test_mode', value_key='acc_mean', row_order=summary_df['train_mode'].tolist(), col_order=['control'], title='Averaged accuracy (%)')

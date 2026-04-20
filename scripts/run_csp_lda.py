@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from refshift.experiments.common import MODES, load_dataset_yaml, load_graphs, get_subject_data
+from refshift.experiments.common import MODES, load_dataset_yaml, load_graphs, get_subject_data, print_acc_table
 from refshift.baselines.csp_lda import run_csp_lda
 from refshift.utils.io import save_csv
 
@@ -25,6 +25,7 @@ def main():
     subjects = list(ds_spec['subjects_default']) if args.subjects == 'default' else [int(x) for x in args.subjects.split(',') if x.strip()]
     rows=[]; mat=[]
     for train_mode in MODES:
+        print(f'\n=== Training CSP+LDA mode: {train_mode} ===')
         for test_mode in MODES:
             accs=[]
             for subj in subjects:
@@ -33,10 +34,16 @@ def main():
                 rows.append({'subject': int(subj), 'train_mode': train_mode, 'test_mode': test_mode, **metrics})
                 accs.append(metrics['acc'])
             mat.append({'train_mode': train_mode, 'test_mode': test_mode, 'acc_mean': float(np.mean(accs)), 'acc_std': float(np.std(accs))})
+        row_df = pd.DataFrame(mat)
+        row_df = row_df[row_df['train_mode'] == train_mode].copy()
+        print_acc_table(row_df, row_key='train_mode', col_key='test_mode', value_key='acc_mean', row_order=[train_mode], col_order=MODES, title='Averaged accuracy (%)')
     out=Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     save_csv(pd.DataFrame(rows), out/'metrics_subject.csv')
     save_csv(pd.DataFrame(mat), out/'matrix_subjectwise.csv')
-    save_csv(pd.DataFrame(mat).pivot(index='train_mode', columns='test_mode', values='acc_mean').reset_index(), out/'matrix_mean.csv')
+    summary_df = pd.DataFrame(mat)
+    save_csv(summary_df.pivot(index='train_mode', columns='test_mode', values='acc_mean').reset_index(), out/'matrix_mean.csv')
+    print('\n=== Final CSP+LDA 6x6 matrix ===')
+    print_acc_table(summary_df, row_key='train_mode', col_key='test_mode', value_key='acc_mean', row_order=MODES, col_order=MODES, title='Averaged accuracy (%)')
 
 if __name__ == '__main__':
     main()

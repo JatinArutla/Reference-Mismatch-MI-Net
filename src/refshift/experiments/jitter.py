@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from refshift.experiments.common import MODES, load_dataset_yaml, load_graphs, get_subject_data
+from refshift.experiments.common import MODES, load_dataset_yaml, load_graphs, get_subject_data, print_acc_table
 from refshift.training.supervised import TrainConfig, fit_jitter_atcnet, _prepare_fixed, predict_metrics
 from refshift.utils.io import save_csv, save_yaml
 
@@ -15,6 +15,7 @@ def run_jitter(repo_root: Path, dataset_id: str, cache_root: str, out_dir: str, 
     neighbor_map, partner_map = load_graphs(repo_root, ds_spec)
     rows = []
     summary = []
+    print(f'\n=== Training jitter over modes: {','.join(train_modes)} ===')
     for test_mode in MODES:
         vals = []
         for subj in subjects:
@@ -29,5 +30,9 @@ def run_jitter(repo_root: Path, dataset_id: str, cache_root: str, out_dir: str, 
         summary.append({'test_mode': test_mode, 'acc_mean': float(np.mean(vals)), 'acc_std': float(np.std(vals))})
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     save_csv(pd.DataFrame(rows), out/'metrics_subject.csv')
-    save_csv(pd.DataFrame(summary), out/'metrics_summary.csv')
+    summary_df = pd.DataFrame(summary)
+    save_csv(summary_df, out/'metrics_summary.csv')
     save_yaml(cfg.__dict__, out/'config.yaml')
+    summary_df = summary_df.assign(train_mode='jitter').rename(columns={'test_mode':'test_mode'})
+    print('\n=== Jitter summary ===')
+    print_acc_table(summary_df, row_key='train_mode', col_key='test_mode', value_key='acc_mean', row_order=['jitter'], col_order=MODES, title='Averaged accuracy (%)')

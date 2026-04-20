@@ -21,7 +21,7 @@ def main():
     for s in subjects:
         item = ds.build_subject_cache(int(s))
         save_cached_subject(args.cache_root, item)
-        print(f'cached {args.dataset} subject {s}')
+    print(f'Cached {args.dataset}: {len(subjects)} subjects -> {args.cache_root}')
 
 if __name__ == '__main__':
     main()
