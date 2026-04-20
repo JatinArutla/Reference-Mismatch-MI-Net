@@ -1,0 +1,69 @@
+dataset_id: iv2a
+status: frozen_v2
+subjects_default:
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+split_mode: session
+train_files_pattern: A0*T.mat
+test_files_pattern: A0*E.mat
+task: all
+task_description: 4-class motor imagery
+classes:
+  1: left hand
+  2: right hand
+  3: feet
+  4: tongue
+window_sec_default:
+- 2.0
+- 6.0
+native_sfreq_hz: 250
+target_sfreq_hz: 250
+bandpass_hz:
+- 8.0
+- 32.0
+bandpass_status: provisional_default
+artifact_field_present: true
+artifact_field_name: artifacts
+channel_names_source: official_dataset_metadata_or_competition_docs
+electrode_positions_source: moabb_digmontage
+channel_map_artifact: artifacts/channel_maps/iv2a_channel_names.json
+positions_artifact: artifacts/channel_maps/iv2a_positions_standard_1005.csv
+laplacian_graph_artifact: artifacts/graphs/iv2a_laplacian_knn4.json
+bipolar_graph_artifact: artifacts/graphs/iv2a_bipolar_nearest.json
+native_channel_order:
+- Fz
+- FC3
+- FC1
+- FCz
+- FC2
+- FC4
+- C5
+- C3
+- C1
+- Cz
+- C2
+- C4
+- C6
+- CP3
+- CP1
+- CPz
+- CP2
+- CP4
+- P1
+- Pz
+- P2
+- POz
+excluded_non_eeg_channels:
+- EOG1
+- EOG2
+- EOG3
+- STI
+position_artifact_file: artifacts/channel_maps/iv2a_positions_moabb.csv
+channel_artifact_file: artifacts/channel_maps/iv2a_channel_names.json

@@ -1,0 +1,41 @@
+ops:
+  native:
+    type: identity
+    shape_preserving: true
+
+  car:
+    type: linear
+    shape_preserving: true
+    definition: subtract channel-wise mean across channels at each timepoint
+
+  median:
+    type: nonlinear_order_statistic
+    shape_preserving: true
+    definition: subtract channel-wise median across channels at each timepoint
+
+  gs:
+    type: data_adaptive_projection
+    shape_preserving: true
+    definition: >
+      For each channel i, let r_i be the mean of all other channels within the
+      same trial. Compute alpha_i = <x_i, r_i> / <r_i, r_i> and output
+      y_i = x_i - alpha_i * r_i.
+
+  laplacian:
+    type: local_spatial_reference
+    shape_preserving: true
+    neighbor_rule:
+      policy: k_nearest_neighbors
+      k: 4
+      source: frozen_graph_artifact
+
+  bipolar:
+    type: local_pairwise_difference
+    shape_preserving: true
+    pair_rule:
+      policy: nearest_neighbor
+      source: frozen_graph_artifact
+
+implementation_rules:
+  - Reference operators are applied per trial.
+  - Neighbor maps and bipolar partner maps are versioned artifacts under artifacts/graphs/.

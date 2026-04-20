@@ -1,0 +1,45 @@
+{
+  "iv2a": {
+    "n_eeg_channels": 22,
+    "excluded_non_eeg_or_nonpositioned_channels": [
+      "EOG1",
+      "EOG2",
+      "EOG3",
+      "STI"
+    ],
+    "positions_source": "moabb_digmontage"
+  },
+  "openbmi": {
+    "n_eeg_channels": 62,
+    "excluded_non_eeg_or_nonpositioned_channels": [
+      "EMG1",
+      "EMG2",
+      "EMG3",
+      "EMG4",
+      "STI 014"
+    ],
+    "positions_source": "moabb_digmontage"
+  },
+  "cho2017": {
+    "n_eeg_channels": 64,
+    "excluded_non_eeg_or_nonpositioned_channels": [
+      "EMG1",
+      "EMG2",
+      "EMG3",
+      "EMG4",
+      "Stim"
+    ],
+    "positions_source": "moabb_digmontage"
+  },
+  "dreyer2023": {
+    "n_eeg_channels": 27,
+    "excluded_non_eeg_or_nonpositioned_channels": [
+      "EMGd",
+      "EMGg",
+      "EOG1",
+      "EOG2",
+      "EOG3"
+    ],
+    "positions_source": "standard_1005_fallback"
+  }
+}
