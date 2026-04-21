@@ -461,12 +461,45 @@ _LOADERS = {
 }
 
 
+# Module-level cache root. When set via set_cache_root(path), load_subject
+# checks the cache before hitting MOABB/scipy/EDF, and saves to cache on
+# first fresh load. Leave unset (None) to disable caching.
+_CACHE_ROOT: Optional[Path] = None
+
+
+def set_cache_root(path) -> None:
+    """Enable transparent subject-level caching. Pass None to disable.
+
+    When set, load_subject() will:
+      1. Return the cached file if {path}/{dataset_id}/subject_{NNN}.npz exists.
+      2. Otherwise do the full load, save to cache, and return.
+
+    The cache stores already-resampled, already-epoched data (pre-bandpass).
+    Safe to share a cache directory across experiments with different
+    bandpass / reference / standardization settings.
+    """
+    global _CACHE_ROOT
+    _CACHE_ROOT = Path(path) if path is not None else None
+
+
+def get_cache_root() -> Optional[Path]:
+    """Return the current cache root, or None if caching is disabled."""
+    return _CACHE_ROOT
+
+
 def load_subject(dataset_id: str, subject: int) -> SubjectData:
     if dataset_id not in _LOADERS:
         raise ValueError(
             f"Unknown dataset {dataset_id!r}. Known: {sorted(_LOADERS)}"
         )
-    return _LOADERS[dataset_id](subject)
+    if _CACHE_ROOT is not None:
+        path = cache_path(_CACHE_ROOT, dataset_id, subject)
+        if path.exists():
+            return load_subject_cache(_CACHE_ROOT, dataset_id, subject)
+    result = _LOADERS[dataset_id](subject)
+    if _CACHE_ROOT is not None:
+        save_subject_cache(result, _CACHE_ROOT)
+    return result
 
 
 # ============================================================================
