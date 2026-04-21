@@ -1,0 +1,27 @@
+# Random seeds used in the paper. Three seeds per experiment gives
+# meaningful mean +/- std across initializations without becoming the
+# dominant compute cost.
+
+main_benchmark:
+  seeds: [0, 1, 2]
+  description: Seeds for the main 6x6 mismatch matrix benchmark.
+
+jitter:
+  seeds: [0, 1, 2]
+  description: Seeds for jitter training runs.
+
+ssl_pretraining:
+  seeds: [0]
+  description: >-
+    SSL pretraining uses a single seed per configuration due to compute
+    budget. Downstream fine-tuning uses main_benchmark.seeds.
+
+notes: |
+  Each seed controls:
+    - numpy random state (sklearn splits, data shuffling)
+    - torch.manual_seed (parameter initialization)
+    - torch.cuda.manual_seed_all (CUDA kernel RNG)
+    - jitter batch sampling RNG (make_jitter_batch_fn)
+
+  cudnn deterministic mode is NOT enabled by default (it slows training
+  ~15-20%); small run-to-run variation within a seed is expected.

@@ -1,0 +1,65 @@
+# Canonical spec for the main 6x6 mismatch matrix benchmark.
+#
+# This is the experiment whose results are the paper's headline figure
+# (the 6x6 train_ref x test_ref accuracy heatmap). One model is trained
+# per train_ref and evaluated against all six test_refs; we report mean
+# accuracy +/- std across subjects and seeds within each cell.
+#
+# This file is READ BY HUMANS; the runners in experiments.py take explicit
+# Python arguments so the spec can be varied from notebooks without
+# touching YAML. If you change anything here, also change the defaults in
+# the runner call.
+
+datasets:
+  - iv2a         # BNCI2014_001, 9 subjects, 4-class, 22 ch
+  - openbmi      # Lee2019, 54 subjects (53 after excl), 2-class, 62 ch
+  - cho2017      # Cho et al., 52 subjects, 2-class, 64 ch (within-subject split)
+  - dreyer2023   # Dreyer et al., 87 subjects, 2-class, 27 ch (within-subject split)
+
+reference_modes:
+  - native
+  - car
+  - median
+  - gs
+  - laplacian
+  - bipolar
+
+standardization: mechanistic    # mechanistic | deployment
+model: atcnet                   # atcnet | csp_lda
+
+preprocessing:
+  target_sfreq_hz: 250.0
+  bandpass_hz: [8.0, 32.0]
+  bandpass_order: 4
+  reject_by_annotation: false   # keep artifact-flagged trials (DL convention)
+  montage: standard_1005
+  laplacian_k: 4
+
+trial_windows_seconds:          # tmin, tmax per dataset
+  iv2a:       [2.0, 6.0]
+  openbmi:    [0.0, 4.0]
+  cho2017:    [0.0, 3.0]
+  dreyer2023: [0.0, 5.0]
+
+training:
+  n_epochs: 200
+  batch_size: 32
+  optimizer: AdamW
+  lr: 1.0e-3
+  weight_decay: 1.0e-3
+
+seeds: [0, 1, 2]
+
+notes: |
+  For session-split datasets (iv2a, openbmi), train/test come from the
+  dataset's native session split. For single-session datasets
+  (cho2017, dreyer2023), each (subject, seed) pair uses a stratified
+  80/20 shuffle split.
+
+  Trial counts are slightly lower than the raw protocol's total because
+  MOABB drops boundary epochs where the window extends past the end of
+  the recording (IV-2a: 282/288 per session typical).
+
+  CSP+LDA numbers will run ~5-15 points below published MOABB leaderboard
+  because we do not drop artifact-flagged trials (DL convention for fair
+  comparison).

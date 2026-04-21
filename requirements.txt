@@ -1,8 +1,14 @@
+numpy>=1.23
+scipy>=1.10
+pandas>=1.5
+scikit-learn>=1.2
+pyyaml>=6.0
 
-numpy
-scipy
-pandas
-scikit-learn
-mne
-pyyaml
-tensorflow
+# EEG / signal processing
+mne>=1.5
+moabb>=1.0
+pyriemann>=0.5
+
+# Deep learning
+torch>=2.0
+braindecode>=0.8
