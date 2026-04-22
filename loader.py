@@ -144,11 +144,13 @@ def _resample_epochs(X: np.ndarray, fs_in: float, fs_out: float) -> np.ndarray:
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
-def _epoch_raw(raw, event_name_to_label: dict, tmin: float, tmax: float):
+def _epoch_raw(raw, event_name_to_label: dict, tmin: float, tmax: float,
+               reject_by_annotation: bool = False):
     """Extract fixed-length epochs from a Raw. Returns (X, y, ch_names).
 
-    `reject_by_annotation=False` keeps artifact-flagged trials (deep-learning
-    convention, matching ATCNet / EEGNet / braindecode defaults for IV-2a).
+    `reject_by_annotation=False` (our default) keeps artifact-flagged trials
+    (deep-learning convention, matching ATCNet / EEGNet / braindecode defaults
+    for IV-2a). Setting True matches MOABB's default pipeline behavior.
     Only EEG channels are kept. Trims MNE's inclusive-tmax endpoint so the
     output is exactly `(tmax - tmin) * sfreq` samples.
     """
@@ -171,7 +173,7 @@ def _epoch_raw(raw, event_name_to_label: dict, tmin: float, tmax: float):
         baseline=None,
         preload=True,
         picks="eeg",
-        reject_by_annotation=False,  # keep artifact-flagged trials
+        reject_by_annotation=reject_by_annotation,
         verbose="ERROR",
     )
     X = epochs.get_data(copy=False).astype(np.float32)
@@ -255,7 +257,10 @@ def _load_iv2a(subject: int) -> SubjectData:
         for run_key in sorted(sess_dict.keys()):
             raw = sess_dict[run_key]
             try:
-                X, y, ch_names = _epoch_raw(raw, label_map, tmin, tmax)
+                X, y, ch_names = _epoch_raw(
+                    raw, label_map, tmin, tmax,
+                    reject_by_annotation=_REJECT_BY_ANNOTATION,
+                )
             except RuntimeError:
                 continue  # baseline runs with no MI events
             Xs.append(X); ys.append(y)
@@ -366,7 +371,10 @@ def _load_cho2017(subject: int) -> SubjectData:
 
     tmin, tmax = WINDOWS["cho2017"]
     label_map = {"left_hand": 0, "right_hand": 1}
-    X, y, ch_names = _epoch_raw(raw, label_map, tmin, tmax)
+    X, y, ch_names = _epoch_raw(
+        raw, label_map, tmin, tmax,
+        reject_by_annotation=_REJECT_BY_ANNOTATION,
+    )
     X = _resample_epochs(X, raw.info["sfreq"], TARGET_SFREQ_HZ)
 
     return SubjectData(
@@ -431,7 +439,10 @@ def _load_dreyer2023(subject: int, root: Optional[Path] = None) -> SubjectData:
         if ch_type_map:
             raw.set_channel_types(ch_type_map)
 
-        X, y, chs = _epoch_raw(raw, label_map, tmin, tmax)
+        X, y, chs = _epoch_raw(
+            raw, label_map, tmin, tmax,
+            reject_by_annotation=_REJECT_BY_ANNOTATION,
+        )
         Xs.append(X); ys.append(y)
         if ch_names is None:
             ch_names = chs
@@ -466,6 +477,11 @@ _LOADERS = {
 # first fresh load. Leave unset (None) to disable caching.
 _CACHE_ROOT: Optional[Path] = None
 
+# Module-level artifact-rejection flag. False (default) matches the DL
+# convention and keeps all trials. True matches MOABB's default and drops
+# trials with BAD_ annotations.
+_REJECT_BY_ANNOTATION: bool = False
+
 
 def set_cache_root(path) -> None:
     """Enable transparent subject-level caching. Pass None to disable.
@@ -485,6 +501,25 @@ def set_cache_root(path) -> None:
 def get_cache_root() -> Optional[Path]:
     """Return the current cache root, or None if caching is disabled."""
     return _CACHE_ROOT
+
+
+def set_reject_by_annotation(flag: bool) -> None:
+    """Enable/disable artifact rejection via MNE BAD_ annotations.
+
+    Default is False (keep all trials, matching DL convention). Set to True
+    to match MOABB's default behavior (drop BAD_-annotated trials).
+
+    IMPORTANT: changing this flag invalidates any existing subject cache —
+    rebuild or clear the cache after flipping it. The cache does not track
+    which flag was used to build it.
+    """
+    global _REJECT_BY_ANNOTATION
+    _REJECT_BY_ANNOTATION = bool(flag)
+
+
+def get_reject_by_annotation() -> bool:
+    """Return the current artifact-rejection flag."""
+    return _REJECT_BY_ANNOTATION
 
 
 def load_subject(dataset_id: str, subject: int) -> SubjectData:
