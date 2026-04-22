@@ -1,210 +1,170 @@
 # refshift
 
-A benchmark for reference-induced distribution shift in EEG motor imagery
-decoding. Studies how re-referencing (CAR, Laplacian, bipolar, etc.)
-creates a systematic distribution shift between training and test that
-causes cross-reference transfer to collapse to near chance.
+Reference-shift experiments for motor-imagery EEG decoding, built on top of
+MOABB. The goal is a controlled benchmark showing that re-referencing induces
+a systematic, family-structured distribution shift that collapses
+cross-reference transfer; and that a simple jitter/SSL intervention fixes it.
 
-## What this repo does
+This repo is organised in phases. **Phase 1 (this drop)** ships the
+foundation: the reference operator as a scikit-learn transformer, a CSP+LDA
+pipeline that matches MOABB's canonical recipe, and two scripts — a
+calibration anchor against MOABB's published benchmark, and a 6×6 mismatch
+matrix runner. Phase 2 (braindecode DL models, jitter, SSL) is scaffolded but
+not yet implemented; see the roadmap at the end.
 
-- Loads four MI datasets with identical preprocessing: IV-2a (9 subjects,
-  4-class), OpenBMI / Lee2019 (53 subjects, 2-class), Cho2017 (52 subjects,
-  2-class), Dreyer2023 (87 subjects, 2-class).
-- Applies six reference operators: native, CAR, median, GS (Gram-Schmidt),
-  Laplacian-kNN4, and bipolar-nearest.
-- Evaluates a 6x6 train-reference by test-reference mismatch matrix using
-  ATCNet (braindecode) and CSP+LDA (MOABB canonical pipeline).
-- Supports reference jitter as a training-time augmentation.
+## Why Phase 1 is self-contained
 
-## File layout
+If the CSP+LDA calibration does not reproduce MOABB's 65.99 ± 15.47 on
+BCI IV-2a to within ~2%, every downstream number on any model is unreliable.
+Phase 1 exists to prove that the pipeline is correctly wired *before* any
+deep-learning or SSL work is layered on top. Run the calibration first, then
+the mismatch matrix, and verify both before moving on.
 
-```
-loader.py            Subject-level loading (all 4 datasets -> epoched arrays)
-preprocessing.py     Zero-phase Butterworth bandpass
-reference_ops.py     Six reference operators + graph construction
-standardization.py   Mechanistic + deployment standardization protocols
-models.py            ATCNet (braindecode) and CSP+LDA (pyriemann)
-training.py          Fit / evaluate / jitter batch factory
-experiments.py       6x6 mismatch matrix + jitter runners, aggregation
+## Install
 
-configs/
-  paper.yaml             Main benchmark spec (datasets, hyperparams, seeds)
-  reference_ops.yaml     Formal definitions of the 6 operators
-  standardization.yaml   Mechanistic vs deployment protocols
-  seeds.yaml             Seed assignments
-
-tests/
-  test_loader.py         Loader correctness (shape, dtype, trial counts)
-  test_preprocessing.py  Bandpass correctness (passband, stopband, zero-phase)
-  test_refs_and_std.py   Reference-op identities + standardization
-  test_chunk4.py         Model forward pass + ATCNet/CSP+LDA training
-  test_experiments.py    End-to-end experiment runners
-
-requirements.txt
+```bash
+pip install -r requirements.txt
+pip install -e .
 ```
 
-## Setup on Kaggle
+MOABB is pinned to 1.5.0 because the calibration target (65.99%) was
+measured at that version and MotorImagery defaults have drifted in later
+releases. Loosen the pin only after re-verifying calibration on the newer
+version.
 
-1. Upload this repo as a Kaggle Dataset (or put the files in an existing
-   dataset), say at `/kaggle/input/refshift/`.
+For Phase 2 DL work: `pip install -e '.[dl]'` pulls in `braindecode`,
+`torch`, `skorch`. You don't need these for Phase 1.
 
-2. Attach the four source datasets to your notebook:
-   - `delhialli/four-class-motor-imagery-bnci-001-2014` (IV-2a)
-   - `imaginer369/openbmi-dataset` (OpenBMI)
-   - `delhialli/cho2017` (Cho2017)
-   - `delhialli/dreyer2023` (Dreyer2023)
+## Usage
 
-   Default paths assumed by the loader:
-   - IV-2a: `/kaggle/input/datasets/delhialli/four-class-motor-imagery-bnci-001-2014`
-   - OpenBMI: `/kaggle/input/datasets/imaginer369/openbmi-dataset`
-   - Cho2017: `/kaggle/input/datasets/delhialli/cho2017`
-   - Dreyer2023: `/kaggle/input/datasets/delhialli/dreyer2023/MNE-Dreyer2023-data`
+**1. Run the tests.** The 13 pure-numpy tests cover the six operators and
+the graph construction. They run in seconds and don't need MOABB:
 
-   Override any of these via environment variables `REFSHIFT_OPENBMI_ROOT`
-   and `REFSHIFT_DREYER_ROOT`; IV-2a and Cho2017 are MOABB-managed via
-   symlinks that `loader._ensure_moabb_cache_symlinks()` sets up automatically.
-
-3. Set the Kaggle accelerator to **GPU T4 x2** (not P100). P100 is sm_60
-   and the current PyTorch lacks compatible kernels. `training.py` probes
-   CUDA on startup and falls back to CPU if kernels fail, so P100 will run
-   but will be much slower than T4.
-
-4. Install missing dependencies:
-   ```python
-   !pip install braindecode --quiet
-   ```
-   Everything else (torch, mne, moabb, pyriemann, sklearn, pandas, numpy,
-   scipy) is pre-installed on Kaggle as of 2026.
-
-5. Import the modules:
-   ```python
-   import sys
-   sys.path.insert(0, '/kaggle/input/refshift')
-   from experiments import run_mismatch_matrix, run_dataset_benchmark
-   ```
-
-## Running the main benchmark
-
-Single subject, headline result:
-
-```python
-from experiments import run_mismatch_matrix
-
-df = run_mismatch_matrix(
-    "iv2a", subject=1,
-    model_type="atcnet",
-    standardization="mechanistic",
-    n_epochs=200, batch_size=32, seed=0, verbose=True,
-)
-print(df.head())
-df.to_csv("iv2a_sub1_seed0.csv", index=False)
+```bash
+pytest tests/test_reference.py -v
 ```
 
-Full dataset:
+The integration test (`tests/test_integration.py`) loads IV-2a subject 1
+through MOABB and checks that `ReferenceTransformer('native')` is a true
+identity in the CSP+LDA pipeline. It's the cheapest end-to-end correctness
+check. Auto-skips if MOABB isn't installed.
 
-```python
-from experiments import run_dataset_benchmark
+**2. Calibrate CSP+LDA against MOABB.** Must pass before trusting
+anything else:
 
-df = run_dataset_benchmark(
-    "iv2a",
-    subjects=None,          # None -> all subjects
-    seeds=[0, 1, 2],
-    model_type="atcnet",
-    standardization="mechanistic",
-    n_epochs=200,
-)
-df.to_csv("iv2a_full.csv", index=False)
+```bash
+python scripts/calibrate_csp_lda.py
 ```
 
-Aggregated 6x6 matrix:
+This runs `WithinSessionEvaluation` on all 9 IV-2a subjects with two
+pipelines: bare MOABB canonical, and canonical with
+`ReferenceTransformer('native')` prepended. Expected output:
 
-```python
-from experiments import mismatch_matrix_mean, mismatch_matrix_std
-
-mean_mat = mismatch_matrix_mean(df, metric="accuracy")
-std_mat  = mismatch_matrix_std(df,  metric="accuracy")
-print(mean_mat.round(3))
+```
+Target 1 (MOABB 65.99% ± 2.0%):  got 65.xx%  -> PASS
+Target 2 (identity transformer within 0.5% of bare):  delta=+0.00% -> PASS
 ```
 
-## Running jitter
+Use `--subjects 1 2 3` for a quick sanity check.
 
-```python
-from experiments import run_jitter
+**3. Run the 6×6 mismatch matrix on IV-2a CSP+LDA.**
 
-df = run_jitter(
-    "iv2a", subject=1,
-    training_refs=["native", "car", "laplacian"],
-    n_epochs=200, seed=0,
-)
-print(df[["training_refs", "test_ref", "accuracy"]])
+```bash
+python scripts/run_mismatch_iv2a_csp_lda.py --out results/iv2a_csp_lda.csv
 ```
 
-## Reproducing the paper
+IV-2a has two sessions per subject, so this uses cross-session evaluation
+(session 1 → train, session 2 → test). Per-cell results are saved to the
+CSV; the script also prints mean and std 6×6 tables plus a diagonal-vs-
+off-diagonal summary.
 
-The exact spec lives in `configs/paper.yaml`. Defaults in the runners
-match it. Full-scale reproduction: run `run_dataset_benchmark` for each
-of the four datasets with seeds `[0, 1, 2]` and each of the two models
-(`atcnet`, `csp_lda`). Expected GPU time on T4: ~3-5 hours for IV-2a,
-longer for OpenBMI (more subjects, wider networks).
+## Package layout
 
-## Compute budgeting
-
-For IV-2a with 200 epochs, one ATCNet training on T4 takes ~40 seconds.
-Per subject that's 6 trainings + 36 evaluations, or ~5 minutes.
-Nine subjects times three seeds is ~4 hours of T4 time. Kaggle's 30-hour
-weekly T4 budget is enough for ATCNet on all four datasets single-seeded,
-or the two-class datasets three-seeded. Budget accordingly.
-
-## Tests
-
-```python
-# Replace `from tests.FOO import run_all` with a flat import if you're
-# running inside the Kaggle notebook with sys.path set to the repo root.
-
-from test_loader        import run_all as test_loader_all
-from test_preprocessing import run_all as test_preprocessing_all
-from test_refs_and_std  import run_all as test_refs_all
-from test_chunk4        import run_all as test_models_all
-from test_experiments   import run_all as test_experiments_all
-
-for fn in [test_loader_all, test_preprocessing_all, test_refs_all,
-           test_models_all, test_experiments_all]:
-    failed = fn()
-    assert not failed
+```
+refshift/
+├── refshift/
+│   ├── __init__.py       public API
+│   ├── reference.py      six reference ops + ReferenceTransformer + build_graph
+│   ├── data.py           MOABB loading helpers + train/test split
+│   ├── pipelines.py      make_csp_lda_pipeline (matches MOABB CSP.yml)
+│   └── mismatch.py       run_mismatch_matrix (train once, score six times)
+├── scripts/
+│   ├── calibrate_csp_lda.py          the trust anchor
+│   └── run_mismatch_iv2a_csp_lda.py  the headline CSP+LDA experiment
+├── tests/
+│   ├── test_reference.py    numpy-only, always runs
+│   └── test_integration.py  MOABB-dependent, auto-skips
+├── pyproject.toml
+├── requirements.txt
+└── README.md
 ```
 
-Test runtime on T4: ~8-10 minutes total for all five suites.
+## Design notes
 
-## Methodology notes for the paper
+**Why we don't use MOABB's `Evaluation` for the mismatch matrix.** MOABB's
+`WithinSessionEvaluation` and `CrossSessionEvaluation` train once and score
+once per fold. The mismatch matrix needs one training per `train_ref` and
+six scorings per fitted model; wrapping MOABB's evaluation loop to extract
+the fitted classifier mid-fold requires reaching into private methods
+(`_fit_cv`, `_build_scored_result`). Instead, `run_mismatch_matrix` calls
+`paradigm.get_data()` directly (which carries all of MOABB's preprocessing
+— filter-on-raw, correct epoching, dataset-specific quirks) and then does
+the 6-train × 6-score loop itself. About 50 lines of code, no private APIs.
 
-- **Trials kept**: We keep artifact-flagged trials (`reject_by_annotation=False`
-  in MNE). This matches the convention of ATCNet, EEGNet, and braindecode for
-  fair deep-learning comparisons. CSP+LDA numbers will run ~5-15 points below
-  MOABB leaderboard because MOABB drops artifacts.
+The calibration script *does* use `WithinSessionEvaluation` — that's how we
+validate the pipeline components against MOABB's published number. Once
+calibration passes, the mismatch-matrix runner inherits trust from its
+shared pipeline factory.
 
-- **IV-2a trial count**: 282 per session (not 288). MOABB drops the final
-  boundary trial of each of 6 runs because the `[2, 6]` window extends past
-  the run's recording end. Matches braindecode behavior.
+**Why `ReferenceTransformer('native')` is not a no-op in test wiring.** It
+*is* mathematically an identity (up to a fresh copy), and the integration
+test confirms this. We include it in the calibration script to catch any
+accidental side-effect of inserting a step into the pipeline (e.g., a
+dtype change, a contiguity issue, a clone-ability failure). A silent
+regression here would corrupt every later row of the mismatch matrix.
 
-- **OpenBMI exclusion**: Subject 29's `sess01` file is corrupt in the
-  Kaggle copy. All other 53 subjects are included.
+**Graph construction uses MNE's `standard_1005` montage.** Every EEG
+channel in IV-2a, OpenBMI, Cho2017, and Dreyer2023 is present in this
+montage. `build_graph(ch_names, k=4)` returns a frozen `DatasetGraph` with
+Laplacian (k-NN) and bipolar (1-NN) indices, built from Euclidean distances
+in xyz space. `C3`'s nearest neighbor on IV-2a's 22-channel set is `CP3`
+under this montage; this is asserted by
+`test_build_graph_iv2a_c3_nearest_is_cp3`.
 
-- **Cho2017 scale**: Raw Biosemi data is ~1000x larger amplitude than
-  typical EEG (~20 mV vs ~20 uV). Within-dataset standardization normalizes
-  this; cross-dataset comparisons need explicit handling.
+**No per-trial / instance standardization.** The mismatch-matrix runner
+applies reference operators to raw MOABB output (filter-on-raw + scaling
+to μV). CSP+LDA handles scale internally via `Covariances(oas)`. Phase 2
+DL runs will use `braindecode.preprocessing.exponential_moving_standardize`
+applied to the continuous Raw *before* epoching (the canonical
+braindecode protocol), so standardization is done once per subject and
+does not depend on the reference choice — avoiding the confound where
+per-trial standardization computed after the reference operator would
+depend on which reference was applied.
 
-- **Montage**: All channel positions come from MNE's `standard_1005`. Every
-  channel across the four datasets is present in this montage.
+## Phase 2 roadmap (not yet implemented)
 
-## Dependencies
+In order of dependency:
 
-See `requirements.txt`. Minimum versions:
-- torch >= 2.0
-- braindecode >= 0.8
-- mne >= 1.5
-- moabb >= 1.0
-- pyriemann >= 0.5
-- scikit-learn >= 1.2
-- pandas >= 1.5
-- numpy >= 1.23
-- scipy >= 1.10
+1. **DL pipelines (EEGNet, ShallowFBCSPNet, ATCNet).** Use
+   `braindecode.datasets.MOABBDataset` + `braindecode.preprocessing` with
+   the canonical four-step preprocess (pick EEG → V→μV → bandpass → EMS).
+   Wrap each braindecode model in `skorch.NeuralNetClassifier` for
+   sklearn-compatibility, insert `ReferenceTransformer` at the front of
+   the pipeline.
+2. **Jitter training.** Pre-compute all 6 reference variants of the
+   training set once per subject, then a custom per-batch sampler that
+   draws a reference uniformly (full jitter) or from a subset
+   (leave-one-reference-out).
+3. **SSL pretraining.** Within-dataset BarlowTwins or VICReg, positive
+   pairs constructed as `(R_i(x), R_j(x))` — two references of the same
+   trial as two views of the same latent. Fine-tune at
+   label-fractions {1.0, 0.5, 0.25, 0.1}, evaluate on all 6 refs.
+4. **Controls** (bandpass mismatch, temporal crop, channel subset).
+5. **V2 mechanistic analyses:** family-structure clustering,
+   operator-distance ↔ transfer correlation, representation-level CKA.
+
+## Reference
+
+Handoff document (`refshift_handoff.md`) in the project root has the full
+scientific context, dataset specifics, v1/v2 retrospective, and numerical
+targets per experiment.
