@@ -44,9 +44,11 @@ Reference-Mismatch-MI-Net/
 │   ├── pipelines.py      make_csp_lda_pipeline (matches MOABB CSP.yml verbatim)
 │   ├── experiments.py    calibrate_csp_lda, run_mismatch, mismatch_matrix
 │   ├── env.py            Kaggle setup + per-dataset cache symlinks + Dreyer patch
-│   └── plotting.py       plot_mismatch_matrix (viridis 0–100, diagonal boxes)
+│   ├── plotting.py       plot_mismatch_matrix (viridis 0–100, diagonal boxes)
+│   └── analysis.py       std matrix, hierarchical clustering, operator-distance correlation
 ├── tests/
-│   └── test_reference.py    19 pure-numpy tests, no MOABB/network needed
+│   ├── test_reference.py   19 pure-numpy tests (operators, graph, REST)
+│   └── test_analysis.py    10 pure-numpy tests (std/clustering/op-distance)
 ├── pyproject.toml
 ├── requirements.txt
 ├── LICENSE
@@ -69,7 +71,8 @@ IV-2a CSP+LDA calibration target against MOABB's published benchmark.
 pytest tests/ -v
 ```
 
-Expect **19/19 passing**. None requires MOABB or network access.
+Expect **29/29 passing** (19 reference operator tests + 10 analysis tests).
+None requires MOABB or network access.
 
 ## Kaggle usage
 
@@ -197,6 +200,59 @@ print(f"MOABB CrossSession IV-2a: {cross_mean:.2f} ± {cross_std:.2f}")
 `run_mismatch`'s diagonal `[native, native]` should match this within ~1
 percentage point. If it doesn't, there is a split-logic bug and all
 downstream numbers are suspect.
+
+### Cell 5 — post-hoc analyses (runs on the CSVs from Cell 3)
+
+Three analyses, all pure numpy/scipy, no MOABB, ~1 second each:
+
+```python
+import pandas as pd
+import matplotlib.pyplot as plt
+from refshift import (
+    mismatch_matrix, mismatch_std_matrix,
+    cluster_references, plot_dendrogram,
+    operator_distance_correlation, plot_operator_distance_scatter,
+)
+
+# IV-2a channel names (match the order in run_mismatch)
+IV2A_CHS = ["Fz","FC3","FC1","FCz","FC2","FC4","C5","C3","C1","Cz","C2","C4","C6",
+            "CP3","CP1","CPz","CP2","CP4","P1","Pz","P2","POz"]
+# Channel lists for the other datasets are on the dataset's info object;
+# pull them from the first run_mismatch call or from MOABB docs.
+
+for ds, chs in [("iv2a", IV2A_CHS)]:  # extend with other datasets as needed
+    df = pd.read_csv(f"{RESULTS}/{ds}_csp_lda.csv")
+    M = mismatch_matrix(df)
+    S = mismatch_std_matrix(df)
+
+    print(f"\n=== {ds} ===")
+    print("Mean:\n", M.round(3))
+    print("Std (across subjects x seeds):\n", S.round(3))
+
+    # Hierarchical clustering → dendrogram
+    cluster = cluster_references(M)
+    print(f"Clusters at k=3: {cluster.clusters[3]}")
+    fig = plot_dendrogram(cluster, out_path=f"{RESULTS}/{ds}_dendrogram.png",
+                           title=f"Reference clustering — {ds}")
+    plt.close(fig)
+
+    # Operator-distance correlation → scatter
+    odc = operator_distance_correlation(M, chs)
+    print(f"Spearman ρ(op-distance, transfer-gap) = {odc.spearman_rho:.3f} "
+          f"(p={odc.spearman_p:.1e}, n={len(odc.pair_table)})")
+    fig = plot_operator_distance_scatter(odc, out_path=f"{RESULTS}/{ds}_op_distance.png",
+                                          title=f"Operator distance vs transfer gap — {ds}")
+    plt.close(fig)
+```
+
+Expected for IV-2a (prototype run on the v1 draft matrix):
+- Clusters at k=3: `[['native','car','median','gs','rest'], ['laplacian'], ['bipolar']]`
+- Spearman ρ ≈ 0.80, p < 0.0001 (n=21 reference pairs)
+
+The dendrogram formalises the "one global-mean cluster + two spatial
+isolates" story from the heatmaps; the operator-distance scatter gives
+the Ben-David-style theoretical framing (transfer gap predicted by how
+far apart the operators are in matrix-valued space).
 
 ## Design notes
 
