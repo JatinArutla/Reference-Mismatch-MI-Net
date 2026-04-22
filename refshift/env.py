@@ -212,25 +212,28 @@ def _setup_openbmi_symlinks(mne_data_path: Path, verbose: bool) -> int:
 
 
 def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
-    """Mirror-tree symlinks for Dreyer2023 + zip placeholders.
+    """Mirror-tree symlinks for Dreyer2023 + zip file placeholders +
+    monkey-patch MOABB's download_by_subject to skip its unzip loop.
 
     The Kaggle dataset has:
       - dreyer2023_manifest.tsv at the root
       - 87 unpacked sub-NN/ BIDS trees with the full EDF + JSON + events.tsv set
       - no sub-NN.zip archives (and we don't need them at runtime)
 
-    MOABB's loader calls ``download_if_missing`` for each sub-NN.zip listed in
-    the manifest. That function only triggers a download when the file does
-    not exist locally. We create zero-byte placeholders to satisfy the
-    existence check. The follow-up unzip step (line ~408 of dreyer2023.py)
-    is gated on the unpacked sub-NN/ dir not existing; since the mirror-tree
-    creates those directories, the empty placeholder zips are never read.
+    Why the monkey-patch: MOABB's download_by_subject has an unzip loop that
+    iterates every .zip entry in the manifest and tries to unpack any whose
+    target directory doesn't exist. The manifest can contain non-subject
+    zip entries (code.zip, sourcedata.zip, etc.) whose target dirs aren't
+    in the Kaggle dataset; previous attempts to pre-create placeholder
+    directories for these proved fragile across manifest variations. Since
+    all subject EEG data is already unpacked via the mirror-tree symlinks,
+    the unzip loop is never needed — patching it out is more robust than
+    trying to predict every manifest entry.
 
-    Mirror-tree (real writable directories, leaf files as symlinks to the
-    read-only Kaggle source) is also necessary to let pooch's tempfile
-    writability probe succeed when MOABB tries to fetch any small top-level
-    BIDS file that isn't in the Kaggle dataset (those get downloaded once
-    and cached in the real writable directory).
+    The monkey-patch preserves the download phase, so any top-level BIDS
+    metadata files (README, dataset_description.json, participants.tsv)
+    that aren't in the Kaggle dataset still get downloaded to the writable
+    cache on first call (~15 KB total, one-time).
     """
     src_root = Path(os.environ.get(
         "REFSHIFT_DREYER_ROOT",
@@ -243,6 +246,7 @@ def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
             print(f"  dreyer2023: source not found ({src_root}); skipping")
         return 0
 
+    # Mirror-tree: real writable directories, symlinked leaf files.
     n_new = 0
     n_total = 0
     for root, _dirs, files in os.walk(src_root):
@@ -262,8 +266,9 @@ def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
             except OSError:
                 pass
 
-    # Create zero-byte placeholders for sub-NN.zip entries listed in the
-    # manifest. Satisfies MOABB's download_if_missing without network.
+    # Zero-byte .zip placeholders so MOABB's download phase skips them.
+    # (Without these, download_if_missing would attempt real downloads of
+    # hundreds-of-MB OSF zip archives for every subject.)
     n_placeholders = 0
     manifest_path = dst_root / "dreyer2023_manifest.tsv"
     if manifest_path.exists():
@@ -275,6 +280,7 @@ def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
                 if not isinstance(fname, str) or not fname.endswith(".zip"):
                     continue
                 placeholder = dst_root / fname
+                placeholder.parent.mkdir(parents=True, exist_ok=True)
                 if not placeholder.exists():
                     placeholder.touch()
                     n_placeholders += 1
@@ -282,12 +288,67 @@ def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
             if verbose:
                 print(f"    dreyer2023: manifest parse failed ({e})")
 
+    # Apply the monkey-patch so MOABB skips its unzip loop.
+    _patch_moabb_dreyer_no_unzip(verbose=verbose)
+
     if verbose:
         print(
             f"  dreyer2023: +{n_new} new file links ({n_total} total), "
             f"+{n_placeholders} zip placeholders under {dst_root}"
         )
     return n_total
+
+
+def _patch_moabb_dreyer_no_unzip(verbose: bool = True) -> None:
+    """Replace ``Dreyer2023.download_by_subject`` with a variant that skips
+    the unzip loop. The download loop (for BIDS metadata files listed in
+    the manifest) is preserved. Idempotent — safe to call multiple times.
+    """
+    try:
+        from moabb.datasets import dreyer2023 as _dr
+        from moabb.datasets import download as _dl
+    except ImportError:
+        return  # MOABB not installed; nothing to patch
+
+    # If we've already patched, the function will have our sentinel attribute.
+    if getattr(_dr.Dreyer2023.download_by_subject, "_refshift_patched", False):
+        return
+
+    def download_by_subject(self, subject, path=None):
+        """refshift-patched: downloads manifest entries, skips the unzip loop."""
+        from pathlib import Path as _Path
+        import pandas as _pd
+        from tqdm import tqdm as _tqdm
+
+        path = _Path(_dl.get_dataset_path(self.code, path)) / f"MNE-{self.code}-data"
+
+        # Ensure the manifest is present (either symlinked or freshly downloaded).
+        _dl.download_if_missing(
+            path / "dreyer2023_manifest.tsv", _dr._manifest_link
+        )
+        manifest = _pd.read_csv(path / "dreyer2023_manifest.tsv", sep="\t")
+        subject_index = manifest["filename"] == f"sub-{subject:02d}.zip"
+        dataset_index = ~manifest["filename"].str.contains("sub")
+        manifest_subject = manifest[subject_index | dataset_index]
+
+        # Download phase — same as MOABB's original.
+        for _, row in _tqdm(manifest_subject.iterrows()):
+            download_url = _dr._api_base_url + row["url"].replace(
+                "https://osf.io/download/", ""
+            ).replace("/", "")
+            _dl.download_if_missing(
+                path / row["filename"], download_url, warn_missing=False
+            )
+
+        # Unzip loop deliberately skipped — all subject data is already
+        # unpacked via refshift's mirror-tree symlinks.
+        return path
+
+    download_by_subject._refshift_patched = True
+    _dr.Dreyer2023.download_by_subject = download_by_subject
+
+    if verbose:
+        print("    dreyer2023: monkey-patched download_by_subject (skip unzip)")
 
 
 def setup_kaggle_env(
