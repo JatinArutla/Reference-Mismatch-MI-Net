@@ -246,7 +246,21 @@ def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
             print(f"  dreyer2023: source not found ({src_root}); skipping")
         return 0
 
-    # Mirror-tree: real writable directories, symlinked leaf files.
+    # Mirror-tree: real writable directories; files are either copied (for
+    # types mne_bids locks) or symlinked (for large EDFs).
+    #
+    # Why: mne_bids.read_raw_bids opens lock files alongside JSON sidecars
+    # via the `filelock` library. filelock calls Path(p).resolve(), which
+    # follows symlinks to the real path, then tries to create `<name>.lock`
+    # in that directory. If the file is a symlink into /kaggle/input, the
+    # real directory is read-only and lock creation fails with EROFS.
+    # Files that mne_bids may lock (all JSON, and defensively all TSV) must
+    # therefore be real files in our writable cache. EDFs are large and
+    # never locked by the read path, so we symlink them to avoid blowing
+    # the 20 GB /kaggle/working quota on ~35 GB of EDFs.
+    import shutil
+    LOCK_SUFFIXES = {".json", ".tsv"}
+
     n_new = 0
     n_total = 0
     for root, _dirs, files in os.walk(src_root):
@@ -256,11 +270,29 @@ def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
         for f in files:
             src_f = Path(root) / f
             dst_f = dst_subdir / f
-            if dst_f.exists() or dst_f.is_symlink():
+            needs_copy = Path(f).suffix.lower() in LOCK_SUFFIXES
+
+            # Replace any stale symlink from a previous refshift version
+            # that symlinked a lockable extension into /kaggle/input.
+            if needs_copy and dst_f.is_symlink():
+                try:
+                    dst_f.unlink()
+                except OSError:
+                    pass
+
+            if dst_f.exists():
                 n_total += 1
                 continue
+
             try:
-                os.symlink(src_f, dst_f)
+                if needs_copy:
+                    shutil.copy2(src_f, dst_f)
+                    # Ensure the copy is writable so mne_bids can also
+                    # update sidecars if it decides to (it usually doesn't
+                    # during read, but there's no downside to u+w).
+                    dst_f.chmod(dst_f.stat().st_mode | 0o200)
+                else:
+                    os.symlink(src_f, dst_f)
                 n_new += 1
                 n_total += 1
             except OSError:
