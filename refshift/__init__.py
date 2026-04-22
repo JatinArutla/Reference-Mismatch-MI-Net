@@ -30,6 +30,7 @@ from refshift.experiments import (
     run_mismatch,
 )
 from refshift.env import setup_kaggle_env, setup_moabb_symlinks
+from refshift.plotting import plot_mismatch_matrix
 
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "calibrate_csp_lda",
     "run_mismatch",
     "mismatch_matrix",
+    "plot_mismatch_matrix",
     "REFERENCE_MODES",
     "DatasetGraph",
     "ReferenceTransformer",
@@ -45,4 +47,4 @@ __all__ = [
     "make_csp_lda_pipeline",
 ]
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"

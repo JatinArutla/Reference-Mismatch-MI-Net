@@ -105,7 +105,7 @@ def _split_train_test(
 
 
 # ---------------------------------------------------------------------------
-# Calibration
+# Calibration (unchanged from 0.1.2 — MOABB WithinSessionEvaluation)
 # ---------------------------------------------------------------------------
 
 IV2A_CSP_LDA_TARGET = 65.99
@@ -198,7 +198,7 @@ def calibrate_csp_lda(
 
 
 # ---------------------------------------------------------------------------
-# Mismatch matrix
+# Mismatch matrix (quiet: tqdm progress bar only, no per-subject prints)
 # ---------------------------------------------------------------------------
 
 def run_mismatch(
@@ -213,7 +213,7 @@ def run_mismatch(
     laplacian_k: int = 4,
     montage: str = "standard_1005",
     cache: bool = True,
-    verbose: bool = True,
+    progress: bool = True,
 ) -> pd.DataFrame:
     """Run the 6x6 mismatch matrix on a dataset.
 
@@ -224,23 +224,43 @@ def run_mismatch(
       3. Pre-compute 6 test variants; train one CSP+LDA per train_ref;
          score each fitted model on all 6 test variants.
 
+    The function is silent by default apart from an optional tqdm progress
+    bar over (subject, seed) pairs. There is no per-subject logging. To
+    inspect the completed matrix, call ``mismatch_matrix(df)`` on the
+    returned DataFrame or ``plot_mismatch_matrix(df, ...)`` to render it.
+
     Parameters
     ----------
     dataset_id : {'iv2a', 'openbmi', 'cho2017', 'dreyer2023'}
     model : {'csp_lda'}
-        Phase 1 only. 'atcnet'/'eegnet'/'shallow' will land in Phase 2.
+        Phase 1 only. 'atcnet'/'eegnet'/'shallow' land in Phase 2.
     subjects : list of int or None
         None -> all subjects in the dataset.
     seeds : list of int
-        Seeds for stratified-split datasets. CSP+LDA is nearly deterministic
-        on session-split datasets, so [0] is usually sufficient there.
+        Seeds for stratified-split datasets. CSP+LDA is nearly
+        deterministic on session-split datasets, so [0] is usually
+        sufficient there.
+    reference_modes : tuple of str
+        Subset of REFERENCE_MODES to evaluate. Order is preserved.
+    split_strategy : {'auto', 'session', 'stratify'}
+        'auto' picks 'session' if the subject has >1 session,
+        otherwise 'stratify' 80/20.
+    n_filters : int
+        CSP spatial filters. MOABB default is 6.
+    laplacian_k : int
+        Nearest neighbors used for the Laplacian reference. Default 4.
+    montage : str
+        MNE montage used to compute spatial neighbor indices.
     cache : bool
         If True (default), MOABB caches the epoched array output to disk.
         First subject load is slow; repeats are near-instant.
+    progress : bool
+        Show a tqdm progress bar over (subject, seed) jobs. Default True.
 
     Returns
     -------
-    pd.DataFrame with columns:
+    pd.DataFrame
+        Long-form results with columns:
         dataset, subject, seed, train_ref, test_ref, accuracy, kappa,
         n_train, n_test.
     """
@@ -253,63 +273,75 @@ def run_mismatch(
     dataset, paradigm = _resolve_dataset(dataset_id)
     if subjects is None:
         subjects = list(dataset.subject_list)
+    seeds = list(seeds)
 
-    # Build neighbor graph once per dataset (only needed for spatial ops).
-    needs_graph = any(m in ("laplacian", "bipolar") for m in modes)
+    # Build the neighbor graph once per dataset (only if needed).
+    needs_graph = any(m in ("laplacian", "bipolar", "rest") for m in modes)
+    needs_rest = "rest" in modes
     graph = None
     if needs_graph:
         ch_names = _get_eeg_channel_names(dataset)
-        graph = build_graph(ch_names, k=laplacian_k, montage=montage)
+        graph = build_graph(
+            ch_names, k=laplacian_k, montage=montage,
+            include_rest=needs_rest,
+        )
 
     cache_config = _build_cache_config() if cache else None
     cache_kwargs = {"cache_config": cache_config} if cache_config else {}
 
-    rows = []
-    for subject in subjects:
-        if verbose:
-            print(f"[{dataset.code}] subject {subject}: loading...")
-        X, y_raw, metadata = paradigm.get_data(
-            dataset=dataset, subjects=[subject], **cache_kwargs,
-        )
-        y_int, _ = _encode_labels(y_raw)
+    # Progress bar (falls back to a no-op iterable if tqdm isn't installed).
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:  # pragma: no cover
+        def _tqdm(it, **kwargs):
+            return it
 
-        for seed in seeds:
-            X_tr, y_tr, X_te, y_te = _split_train_test(
-                X, y_int, metadata, strategy=split_strategy, seed=seed,
+    jobs = [(s, k) for s in subjects for k in seeds]
+    iterator = _tqdm(
+        jobs, desc=f"[{dataset.code}] mismatch",
+        disable=not progress, leave=True,
+    )
+
+    rows: List[dict] = []
+    last_subject: Optional[int] = None
+    X = y_int = metadata = None
+
+    for subject, seed in iterator:
+        # Reuse the loaded tensor across seeds for the same subject.
+        if subject != last_subject:
+            X, y_raw, metadata = paradigm.get_data(
+                dataset=dataset, subjects=[subject], **cache_kwargs,
             )
+            y_int, _ = _encode_labels(y_raw)
+            last_subject = subject
 
-            X_te_by_ref = {
-                m: apply_reference(X_te, m, graph=graph) for m in modes
-            }
+        X_tr, y_tr, X_te, y_te = _split_train_test(
+            X, y_int, metadata, strategy=split_strategy, seed=seed,
+        )
 
-            for train_ref in modes:
-                X_tr_ref = apply_reference(X_tr, train_ref, graph=graph)
-                pipe = make_csp_lda_pipeline(
-                    reference_mode=None, n_filters=n_filters,
-                )
-                pipe.fit(X_tr_ref, y_tr)
+        X_te_by_ref = {
+            m: apply_reference(X_te, m, graph=graph) for m in modes
+        }
 
-                for test_ref in modes:
-                    y_pred = pipe.predict(X_te_by_ref[test_ref])
-                    rows.append({
-                        "dataset":   dataset.code,
-                        "subject":   subject,
-                        "seed":      seed,
-                        "train_ref": train_ref,
-                        "test_ref":  test_ref,
-                        "accuracy":  float(accuracy_score(y_te, y_pred)),
-                        "kappa":     float(cohen_kappa_score(y_te, y_pred)),
-                        "n_train":   int(len(y_tr)),
-                        "n_test":    int(len(y_te)),
-                    })
-
-            if verbose:
-                n = len(modes) ** 2
-                acc = np.mean([r["accuracy"] for r in rows[-n:]])
-                print(
-                    f"[{dataset.code}] subject {subject} seed {seed} done "
-                    f"(mean over {n} cells: {acc:.3f})"
-                )
+        for train_ref in modes:
+            X_tr_ref = apply_reference(X_tr, train_ref, graph=graph)
+            pipe = make_csp_lda_pipeline(
+                reference_mode=None, n_filters=n_filters,
+            )
+            pipe.fit(X_tr_ref, y_tr)
+            for test_ref in modes:
+                y_pred = pipe.predict(X_te_by_ref[test_ref])
+                rows.append({
+                    "dataset":   dataset.code,
+                    "subject":   subject,
+                    "seed":      seed,
+                    "train_ref": train_ref,
+                    "test_ref":  test_ref,
+                    "accuracy":  float(accuracy_score(y_te, y_pred)),
+                    "kappa":     float(cohen_kappa_score(y_te, y_pred)),
+                    "n_train":   int(len(y_tr)),
+                    "n_test":    int(len(y_te)),
+                })
 
     return pd.DataFrame(rows)
 

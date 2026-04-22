@@ -200,11 +200,99 @@ def test_transformer_roundtrip_all_modes(small_X, iv2a_ch_names):
     """Smoke test: every mode produces a float32 array of the same shape."""
     pytest.importorskip("mne")
     # small_X has C=8, but iv2a fixture is C=22 — build graph for 8 random
-    # channels from standard_1005 instead.
-    g = build_graph(iv2a_ch_names[:8], k=4)
+    # channels from standard_1005 instead. Include REST so the 'rest' mode
+    # has its transformation matrix available.
+    g = build_graph(iv2a_ch_names[:8], k=4, include_rest=True)
     for mode in REFERENCE_MODES:
-        t = ReferenceTransformer(mode=mode, graph=g if mode in ("laplacian", "bipolar") else None)
+        needs_graph = mode in ("laplacian", "bipolar", "rest")
+        t = ReferenceTransformer(mode=mode, graph=g if needs_graph else None)
         out = t.fit_transform(small_X)
         assert out.shape == small_X.shape
         assert out.dtype == np.float32
         assert np.isfinite(out).all()
+
+
+# ---------------------------------------------------------------------------
+# REST (Yao 2001) — new in 0.2.0
+# ---------------------------------------------------------------------------
+
+def test_rest_matrix_built_when_requested(iv2a_ch_names):
+    """build_graph with include_rest=True populates the REST matrix."""
+    pytest.importorskip("mne")
+    g_off = build_graph(iv2a_ch_names, k=4, include_rest=False)
+    assert g_off.rest_matrix is None
+
+    g_on = build_graph(iv2a_ch_names, k=4, include_rest=True)
+    C = len(iv2a_ch_names)
+    assert g_on.rest_matrix is not None
+    assert g_on.rest_matrix.shape == (C, C)
+    assert g_on.rest_matrix.dtype == np.float32
+    assert np.isfinite(g_on.rest_matrix).all()
+
+
+def test_rest_is_reference_invariant(small_X, iv2a_ch_names):
+    """REST(V + c*ones_C) == REST(V) for any per-trial per-time constant c.
+
+    This is the defining property of REST: the transformation commutes
+    with any additive re-referencing, because it incorporates the centering
+    operator (I - 1_C 1_C^T / C) that annihilates the all-ones vector.
+    """
+    pytest.importorskip("mne")
+    # small_X is [4, 8, 64]. Build graph on the same 8 channels used for
+    # the rest of the small tests.
+    g = build_graph(iv2a_ch_names[:8], k=4, include_rest=True)
+
+    rng = np.random.default_rng(7)
+    # additive constant per trial per time (broadcasts across channels)
+    offset = rng.standard_normal((small_X.shape[0], 1, small_X.shape[2])).astype(np.float32) * 100.0
+
+    Y1 = apply_reference(small_X, "rest", graph=g)
+    Y2 = apply_reference(small_X + offset, "rest", graph=g)
+    # float32 accumulation across a (C, C) matmul leaves O(1e-4) residual;
+    # the math is exact.
+    np.testing.assert_allclose(Y1, Y2, atol=1e-3)
+
+
+def test_rest_matrix_annihilates_all_ones(iv2a_ch_names):
+    """T @ 1_C should be (numerically) zero. This is the algebraic root of
+    REST's reference-invariance property, independent of any input data.
+    """
+    pytest.importorskip("mne")
+    g = build_graph(iv2a_ch_names, k=4, include_rest=True)
+    C = len(iv2a_ch_names)
+    ones = np.ones(C, dtype=np.float32)
+    residual = g.rest_matrix @ ones
+    assert np.max(np.abs(residual)) < 1e-4, (
+        f"REST matrix failed the T @ 1_C = 0 check; max residual="
+        f"{np.max(np.abs(residual)):.3e}"
+    )
+
+
+def test_rest_is_not_identity(small_X, iv2a_ch_names):
+    """Sanity: REST should actually change the data (unlike 'native')."""
+    pytest.importorskip("mne")
+    g = build_graph(iv2a_ch_names[:8], k=4, include_rest=True)
+    Y = apply_reference(small_X, "rest", graph=g)
+    assert not np.allclose(Y, small_X, atol=1e-3), (
+        "REST output equals input — leadfield is degenerate or transform "
+        "collapsed to identity."
+    )
+
+
+def test_rest_requires_include_rest_graph():
+    """Attempting REST with a graph built for spatial-only modes raises."""
+    pytest.importorskip("mne")
+    iv2a = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
+    g = build_graph(iv2a, k=4, include_rest=False)
+    with pytest.raises(ValueError, match="include_rest=True"):
+        ReferenceTransformer(mode="rest", graph=g).fit(np.zeros((1, 8, 16)))
+
+
+def test_rest_2d_and_3d_shapes_equivalent(small_X, iv2a_ch_names):
+    """REST on [C, T] equals REST on [1, C, T] squeezed, same as other modes."""
+    pytest.importorskip("mne")
+    g = build_graph(iv2a_ch_names[:8], k=4, include_rest=True)
+    single = small_X[0]  # [C, T]
+    Y2 = apply_reference(single, "rest", graph=g)
+    Y3 = apply_reference(small_X[:1], "rest", graph=g)[0]
+    np.testing.assert_allclose(Y2, Y3, atol=1e-5)
