@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Dict, Optional
+import re
 
 
 # Kaggle input paths used in v2 that are known to contain the raw dataset
@@ -49,23 +50,13 @@ _KAGGLE_SOURCES: Dict[str, Dict[str, str]] = {
         # GIGA_URL = .../gigadb-datasets/live/pub/10.5524/100001_101000/100295/mat_data/
         "moabb_dest": "MNE-gigadb-data/gigadb-datasets/live/pub/10.5524/100001_101000/100295/mat_data",
     },
-    "openbmi": {
-        "env_var": "REFSHIFT_OPENBMI_ROOT",
-        "default": "/kaggle/input/datasets/imaginer369/openbmi-dataset",
-        # Lee2019_MI files are nested by session/subject under
-        # MNE-lee2019-mi-data/gigadb-datasets/live/pub/10.5524/100001_101000/100542/sessionN/sM/...
-        # The Kaggle dataset's internal layout may or may not match this;
-        # marked untested. If MOABB re-downloads, that's the fallback.
-        "pattern": None,  # link whole subtree
-        "moabb_dest": "MNE-lee2019-mi-data",
-    },
-    "dreyer2023": {
-        "env_var": "REFSHIFT_DREYER_ROOT",
-        "default": "/kaggle/input/datasets/delhialli/dreyer2023/MNE-Dreyer2023-data",
-        # Dreyer is already in MOABB's layout; we link the whole dir tree.
-        "pattern": None,
-        "moabb_dest": "MNE-Dreyer2023-data",
-    },
+    # openbmi is handled by _setup_openbmi_symlinks (per-file path rewriting;
+    # source files are flat sess{SS}_subj{NN}_EEG_MI.mat but MOABB expects
+    # them nested under session{S}/s{N}/).
+    # dreyer2023 is handled by _setup_dreyer_symlinks (mirror-tree: real
+    # writable directories with leaf files symlinked to the read-only Kaggle
+    # source; necessary because MOABB's loader writes tempfiles inside the
+    # cache dir via pooch, which fails on a symlink pointing into /kaggle/input).
 }
 
 
@@ -111,11 +102,30 @@ def setup_moabb_symlinks(
     mne_data_path.mkdir(parents=True, exist_ok=True)
     os.environ["MNE_DATA"] = str(mne_data_path)
 
+    # Clean up stale whole-directory symlinks from older refshift versions.
+    # These pointed at /kaggle/input/... (read-only), which breaks MOABB as
+    # soon as it tries to write sidecar files or tempfiles inside the cache dir.
+    for stale_name in ("MNE-lee2019-mi-data", "MNE-Dreyer2023-data"):
+        stale = mne_data_path / stale_name
+        if stale.is_symlink():
+            try:
+                stale.unlink()
+                if verbose:
+                    print(f"  cleaned up stale symlink: {stale}")
+            except OSError:
+                pass
+
     if datasets is None:
-        datasets = list(_KAGGLE_SOURCES)
+        datasets = list(_KAGGLE_SOURCES) + ["openbmi", "dreyer2023"]
 
     counts: Dict[str, int] = {}
     for ds_id in datasets:
+        if ds_id == "openbmi":
+            counts[ds_id] = _setup_openbmi_symlinks(mne_data_path, verbose=verbose)
+            continue
+        if ds_id == "dreyer2023":
+            counts[ds_id] = _setup_dreyer_symlinks(mne_data_path, verbose=verbose)
+            continue
         if ds_id not in _KAGGLE_SOURCES:
             if verbose:
                 print(f"  {ds_id}: unknown dataset id, skipping")
@@ -130,24 +140,7 @@ def setup_moabb_symlinks(
                 print(f"  {ds_id}: source not found ({src_root}); skipping")
             continue
 
-        # Dir-level symlink for tree-layout datasets (Dreyer).
-        if entry["pattern"] is None:
-            # Symlink the whole dir if destination doesn't exist.
-            if dst_root.exists() or dst_root.is_symlink():
-                counts[ds_id] = 0
-            else:
-                dst_root.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    os.symlink(src_root, dst_root)
-                    counts[ds_id] = 1
-                except (FileExistsError, OSError):
-                    counts[ds_id] = 0
-            if verbose:
-                status = "linked" if counts[ds_id] else "already linked"
-                print(f"  {ds_id}: {status} {src_root} -> {dst_root}")
-            continue
-
-        # File-by-file symlinks for flat-layout datasets (IV-2a, Cho2017, OpenBMI).
+        # File-by-file symlinks for flat-layout datasets (IV-2a, Cho2017).
         n_new = 0
         for f in src_root.glob(entry["pattern"]):
             if _link(f, dst_root / f.name):
@@ -158,6 +151,143 @@ def setup_moabb_symlinks(
             print(f"  {ds_id}: +{n_new} new links ({n_existing} total at {dst_root})")
 
     return counts
+
+
+# OpenBMI needs per-file path rewriting: flat source filenames
+# (sess{SS}_subj{NN}_EEG_MI.mat) -> MOABB's nested layout
+# (session{S}/s{N}/sess{SS}_subj{NN}_EEG_MI.mat).
+_OPENBMI_DEST_SUBDIR = (
+    "MNE-lee2019-mi-data/gigadb-datasets/live/pub/"
+    "10.5524/100001_101000/100542"
+)
+_OPENBMI_FNAME_RE = re.compile(r"^sess(\d{2})_subj(\d{2})_EEG_MI\.mat$")
+
+
+def _setup_openbmi_symlinks(mne_data_path: Path, verbose: bool) -> int:
+    """Per-file symlinks for OpenBMI (Lee2019_MI).
+
+    Rewrites the flat Kaggle layout into MOABB's nested layout. Returns the
+    total count of files present at the expected MOABB paths after linking.
+    """
+    src_root = Path(os.environ.get(
+        "REFSHIFT_OPENBMI_ROOT",
+        "/kaggle/input/datasets/imaginer369/openbmi-dataset",
+    ))
+    dest_root = mne_data_path / _OPENBMI_DEST_SUBDIR
+
+    if not src_root.exists():
+        if verbose:
+            print(f"  openbmi: source not found ({src_root}); skipping")
+        return 0
+
+    n_new = 0
+    n_total = 0
+    n_skipped = 0
+    for f in src_root.iterdir():
+        m = _OPENBMI_FNAME_RE.match(f.name)
+        if not m:
+            n_skipped += 1
+            continue
+        sess, subj = int(m.group(1)), int(m.group(2))
+        dest = dest_root / f"session{sess}" / f"s{subj}" / f.name
+        if dest.exists() or dest.is_symlink():
+            n_total += 1
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(f, dest)
+            n_new += 1
+            n_total += 1
+        except OSError:
+            pass
+
+    if verbose:
+        print(
+            f"  openbmi: +{n_new} new links ({n_total}/108 total under "
+            f"{mne_data_path}/MNE-lee2019-mi-data/)"
+        )
+        if n_skipped:
+            print(f"    ({n_skipped} source files did not match expected pattern)")
+    return n_total
+
+
+def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
+    """Mirror-tree symlinks for Dreyer2023 + zip placeholders.
+
+    The Kaggle dataset has:
+      - dreyer2023_manifest.tsv at the root
+      - 87 unpacked sub-NN/ BIDS trees with the full EDF + JSON + events.tsv set
+      - no sub-NN.zip archives (and we don't need them at runtime)
+
+    MOABB's loader calls ``download_if_missing`` for each sub-NN.zip listed in
+    the manifest. That function only triggers a download when the file does
+    not exist locally. We create zero-byte placeholders to satisfy the
+    existence check. The follow-up unzip step (line ~408 of dreyer2023.py)
+    is gated on the unpacked sub-NN/ dir not existing; since the mirror-tree
+    creates those directories, the empty placeholder zips are never read.
+
+    Mirror-tree (real writable directories, leaf files as symlinks to the
+    read-only Kaggle source) is also necessary to let pooch's tempfile
+    writability probe succeed when MOABB tries to fetch any small top-level
+    BIDS file that isn't in the Kaggle dataset (those get downloaded once
+    and cached in the real writable directory).
+    """
+    src_root = Path(os.environ.get(
+        "REFSHIFT_DREYER_ROOT",
+        "/kaggle/input/datasets/delhialli/dreyer2023/MNE-Dreyer2023-data",
+    ))
+    dst_root = mne_data_path / "MNE-Dreyer2023-data"
+
+    if not src_root.exists():
+        if verbose:
+            print(f"  dreyer2023: source not found ({src_root}); skipping")
+        return 0
+
+    n_new = 0
+    n_total = 0
+    for root, _dirs, files in os.walk(src_root):
+        rel = Path(root).relative_to(src_root)
+        dst_subdir = dst_root / rel
+        dst_subdir.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            src_f = Path(root) / f
+            dst_f = dst_subdir / f
+            if dst_f.exists() or dst_f.is_symlink():
+                n_total += 1
+                continue
+            try:
+                os.symlink(src_f, dst_f)
+                n_new += 1
+                n_total += 1
+            except OSError:
+                pass
+
+    # Create zero-byte placeholders for sub-NN.zip entries listed in the
+    # manifest. Satisfies MOABB's download_if_missing without network.
+    n_placeholders = 0
+    manifest_path = dst_root / "dreyer2023_manifest.tsv"
+    if manifest_path.exists():
+        try:
+            import pandas as pd
+            manifest = pd.read_csv(manifest_path, sep="\t")
+            fname_col = "filename" if "filename" in manifest.columns else manifest.columns[0]
+            for fname in manifest[fname_col]:
+                if not isinstance(fname, str) or not fname.endswith(".zip"):
+                    continue
+                placeholder = dst_root / fname
+                if not placeholder.exists():
+                    placeholder.touch()
+                    n_placeholders += 1
+        except Exception as e:
+            if verbose:
+                print(f"    dreyer2023: manifest parse failed ({e})")
+
+    if verbose:
+        print(
+            f"  dreyer2023: +{n_new} new file links ({n_total} total), "
+            f"+{n_placeholders} zip placeholders under {dst_root}"
+        )
+    return n_total
 
 
 def setup_kaggle_env(
