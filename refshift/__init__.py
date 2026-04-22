@@ -1,11 +1,20 @@
 """refshift — reference-shift experiments for motor-imagery EEG decoding.
 
-Public API (Phase 1):
-    ReferenceTransformer   — sklearn transformer applying a reference op to [N,C,T] arrays
-    build_graph            — build Laplacian/bipolar neighbor indices from channel names
-    REFERENCE_MODES        — tuple of the six supported modes
-    make_csp_lda_pipeline  — CSP+LDA pipeline matching MOABB's canonical CSP.yml
-    run_mismatch_matrix    — train-once/evaluate-six-times runner for CSP+LDA
+Notebook API:
+
+    setup_kaggle_env()          environment + MOABB dataset symlinks
+    calibrate_csp_lda(...)      MOABB calibration, returns (results, summary, passed)
+    run_mismatch(...)           6x6 mismatch matrix by dataset_id
+    mismatch_matrix(df, ...)    pivot long-form results into a 6x6 table
+
+Primitives:
+
+    ReferenceTransformer        sklearn transformer applying a reference op
+    build_graph                 Laplacian/bipolar neighbor indices
+    REFERENCE_MODES             tuple of the six supported modes
+    make_csp_lda_pipeline       CSP+LDA pipeline matching MOABB's canonical CSP.yml
+
+Phase 2 (not yet implemented): braindecode DL pipelines, jitter, SSL.
 """
 
 from refshift.reference import (
@@ -15,15 +24,25 @@ from refshift.reference import (
     build_graph,
 )
 from refshift.pipelines import make_csp_lda_pipeline
-from refshift.mismatch import run_mismatch_matrix
+from refshift.experiments import (
+    calibrate_csp_lda,
+    mismatch_matrix,
+    run_mismatch,
+)
+from refshift.env import setup_kaggle_env, setup_moabb_symlinks
+
 
 __all__ = [
+    "setup_kaggle_env",
+    "setup_moabb_symlinks",
+    "calibrate_csp_lda",
+    "run_mismatch",
+    "mismatch_matrix",
     "REFERENCE_MODES",
     "DatasetGraph",
     "ReferenceTransformer",
     "build_graph",
     "make_csp_lda_pipeline",
-    "run_mismatch_matrix",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
