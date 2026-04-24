@@ -2,11 +2,13 @@
 
 Three entry points:
 
-    calibrate_csp_lda(dataset_id, ...)  - MOABB WithinSession calibration
-    run_mismatch(dataset_id, ...)       - 6x6 mismatch matrix
-    mismatch_matrix(df, ...)            - pivot long-form -> 6x6 table
+    calibrate_csp_lda(dataset_id, ...)  - MOABB WithinSession calibration (Phase 1)
+    run_mismatch(dataset_id, ...)       - 7x7 mismatch matrix, CSP+LDA or DL
+    mismatch_matrix(df, ...)            - pivot long-form -> 7x7 table
 
-Plus helpers used only inside this module, kept private (leading underscore).
+``run_mismatch`` dispatches on ``model``: ``'csp_lda'`` uses MOABB's paradigm
+interface (Phase 1); ``'eegnet'`` / ``'shallow'`` use ``refshift.dl`` wrappers
+around braindecode's canonical MOABB loader.
 """
 
 from __future__ import annotations
@@ -104,8 +106,18 @@ def _split_train_test(
     raise ValueError(f"Unknown split strategy: {strategy!r}")
 
 
+def _free_cuda():
+    """Best-effort CUDA cache release between DL model trainings."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 # ---------------------------------------------------------------------------
-# Calibration (unchanged from 0.1.2 — MOABB WithinSessionEvaluation)
+# Calibration (Phase 1 CSP+LDA MOABB match)
 # ---------------------------------------------------------------------------
 
 IV2A_CSP_LDA_TARGET = 65.99
@@ -126,16 +138,6 @@ def calibrate_csp_lda(
     Runs two pipelines: bare MOABB canonical and canonical prepended with
     ReferenceTransformer('native'). Identity-pipeline per-fold scores must
     match bare to within 0.5%.
-
-    Returns
-    -------
-    results : pd.DataFrame
-        Per-subject/session/pipeline scores from MOABB.
-    summary : pd.DataFrame
-        Two rows: mean and std per pipeline.
-    passed : bool
-        True iff both calibration targets (MOABB-match on IV-2a and
-        identity-match) are satisfied.
     """
     from moabb.evaluations import WithinSessionEvaluation
 
@@ -198,7 +200,7 @@ def calibrate_csp_lda(
 
 
 # ---------------------------------------------------------------------------
-# Mismatch matrix (quiet: tqdm progress bar only, no per-subject prints)
+# Mismatch matrix — CSP+LDA or DL via braindecode
 # ---------------------------------------------------------------------------
 
 def run_mismatch(
@@ -214,60 +216,67 @@ def run_mismatch(
     montage: str = "standard_1005",
     cache: bool = True,
     progress: bool = True,
+    # --- Phase 2 (DL) options ---
+    dl_max_epochs: int = 200,
+    dl_batch_size: int = 32,
+    dl_lr: Optional[float] = None,
+    dl_weight_decay: float = 0.0,
+    dl_device: Optional[str] = None,
+    dl_verbose: int = 0,
+    dl_l_freq: float = 8.0,
+    dl_h_freq: float = 32.0,
+    dl_trial_start_offset_s: float = 0.0,
+    dl_trial_stop_offset_s: float = 0.0,
 ) -> pd.DataFrame:
-    """Run the 6x6 mismatch matrix on a dataset.
+    """Run the 7x7 mismatch matrix on a dataset.
 
     For each (subject, seed):
-      1. Load epoched data via MOABB's paradigm.get_data (filter-on-raw,
-         correct epoching, scaling).
-      2. Split into train/test (session split if >1 session, else 80/20).
-      3. Pre-compute 6 test variants; train one CSP+LDA per train_ref;
-         score each fitted model on all 6 test variants.
-
-    The function is silent by default apart from an optional tqdm progress
-    bar over (subject, seed) pairs. There is no per-subject logging. To
-    inspect the completed matrix, call ``mismatch_matrix(df)`` on the
-    returned DataFrame or ``plot_mismatch_matrix(df, ...)`` to render it.
+      1. Load epoched data (CSP path: MOABB paradigm; DL path: braindecode).
+      2. Split train/test (session split if >1 session, else 80/20 stratified).
+      3. Pre-compute all 7 test variants once.
+      4. For each train_ref, train one model; score on all 7 test variants.
 
     Parameters
     ----------
     dataset_id : {'iv2a', 'openbmi', 'cho2017', 'dreyer2023'}
-    model : {'csp_lda'}
-        Phase 1 only. 'atcnet'/'eegnet'/'shallow' land in Phase 2.
+    model : {'csp_lda', 'eegnet', 'shallow'}
+        ``csp_lda`` uses the MOABB paradigm path (Phase 1).
+        ``eegnet`` / ``shallow`` use ``refshift.dl`` (Phase 2).
     subjects : list of int or None
-        None -> all subjects in the dataset.
+        None -> all subjects in the dataset. For OpenBMI pass
+        ``[s for s in range(1, 55) if s != 29]`` (subject 29 is corrupt).
     seeds : list of int
-        Seeds for stratified-split datasets. CSP+LDA is nearly
-        deterministic on session-split datasets, so [0] is usually
-        sufficient there.
+        For stratified-split datasets and for DL training. For CSP+LDA on
+        session-split datasets, seeds are near-redundant.
     reference_modes : tuple of str
         Subset of REFERENCE_MODES to evaluate. Order is preserved.
     split_strategy : {'auto', 'session', 'stratify'}
-        'auto' picks 'session' if the subject has >1 session,
-        otherwise 'stratify' 80/20.
-    n_filters : int
-        CSP spatial filters. MOABB default is 6.
-    laplacian_k : int
-        Nearest neighbors used for the Laplacian reference. Default 4.
-    montage : str
-        MNE montage used to compute spatial neighbor indices.
+        'auto' picks 'session' if the subject has >1 session, else 'stratify' 80/20.
+    n_filters, laplacian_k, montage : Phase 1 knobs (CSP+LDA only / graph build).
     cache : bool
-        If True (default), MOABB caches the epoched array output to disk.
-        First subject load is slow; repeats are near-instant.
+        MOABB paradigm cache (CSP path). Ignored by the DL path.
     progress : bool
-        Show a tqdm progress bar over (subject, seed) jobs. Default True.
+        Show tqdm progress bar over (subject, seed) jobs.
+
+    DL options (``dl_``-prefixed) are ignored when ``model='csp_lda'``.
 
     Returns
     -------
-    pd.DataFrame
-        Long-form results with columns:
-        dataset, subject, seed, train_ref, test_ref, accuracy, kappa,
-        n_train, n_test.
+    pandas.DataFrame with columns
+        ``dataset, subject, seed, train_ref, test_ref, accuracy, kappa,
+        n_train, n_test``.
     """
-    if model != "csp_lda":
-        raise NotImplementedError(
-            f"model={model!r} is Phase 2. Phase 1 supports 'csp_lda' only."
-        )
+    model_lc = model.lower()
+    if model_lc == "csp_lda":
+        is_dl = False
+    else:
+        from refshift.dl import SUPPORTED_DL_MODELS
+        if model_lc not in SUPPORTED_DL_MODELS:
+            raise NotImplementedError(
+                f"model={model!r} is not supported. "
+                f"Known: 'csp_lda', {SUPPORTED_DL_MODELS}."
+            )
+        is_dl = True
 
     modes = tuple(reference_modes)
     dataset, paradigm = _resolve_dataset(dataset_id)
@@ -280,16 +289,15 @@ def run_mismatch(
     needs_rest = "rest" in modes
     graph = None
     if needs_graph:
-        ch_names = _get_eeg_channel_names(dataset)
+        ch_names = _get_eeg_channel_names(dataset, subject=subjects[0])
         graph = build_graph(
             ch_names, k=laplacian_k, montage=montage,
             include_rest=needs_rest,
         )
 
-    cache_config = _build_cache_config() if cache else None
+    cache_config = _build_cache_config() if (cache and not is_dl) else None
     cache_kwargs = {"cache_config": cache_config} if cache_config else {}
 
-    # Progress bar (falls back to a no-op iterable if tqdm isn't installed).
     try:
         from tqdm.auto import tqdm as _tqdm
     except ImportError:  # pragma: no cover
@@ -298,36 +306,68 @@ def run_mismatch(
 
     jobs = [(s, k) for s in subjects for k in seeds]
     iterator = _tqdm(
-        jobs, desc=f"[{dataset.code}] mismatch",
+        jobs, desc=f"[{dataset.code}] {model_lc} mismatch",
         disable=not progress, leave=True,
     )
 
     rows: List[dict] = []
     last_subject: Optional[int] = None
     X = y_int = metadata = None
+    sfreq: Optional[float] = None
 
     for subject, seed in iterator:
-        # Reuse the loaded tensor across seeds for the same subject.
+        # Reload data only when subject changes (shared across seeds).
         if subject != last_subject:
-            X, y_raw, metadata = paradigm.get_data(
-                dataset=dataset, subjects=[subject], **cache_kwargs,
-            )
-            y_int, _ = _encode_labels(y_raw)
+            if is_dl:
+                from refshift.dl import load_dl_data
+                X, y_int, metadata, sfreq, _ = load_dl_data(
+                    dataset_id, subject,
+                    l_freq=dl_l_freq, h_freq=dl_h_freq,
+                    trial_start_offset_s=dl_trial_start_offset_s,
+                    trial_stop_offset_s=dl_trial_stop_offset_s,
+                )
+            else:
+                X, y_raw, metadata = paradigm.get_data(
+                    dataset=dataset, subjects=[subject], **cache_kwargs,
+                )
+                y_int, _ = _encode_labels(y_raw)
             last_subject = subject
 
         X_tr, y_tr, X_te, y_te = _split_train_test(
             X, y_int, metadata, strategy=split_strategy, seed=seed,
         )
 
+        # Pre-compute all 7 test variants once.
         X_te_by_ref = {
             m: apply_reference(X_te, m, graph=graph) for m in modes
         }
 
+        n_classes = int(max(int(y_tr.max()), int(y_te.max()))) + 1
+
         for train_ref in modes:
             X_tr_ref = apply_reference(X_tr, train_ref, graph=graph)
-            pipe = make_csp_lda_pipeline(
-                reference_mode=None, n_filters=n_filters,
-            )
+
+            if is_dl:
+                from refshift.dl import make_dl_model
+                pipe = make_dl_model(
+                    model=model_lc,
+                    n_channels=X_tr_ref.shape[1],
+                    n_classes=n_classes,
+                    n_times=X_tr_ref.shape[2],
+                    sfreq=float(sfreq),
+                    seed=int(seed),
+                    max_epochs=dl_max_epochs,
+                    batch_size=dl_batch_size,
+                    lr=dl_lr,
+                    weight_decay=dl_weight_decay,
+                    device=dl_device,
+                    verbose=dl_verbose,
+                )
+            else:
+                pipe = make_csp_lda_pipeline(
+                    reference_mode=None, n_filters=n_filters,
+                )
+
             pipe.fit(X_tr_ref, y_tr)
             for test_ref in modes:
                 y_pred = pipe.predict(X_te_by_ref[test_ref])
@@ -342,6 +382,11 @@ def run_mismatch(
                     "n_train":   int(len(y_tr)),
                     "n_test":    int(len(y_te)),
                 })
+
+            # Release GPU memory between cells to keep Kaggle P100 stable.
+            if is_dl:
+                del pipe
+                _free_cuda()
 
     return pd.DataFrame(rows)
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "refshift"
-version = "0.3.0"
+version = "0.4.0"
 description = "Reference-shift experiments for motor-imagery EEG decoding."
 requires-python = ">=3.10"
 dependencies = [
@@ -23,10 +23,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Phase 2 deps; not needed for CSP+LDA calibration or the CSP+LDA mismatch
-# matrix. Install with `pip install -e '.[dl]'` once Phase 2 work starts.
+# Phase 2 DL dependencies. Install with `pip install -e '.[dl]'`.
+# Targets the braindecode 1.x API (`n_chans`/`n_outputs`/`n_times` model
+# parameters). If Kaggle's default resolves an older braindecode, pin
+# explicitly with `pip install 'braindecode>=1.0'`.
 dl = [
-    "braindecode>=0.8",
+    "braindecode>=1.0",
     "torch>=2.0",
     "skorch>=0.15",
 ]

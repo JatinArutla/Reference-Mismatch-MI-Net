@@ -4,17 +4,20 @@ Notebook API:
 
     setup_kaggle_env()          environment + MOABB dataset symlinks
     calibrate_csp_lda(...)      MOABB calibration, returns (results, summary, passed)
-    run_mismatch(...)           6x6 mismatch matrix by dataset_id
-    mismatch_matrix(df, ...)    pivot long-form results into a 6x6 table
+    run_mismatch(...)           7x7 mismatch matrix by dataset_id (CSP+LDA or DL)
+    mismatch_matrix(df, ...)    pivot long-form results into a 7x7 table
 
 Primitives:
 
     ReferenceTransformer        sklearn transformer applying a reference op
-    build_graph                 Laplacian/bipolar neighbor indices
-    REFERENCE_MODES             tuple of the six supported modes
+    build_graph                 Laplacian/bipolar/REST neighbor indices
+    REFERENCE_MODES             tuple of the seven supported modes
     make_csp_lda_pipeline       CSP+LDA pipeline matching MOABB's canonical CSP.yml
 
-Phase 2 (not yet implemented): braindecode DL pipelines, jitter, SSL.
+Phase 2 (DL):
+    refshift.dl.load_dl_data    braindecode MOABBDataset + canonical preprocess
+    refshift.dl.make_dl_model   EEGNetv4 / ShallowFBCSPNet factory (skorch-wrapped)
+    SUPPORTED_DL_MODELS         ('eegnet', 'shallow')
 """
 
 from refshift.reference import (
@@ -59,4 +62,4 @@ __all__ = [
     "make_csp_lda_pipeline",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
