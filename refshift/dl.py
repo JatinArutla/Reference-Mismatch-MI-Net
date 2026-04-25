@@ -192,6 +192,7 @@ def make_dl_model(
     drop_last: bool = False,
     device: Optional[str] = None,
     verbose: int = 0,
+    transforms=None,
 ):
     """Construct a braindecode EEGClassifier for one supervised training run.
 
@@ -232,6 +233,12 @@ def make_dl_model(
         None -> auto-detect.
     verbose : int
         skorch verbosity. Default 0 (silent; tqdm in run_mismatch gives progress).
+    transforms : list, Transform, or None
+        If non-None, the train iterator is swapped to braindecode's
+        ``AugmentedDataLoader`` and these transforms are applied per training
+        batch. Test/predict is unaffected. Used by ``run_mismatch_jitter``
+        for reference-jitter augmentation. None disables augmentation
+        (default; matches the canonical Phase 2 mismatch-matrix runs).
 
     Returns
     -------
@@ -282,15 +289,17 @@ def make_dl_model(
     if device == "cuda":
         module = module.cuda()
 
-    clf = EEGClassifier(
-        module,
+    # Build EEGClassifier kwargs. When transforms is given, swap the train
+    # iterator to AugmentedDataLoader and pass transforms through skorch's
+    # ``iterator_train__<param>`` plumbing. Test/predict path is unaffected.
+    classifier_kwargs = dict(
         criterion=torch.nn.CrossEntropyLoss,
         optimizer=torch.optim.AdamW,
         optimizer__lr=float(lr),
         optimizer__weight_decay=float(weight_decay),
         batch_size=int(batch_size),
         max_epochs=int(max_epochs),
-        train_split=None,  # full training on given X, y
+        train_split=None,
         iterator_train__shuffle=True,
         iterator_train__drop_last=bool(drop_last),
         callbacks=[
@@ -301,4 +310,10 @@ def make_dl_model(
         device=device,
         verbose=int(verbose),
     )
+    if transforms is not None:
+        from braindecode.augmentation import AugmentedDataLoader
+        classifier_kwargs["iterator_train"] = AugmentedDataLoader
+        classifier_kwargs["iterator_train__transforms"] = transforms
+
+    clf = EEGClassifier(module, **classifier_kwargs)
     return clf

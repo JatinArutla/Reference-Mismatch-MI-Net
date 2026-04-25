@@ -407,3 +407,213 @@ def mismatch_matrix(
     if aggregate == "std":
         return grouped.std().unstack("test_ref")
     raise ValueError(f"Unknown aggregate: {aggregate!r}")
+
+
+# ---------------------------------------------------------------------------
+# Reference-jitter augmentation runner (Phase 2 intervention)
+# ---------------------------------------------------------------------------
+
+def run_mismatch_jitter(
+    dataset_id: str,
+    *,
+    model: str,
+    condition: str = "full",
+    holdout_ref: str = "bipolar",
+    subjects: Optional[List[int]] = None,
+    seeds: List[int] = (0,),
+    test_reference_modes: tuple = REFERENCE_MODES,
+    split_strategy: str = "auto",
+    laplacian_k: int = 4,
+    montage: str = "standard_1005",
+    progress: bool = True,
+    dl_max_epochs: int = 200,
+    dl_batch_size: int = 32,
+    dl_lr: Optional[float] = None,
+    dl_weight_decay: float = 0.0,
+    dl_device: Optional[str] = None,
+    dl_verbose: int = 0,
+    dl_l_freq: float = 8.0,
+    dl_h_freq: float = 32.0,
+    dl_trial_start_offset_s: float = 0.0,
+    dl_trial_stop_offset_s: float = 0.0,
+) -> pd.DataFrame:
+    """Train one model per (subject, seed) with reference-jitter augmentation,
+    evaluate on all 7 test references.
+
+    Two conditions:
+
+      condition='full':
+          Each training sample independently gets a reference drawn uniformly
+          from all 7 modes. Tests at-distribution generalization across all
+          references the model has seen.
+
+      condition='lofo':
+          Each training sample independently gets a reference from
+          REFERENCE_MODES \\ {holdout_ref}. The model never sees holdout_ref
+          during training. Test-time accuracy on holdout_ref is the cleanest
+          probe of operator-invariance — the model has to generalize to a
+          previously-unseen reference.
+
+    Parameters
+    ----------
+    dataset_id : {'iv2a', 'openbmi', 'cho2017', 'dreyer2023'}
+    model : {'eegnet', 'shallow'}
+        DL only — jitter is meaningful for end-to-end models, not for the
+        CSP+LDA pipeline (which has no batched training loop to inject
+        per-sample reference randomness into).
+    condition : {'full', 'lofo'}
+    holdout_ref : str
+        Used only when condition='lofo'. Default 'bipolar' (the structurally
+        most distinct operator and the strongest test of generalization).
+    test_reference_modes : tuple of str
+        References to evaluate on at test time. Defaults to all 7.
+    Other parameters : see ``run_mismatch``.
+
+    Returns
+    -------
+    DataFrame with columns
+        ``dataset, subject, seed, condition, holdout_ref, train_modes,
+        test_ref, accuracy, kappa, n_train, n_test``.
+
+    There is no ``train_ref`` column because each sample sees a different
+    reference; ``train_modes`` is the comma-joined set the sampler drew from.
+    """
+    from refshift.dl import SUPPORTED_DL_MODELS, load_dl_data, make_dl_model
+    from refshift.jitter import make_random_reference_transform
+
+    model_lc = model.lower()
+    if model_lc not in SUPPORTED_DL_MODELS:
+        raise ValueError(
+            f"run_mismatch_jitter requires a DL model. "
+            f"Got model={model!r}; supported: {SUPPORTED_DL_MODELS}."
+        )
+    cond = condition.lower()
+    if cond not in ("full", "lofo"):
+        raise ValueError(f"Unknown condition: {condition!r}. Use 'full' or 'lofo'.")
+    if cond == "lofo" and holdout_ref not in REFERENCE_MODES:
+        raise ValueError(
+            f"holdout_ref={holdout_ref!r} not in REFERENCE_MODES={REFERENCE_MODES}"
+        )
+
+    dataset, _paradigm = _resolve_dataset(dataset_id)
+    if subjects is None:
+        subjects = list(dataset.subject_list)
+    seeds = list(seeds)
+    test_modes = tuple(test_reference_modes)
+
+    # Reference set for the train-time sampler
+    if cond == "full":
+        train_modes = tuple(REFERENCE_MODES)
+        holdout_label = ""
+    else:
+        train_modes = tuple(m for m in REFERENCE_MODES if m != holdout_ref)
+        holdout_label = holdout_ref
+    train_modes_str = ",".join(train_modes)
+
+    # Graph for spatial / REST modes (needed by the train-time sampler if
+    # any of laplacian/bipolar/rest is in train_modes, AND/OR by test-time
+    # apply_reference for any spatial test mode).
+    needs_graph = any(
+        m in ("laplacian", "bipolar", "rest")
+        for m in set(train_modes) | set(test_modes)
+    )
+    needs_rest = ("rest" in train_modes) or ("rest" in test_modes)
+    graph = None
+    if needs_graph:
+        ch_names = _get_eeg_channel_names(dataset, subject=subjects[0])
+        graph = build_graph(
+            ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
+        )
+
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(it, **kwargs):
+            return it
+
+    jobs = [(s, k) for s in subjects for k in seeds]
+    iterator = _tqdm(
+        jobs,
+        desc=f"[{dataset.code}] {model_lc} jitter-{cond}",
+        disable=not progress, leave=True,
+    )
+
+    rows: List[dict] = []
+    last_subject: Optional[int] = None
+    X = y_int = metadata = None
+    sfreq: Optional[float] = None
+
+    for subject, seed in iterator:
+        if subject != last_subject:
+            X, y_int, metadata, sfreq, _ = load_dl_data(
+                dataset_id, subject,
+                l_freq=dl_l_freq, h_freq=dl_h_freq,
+                trial_start_offset_s=dl_trial_start_offset_s,
+                trial_stop_offset_s=dl_trial_stop_offset_s,
+            )
+            last_subject = subject
+
+        X_tr, y_tr, X_te, y_te = _split_train_test(
+            X, y_int, metadata, strategy=split_strategy, seed=seed,
+        )
+
+        # Pre-compute every test variant once. We intentionally compute all
+        # 7 even under LOFO so the table includes the held-out test-ref
+        # accuracy in the same row layout as the full-jitter table.
+        X_te_by_ref = {
+            m: apply_reference(X_te, m, graph=graph) for m in test_modes
+        }
+        n_classes = int(max(int(y_tr.max()), int(y_te.max()))) + 1
+
+        # Build the per-sample random-reference transform. random_state is
+        # tied to the (subject, seed, condition) triple so reproducibility
+        # is preserved across re-runs.
+        rng_seed = int(1_000_003 * int(seed) + 7919 * int(subject))
+        ref_transform = make_random_reference_transform(
+            allowed_modes=train_modes,
+            graph=graph,
+            probability=1.0,
+            random_state=rng_seed,
+        )
+
+        pipe = make_dl_model(
+            model=model_lc,
+            n_channels=X_tr.shape[1],
+            n_classes=n_classes,
+            n_times=X_tr.shape[2],
+            sfreq=float(sfreq),
+            seed=int(seed),
+            max_epochs=dl_max_epochs,
+            batch_size=dl_batch_size,
+            lr=dl_lr,
+            weight_decay=dl_weight_decay,
+            device=dl_device,
+            verbose=dl_verbose,
+            transforms=[ref_transform],
+        )
+
+        # The training data is intentionally passed in *native* form. The
+        # transform re-references each sample at batch-time; if we apply a
+        # reference here too, we'd be transforming twice.
+        pipe.fit(X_tr, y_tr)
+
+        for test_ref in test_modes:
+            y_pred = pipe.predict(X_te_by_ref[test_ref])
+            rows.append({
+                "dataset":     dataset.code,
+                "subject":     subject,
+                "seed":        seed,
+                "condition":   cond,
+                "holdout_ref": holdout_label,
+                "train_modes": train_modes_str,
+                "test_ref":    test_ref,
+                "accuracy":    float(accuracy_score(y_te, y_pred)),
+                "kappa":       float(cohen_kappa_score(y_te, y_pred)),
+                "n_train":     int(len(y_tr)),
+                "n_test":      int(len(y_te)),
+            })
+
+        del pipe
+        _free_cuda()
+
+    return pd.DataFrame(rows)

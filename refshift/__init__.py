@@ -5,6 +5,8 @@ Notebook API:
     setup_kaggle_env()          environment + MOABB dataset symlinks
     calibrate_csp_lda(...)      MOABB calibration, returns (results, summary, passed)
     run_mismatch(...)           7x7 mismatch matrix by dataset_id (CSP+LDA or DL)
+    run_mismatch_jitter(...)    DL training with per-sample reference jitter
+                                (full or LOFO-bipolar), evaluated on all 7 refs
     mismatch_matrix(df, ...)    pivot long-form results into a 7x7 table
 
 Primitives:
@@ -17,6 +19,7 @@ Primitives:
 Phase 2 (DL):
     refshift.dl.load_dl_data    braindecode MOABBDataset + canonical preprocess
     refshift.dl.make_dl_model   EEGNetv4 / ShallowFBCSPNet factory (skorch-wrapped)
+    refshift.jitter             RandomReferenceTransform for per-sample jitter
     SUPPORTED_DL_MODELS         ('eegnet', 'shallow')
 """
 
@@ -31,6 +34,7 @@ from refshift.experiments import (
     calibrate_csp_lda,
     mismatch_matrix,
     run_mismatch,
+    run_mismatch_jitter,
 )
 from refshift.env import setup_kaggle_env, setup_moabb_symlinks
 from refshift.plotting import plot_mismatch_matrix
@@ -48,6 +52,7 @@ __all__ = [
     "setup_moabb_symlinks",
     "calibrate_csp_lda",
     "run_mismatch",
+    "run_mismatch_jitter",
     "mismatch_matrix",
     "plot_mismatch_matrix",
     "mismatch_std_matrix",
@@ -62,4 +67,4 @@ __all__ = [
     "make_csp_lda_pipeline",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
