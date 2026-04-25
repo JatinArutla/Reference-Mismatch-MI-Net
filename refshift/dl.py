@@ -47,6 +47,23 @@ _DATASET_ID_TO_MOABB = {
 }
 
 
+def _scale_volts_to_microvolts(data):
+    """Scale a raw ndarray from Volts to microvolts.
+
+    Module-level (not a lambda) so braindecode's Preprocessor can pickle it,
+    which (a) silences the "lambda cannot be saved" and "apply_on_array
+    auto-correcting" warnings, and (b) allows braindecode's preprocessing
+    cache to be reused across runs if the dataset is persisted.
+
+    Multiplying by 1e6 is numerically a no-op against the downstream
+    exponential_moving_standardize step (which renormalizes per-channel to
+    zero mean, unit variance), but we keep it for consistency with MOABB's
+    paradigm path, which applies dataset.unit_factor (= 1e6 for all four
+    datasets in this study) before any downstream processing.
+    """
+    return data * 1e6
+
+
 def _moabb_code(dataset_id: str) -> str:
     """Map refshift dataset_id -> braindecode MOABBDataset class name."""
     key = dataset_id.lower()
@@ -123,7 +140,7 @@ def load_dl_data(
 
     preprocessors = [
         Preprocessor("pick_types", eeg=True, meg=False, stim=False),
-        Preprocessor(lambda data: data * 1e6, apply_on_array=True),
+        Preprocessor(_scale_volts_to_microvolts, apply_on_array=True),
         Preprocessor("filter", l_freq=l_freq, h_freq=h_freq),
         Preprocessor(
             exponential_moving_standardize,
