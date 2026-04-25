@@ -39,9 +39,12 @@ from refshift.experiments import (
 from refshift.env import setup_kaggle_env, setup_moabb_symlinks
 from refshift.plotting import plot_mismatch_matrix
 from refshift.analysis import (
+    baseline_col_off_diag_view,
+    baseline_diagonal_view,
     cluster_references,
     mismatch_std_matrix,
     operator_distance_correlation,
+    paired_wilcoxon_per_test_ref,
     plot_dendrogram,
     plot_operator_distance_scatter,
 )
@@ -60,6 +63,9 @@ __all__ = [
     "plot_dendrogram",
     "operator_distance_correlation",
     "plot_operator_distance_scatter",
+    "paired_wilcoxon_per_test_ref",
+    "baseline_diagonal_view",
+    "baseline_col_off_diag_view",
     "REFERENCE_MODES",
     "DatasetGraph",
     "ReferenceTransformer",
@@ -67,4 +73,4 @@ __all__ = [
     "make_csp_lda_pipeline",
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
