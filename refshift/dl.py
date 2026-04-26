@@ -1,6 +1,6 @@
 """Phase 2 DL pipelines via braindecode + skorch.
 
-Two architectures are supported: ``eegnet`` (EEGNetv4 with F1=8, D=2 — the
+Two architectures are supported: ``eegnet`` (EEGNet with F1=8, D=2 — the
 EEGNet_8_2 configuration benchmarked in MOABB) and ``shallow``
 (ShallowFBCSPNet from Schirrmeister et al. 2017, the canonical braindecode
 model for motor-imagery decoding).
@@ -372,7 +372,7 @@ def make_dl_model(
     # Lazy imports so module imports cheaply without [dl] extras.
     import torch
     from braindecode import EEGClassifier
-    from braindecode.models import EEGNetv4, ShallowFBCSPNet
+    from braindecode.models import EEGNet, ShallowFBCSPNet
     from braindecode.util import set_random_seeds
     from skorch.callbacks import LRScheduler
 
@@ -400,7 +400,7 @@ def make_dl_model(
     else:  # eegnet
         if lr is None:
             lr = 1e-3  # Lawhern-2018 canonical
-        module = EEGNetv4(
+        module = EEGNet(
             n_chans=int(n_channels),
             n_outputs=int(n_classes),
             n_times=int(n_times),
