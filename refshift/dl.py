@@ -1,6 +1,6 @@
 """Phase 2 DL pipelines via braindecode + skorch.
 
-Two architectures are supported: ``eegnet`` (EEGNet with F1=8, D=2 — the
+Two architectures are supported: ``eegnet`` (EEGNetv4 with F1=8, D=2 — the
 EEGNet_8_2 configuration benchmarked in MOABB) and ``shallow``
 (ShallowFBCSPNet from Schirrmeister et al. 2017, the canonical braindecode
 model for motor-imagery decoding).
@@ -75,6 +75,46 @@ def _moabb_code(dataset_id: str) -> str:
     return _DATASET_ID_TO_MOABB[key]
 
 
+# ---------------------------------------------------------------------------
+# Disk cache for preprocessed (X, y, metadata, sfreq, ch_names) tensors
+# ---------------------------------------------------------------------------
+#
+# A thin .npz cache keyed on a hash of the preprocessing parameters. The
+# point is purely to avoid re-running braindecode's filter + EMS on the
+# same Raws when we run multiple architectures / jitter conditions on the
+# same dataset. Reference operators are applied AFTER this layer, so all
+# 7 reference variants share a single cached entry.
+#
+# When future preprocessing-mismatch experiments add new knobs to
+# load_dl_data (resample target, filter type, window length), add them to
+# _CACHE_KEY_PARAMS so each variant gets its own slot.
+#
+# If a cache file is corrupt, the user deletes the directory and reruns.
+
+_CACHE_KEY_PARAMS = (
+    "dataset_id", "subject", "l_freq", "h_freq",
+    "ems_factor_new", "ems_init_block_size",
+    "trial_start_offset_s", "trial_stop_offset_s",
+)
+
+
+def _cache_path(cache_dir: str, params: dict) -> str:
+    """Return ``<cache_dir>/<dataset_id>/sub-<NNN>/<hash>.npz``."""
+    import hashlib
+    import json
+    import os
+
+    relevant = {k: params[k] for k in _CACHE_KEY_PARAMS}
+    key = hashlib.sha1(
+        json.dumps(relevant, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    subdir = os.path.join(
+        cache_dir, params["dataset_id"], f"sub-{int(params['subject']):03d}",
+    )
+    os.makedirs(subdir, exist_ok=True)
+    return os.path.join(subdir, f"{key}.npz")
+
+
 def load_dl_data(
     dataset_id: str,
     subject: int,
@@ -87,6 +127,7 @@ def load_dl_data(
     trial_stop_offset_s: float = 0.0,
     preload: bool = True,
     n_jobs: int = 1,
+    cache_dir: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float, List[str]]:
     """Load one subject's MI data in the braindecode + MOABB canonical protocol.
 
@@ -99,6 +140,18 @@ def load_dl_data(
 
     Reference operators are NOT applied here — ``run_mismatch`` applies them
     to X after this returns.
+
+    If ``cache_dir`` is provided, the preprocessed (X, y, metadata, sfreq,
+    ch_names) tuple is read from / written to a per-subject ``.npz`` file
+    keyed on a hash of all preprocessing parameters. Re-referencing happens
+    after this function returns, so all 7 reference variants share one cache
+    entry. Filter band, EMS settings, and trial offsets are part of the key,
+    so future preprocessing-mismatch experiments (e.g. filter-band mismatch)
+    automatically get separate cache slots without code changes.
+
+    Cache misses (file missing, sidecar malformed, parameters disagree,
+    format-version stale, or any disk error) silently fall back to the full
+    preprocess pipeline and write a fresh entry.
 
     Parameters
     ----------
@@ -114,9 +167,15 @@ def load_dl_data(
         Offsets (seconds) applied to MOABB's event-defined trial window.
         Default 0.0 / 0.0 keeps MOABB's native trial interval.
     preload : bool
-        Preload windows into memory. Default True.
+        Preload windows into memory. Default True. Not part of the cache key.
     n_jobs : int
-        Parallel preprocess jobs. Default 1 for reproducibility.
+        Parallel preprocess jobs. Default 1 for reproducibility. Not part of
+        the cache key.
+    cache_dir : str or None
+        Root directory for the preprocessed-tensor cache. If None (default),
+        no caching: every call runs the full preprocess pipeline. If a path
+        is provided, it is created if missing and used for read/write.
+        Each cache entry is ~5-200 MB depending on dataset.
 
     Returns
     -------
@@ -126,7 +185,39 @@ def load_dl_data(
     sfreq : float
     ch_names : list of str (EEG channel order of X's axis=1)
     """
-    # Lazy imports so that `import refshift` doesn't require `[dl]` extras.
+    # Cache parameters: anything in _CACHE_KEY_PARAMS gets hashed.
+    params = {
+        "dataset_id": str(dataset_id).lower(),
+        "subject": int(subject),
+        "l_freq": float(l_freq),
+        "h_freq": float(h_freq),
+        "ems_factor_new": float(ems_factor_new),
+        "ems_init_block_size": int(ems_init_block_size),
+        "trial_start_offset_s": float(trial_start_offset_s),
+        "trial_stop_offset_s": float(trial_stop_offset_s),
+    }
+
+    # Cache lookup. If the file exists, load it; if anything goes wrong,
+    # fall through to the full preprocess and overwrite.
+    cache_path = _cache_path(cache_dir, params) if cache_dir is not None else None
+    if cache_path is not None:
+        import os
+        if os.path.exists(cache_path):
+            try:
+                npz = np.load(cache_path, allow_pickle=True)
+                metadata = pd.DataFrame({
+                    "session": npz["metadata_session"],
+                    "run": npz["metadata_run"],
+                    "subject": npz["metadata_subject"],
+                })
+                return (npz["X"], npz["y"], metadata,
+                        float(npz["sfreq"].item()), list(npz["ch_names"]))
+            except Exception:
+                # Corrupt or unreadable cache file (truncated download,
+                # partial write, format mismatch). Fall through and overwrite.
+                pass
+
+    # Cache miss (or caching disabled): run the canonical preprocess.
     from braindecode.datasets import MOABBDataset
     from braindecode.preprocessing import (
         Preprocessor,
@@ -191,6 +282,21 @@ def load_dl_data(
     X = np.stack(Xs).astype(np.float32, copy=False)
     y = np.array(ys, dtype=np.int64)
     metadata = pd.DataFrame(rows)
+
+    # Cache write. Don't let a disk error fail the otherwise-successful run.
+    if cache_path is not None:
+        try:
+            np.savez(
+                cache_path[:-len(".npz")],  # np.savez auto-appends .npz
+                X=X, y=y, sfreq=np.float64(sfreq),
+                metadata_session=metadata["session"].to_numpy(),
+                metadata_run=metadata["run"].to_numpy(),
+                metadata_subject=metadata["subject"].to_numpy(),
+                ch_names=np.asarray(ch_names, dtype=object),
+            )
+        except OSError:
+            pass
+
     return X, y, metadata, sfreq, ch_names
 
 
@@ -266,7 +372,7 @@ def make_dl_model(
     # Lazy imports so module imports cheaply without [dl] extras.
     import torch
     from braindecode import EEGClassifier
-    from braindecode.models import EEGNet, ShallowFBCSPNet
+    from braindecode.models import EEGNetv4, ShallowFBCSPNet
     from braindecode.util import set_random_seeds
     from skorch.callbacks import LRScheduler
 
@@ -294,7 +400,7 @@ def make_dl_model(
     else:  # eegnet
         if lr is None:
             lr = 1e-3  # Lawhern-2018 canonical
-        module = EEGNet(
+        module = EEGNetv4(
             n_chans=int(n_channels),
             n_outputs=int(n_classes),
             n_times=int(n_times),

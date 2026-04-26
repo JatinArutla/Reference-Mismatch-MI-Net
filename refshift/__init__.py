@@ -17,7 +17,13 @@ Primitives:
     make_csp_lda_pipeline       CSP+LDA pipeline matching MOABB's canonical CSP.yml
 
 Phase 2 (DL):
-    refshift.dl.load_dl_data    braindecode MOABBDataset + canonical preprocess
+    refshift.dl.load_dl_data    braindecode MOABBDataset + canonical preprocess.
+                                Supports a ``cache_dir=`` argument that
+                                caches the preprocessed (X, y, metadata,
+                                sfreq, ch_names) tuple to disk keyed on a
+                                hash of all preprocessing parameters; reused
+                                automatically by both ``run_mismatch`` and
+                                ``run_mismatch_jitter`` via ``dl_cache_dir=``.
     refshift.dl.make_dl_model   EEGNetv4 / ShallowFBCSPNet factory (skorch-wrapped)
     refshift.jitter             RandomReferenceTransform for per-sample jitter
     SUPPORTED_DL_MODELS         ('eegnet', 'shallow')
@@ -73,4 +79,4 @@ __all__ = [
     "make_csp_lda_pipeline",
 ]
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"

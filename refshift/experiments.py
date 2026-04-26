@@ -30,28 +30,55 @@ from refshift.reference import REFERENCE_MODES, apply_reference, build_graph
 DATASET_IDS = ("iv2a", "openbmi", "cho2017", "dreyer2023")
 
 
+# Subjects with known data-quality issues in the public dataset release.
+# These are excluded from the default ``subject_list`` returned by
+# ``_resolve_dataset`` so that ``run_mismatch(dataset_id, subjects=None, ...)``
+# never silently hits a corrupt file mid-run. Callers can still pass
+# ``subjects=[...]`` explicitly to include or exclude any subjects they want;
+# this only changes the default.
+#
+# - openbmi (Lee2019_MI) subject 29: corrupt .mat in the GigaDB release;
+#   loadmat raises "could not read bytes" mid-stream. Confirmed against
+#   Phase 1 results (53/54 subjects, 29 absent).
+_KNOWN_BAD_SUBJECTS: dict = {
+    "openbmi": frozenset({29}),
+}
+
+
 def _resolve_dataset(dataset_id: str):
-    """Return (dataset, paradigm) for a short dataset_id."""
+    """Return (dataset, paradigm) for a short dataset_id.
+
+    The dataset's ``subject_list`` is filtered to drop any IDs in
+    ``_KNOWN_BAD_SUBJECTS[dataset_id]``. This is the *default* subject list
+    used when the caller passes ``subjects=None``; explicit ``subjects=``
+    overrides bypass the filter entirely.
+    """
     dataset_id = dataset_id.lower()
     if dataset_id == "iv2a":
         from moabb.datasets import BNCI2014_001
         from moabb.paradigms import MotorImagery
-        return BNCI2014_001(), MotorImagery(n_classes=4)
-    if dataset_id == "openbmi":
+        ds, paradigm = BNCI2014_001(), MotorImagery(n_classes=4)
+    elif dataset_id == "openbmi":
         from moabb.datasets import Lee2019_MI
         from moabb.paradigms import LeftRightImagery
-        return Lee2019_MI(), LeftRightImagery()
-    if dataset_id == "cho2017":
+        ds, paradigm = Lee2019_MI(), LeftRightImagery()
+    elif dataset_id == "cho2017":
         from moabb.datasets import Cho2017
         from moabb.paradigms import LeftRightImagery
-        return Cho2017(), LeftRightImagery()
-    if dataset_id == "dreyer2023":
+        ds, paradigm = Cho2017(), LeftRightImagery()
+    elif dataset_id == "dreyer2023":
         from moabb.datasets import Dreyer2023
         from moabb.paradigms import LeftRightImagery
-        return Dreyer2023(), LeftRightImagery()
-    raise ValueError(
-        f"Unknown dataset_id: {dataset_id!r}. Known: {DATASET_IDS}"
-    )
+        ds, paradigm = Dreyer2023(), LeftRightImagery()
+    else:
+        raise ValueError(
+            f"Unknown dataset_id: {dataset_id!r}. Known: {DATASET_IDS}"
+        )
+
+    bad = _KNOWN_BAD_SUBJECTS.get(dataset_id, frozenset())
+    if bad:
+        ds.subject_list = [s for s in ds.subject_list if s not in bad]
+    return ds, paradigm
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +254,7 @@ def run_mismatch(
     dl_h_freq: float = 32.0,
     dl_trial_start_offset_s: float = 0.0,
     dl_trial_stop_offset_s: float = 0.0,
+    dl_cache_dir: 'Optional[str]' = None,
 ) -> pd.DataFrame:
     """Run the 7x7 mismatch matrix on a dataset.
 
@@ -243,8 +271,10 @@ def run_mismatch(
         ``csp_lda`` uses the MOABB paradigm path (Phase 1).
         ``eegnet`` / ``shallow`` use ``refshift.dl`` (Phase 2).
     subjects : list of int or None
-        None -> all subjects in the dataset. For OpenBMI pass
-        ``[s for s in range(1, 55) if s != 29]`` (subject 29 is corrupt).
+        None -> all subjects in the dataset, with known-bad subjects excluded
+        (currently: OpenBMI subject 29, due to a corrupt .mat in the GigaDB
+        release; see ``_KNOWN_BAD_SUBJECTS`` in this module). Pass an
+        explicit list to override (this bypasses the bad-subject filter).
     seeds : list of int
         For stratified-split datasets and for DL training. For CSP+LDA on
         session-split datasets, seeds are near-redundant.
@@ -325,6 +355,7 @@ def run_mismatch(
                     l_freq=dl_l_freq, h_freq=dl_h_freq,
                     trial_start_offset_s=dl_trial_start_offset_s,
                     trial_stop_offset_s=dl_trial_stop_offset_s,
+                    cache_dir=dl_cache_dir,
                 )
             else:
                 X, y_raw, metadata = paradigm.get_data(
@@ -436,6 +467,7 @@ def run_mismatch_jitter(
     dl_h_freq: float = 32.0,
     dl_trial_start_offset_s: float = 0.0,
     dl_trial_stop_offset_s: float = 0.0,
+    dl_cache_dir: 'Optional[str]' = None,
 ) -> pd.DataFrame:
     """Train one model per (subject, seed) with reference-jitter augmentation,
     evaluate on all 7 test references.
@@ -550,6 +582,7 @@ def run_mismatch_jitter(
                 l_freq=dl_l_freq, h_freq=dl_h_freq,
                 trial_start_offset_s=dl_trial_start_offset_s,
                 trial_stop_offset_s=dl_trial_stop_offset_s,
+                cache_dir=dl_cache_dir,
             )
             last_subject = subject
 
