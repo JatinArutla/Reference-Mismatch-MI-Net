@@ -1,6 +1,6 @@
 """Phase 2 DL pipelines via braindecode + skorch.
 
-Two architectures are supported: ``eegnet`` (EEGNet with F1=8, D=2 — the
+Two architectures are supported: ``eegnet`` (EEGNetv4 with F1=8, D=2 — the
 EEGNet_8_2 configuration benchmarked in MOABB) and ``shallow``
 (ShallowFBCSPNet from Schirrmeister et al. 2017, the canonical braindecode
 model for motor-imagery decoding).
@@ -73,6 +73,51 @@ def _moabb_code(dataset_id: str) -> str:
             f"Known: {tuple(_DATASET_ID_TO_MOABB)}"
         )
     return _DATASET_ID_TO_MOABB[key]
+
+
+def _build_braindecode_dataset(dataset_id: str, subject: int, moabb_code: str):
+    """Construct a braindecode dataset for one subject.
+
+    For most datasets this is a direct ``MOABBDataset(name, subject_ids=[s])``.
+    For OpenBMI we have to bypass that path and build the dataset manually
+    because we need to:
+      - pass ``test_run=True`` to load both the calibration ('1train') and
+        online ('4test') runs (n=200/subject instead of 100), and
+      - clear ``_selected_sessions`` post-construction to work around a
+        MOABB 1.5.0 bug where the session filter accepts user-facing labels
+        ('1', '2') but the loader writes zero-indexed keys ('0', '1');
+        without this, every call silently drops one session (n=400 -> 200).
+
+    These two together get OpenBMI from the broken default 100 trials/subject
+    up to the full 400 trials/subject. Other datasets are unaffected and use
+    braindecode's default MOABBDataset path.
+    """
+    from braindecode.datasets import MOABBDataset
+
+    if dataset_id != "openbmi":
+        return MOABBDataset(dataset_name=moabb_code, subject_ids=[int(subject)])
+
+    # OpenBMI workaround path. We build the MOABB dataset ourselves, apply
+    # the _selected_sessions fix, then assemble the same braindecode object
+    # that MOABBDataset would have constructed.
+    from braindecode.datasets.base import BaseConcatDataset, RawDataset
+    from braindecode.datasets.moabb import fetch_data_with_moabb
+    from moabb.datasets import Lee2019_MI
+
+    moabb_dataset = Lee2019_MI(test_run=True)
+    moabb_dataset._selected_sessions = None
+
+    # fetch_data_with_moabb accepts a pre-built BaseDataset object via its
+    # `dataset_name` parameter (despite the name); it then calls
+    # dataset.get_data and unpacks to (raws, description).
+    raws, description = fetch_data_with_moabb(
+        moabb_dataset, subject_ids=[int(subject)],
+    )
+    base_datasets = [
+        RawDataset(raw, row)
+        for raw, (_, row) in zip(raws, description.iterrows())
+    ]
+    return BaseConcatDataset(base_datasets)
 
 
 # ---------------------------------------------------------------------------
@@ -218,16 +263,15 @@ def load_dl_data(
                 pass
 
     # Cache miss (or caching disabled): run the canonical preprocess.
-    from braindecode.datasets import MOABBDataset
+    moabb_code = _moabb_code(dataset_id)
+    dataset = _build_braindecode_dataset(dataset_id, int(subject), moabb_code)
+
     from braindecode.preprocessing import (
         Preprocessor,
         create_windows_from_events,
         exponential_moving_standardize,
         preprocess,
     )
-
-    moabb_code = _moabb_code(dataset_id)
-    dataset = MOABBDataset(dataset_name=moabb_code, subject_ids=[int(subject)])
 
     preprocessors = [
         Preprocessor("pick_types", eeg=True, meg=False, stim=False),
@@ -372,7 +416,7 @@ def make_dl_model(
     # Lazy imports so module imports cheaply without [dl] extras.
     import torch
     from braindecode import EEGClassifier
-    from braindecode.models import EEGNet, ShallowFBCSPNet
+    from braindecode.models import EEGNetv4, ShallowFBCSPNet
     from braindecode.util import set_random_seeds
     from skorch.callbacks import LRScheduler
 
@@ -400,7 +444,7 @@ def make_dl_model(
     else:  # eegnet
         if lr is None:
             lr = 1e-3  # Lawhern-2018 canonical
-        module = EEGNet(
+        module = EEGNetv4(
             n_chans=int(n_channels),
             n_outputs=int(n_classes),
             n_times=int(n_times),
