@@ -79,4 +79,4 @@ __all__ = [
     "make_csp_lda_pipeline",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"

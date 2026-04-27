@@ -215,3 +215,31 @@ def test_resolve_dataset_iv2a_unfiltered():
     from refshift.experiments import _resolve_dataset
     ds, _ = _resolve_dataset("iv2a")
     assert sorted(ds.subject_list) == list(range(1, 10))
+
+
+# ---- OpenBMI loader regression: both sessions, both runs --------------------
+
+def test_resolve_dataset_openbmi_loads_both_sessions_and_runs():
+    """Regression test for the MOABB 1.5.0 Lee2019 session-filter bug.
+
+    With default Lee2019_MI() construction, MOABB silently drops one of the
+    two recording sessions (the loader writes keys as '0'/'1' but the filter
+    in BaseDataset.get_data accepts only '1'/'2'). Default behavior gives 100
+    trials/subject; with our workaround, we expect 400 (2 sessions x 2 runs x
+    100 trials).
+
+    This test inspects the dataset object's configuration without actually
+    loading any data — the loaders are MOABB-internal and need real .mat
+    files. The configuration check is a tight proxy for the bug fix.
+    """
+    pytest.importorskip("moabb")
+    from refshift.experiments import _resolve_dataset
+
+    ds, _ = _resolve_dataset("openbmi")
+    # Both runs requested
+    assert ds.train_run is True
+    assert ds.test_run is True
+    # Filter disabled (the workaround)
+    assert ds._selected_sessions is None
+    # Sessions tuple still set internally
+    assert ds.sessions == (1, 2)
