@@ -1,21 +1,15 @@
 # refshift
 
-Reference-shift experiments for motor-imagery (MI) EEG decoding, built on top
-of [MOABB](https://github.com/NeuroTechX/moabb).
+Reference-shift experiments for motor-imagery (MI) EEG decoding, built on
+top of [MOABB](https://github.com/NeuroTechX/moabb) and
+[braindecode](https://github.com/braindecode/braindecode).
 
-**Empirical claim:** a classifier trained under one EEG reference operator
+**Empirical claim.** A classifier trained under one EEG reference operator
 (CAR, Laplacian, REST, ...) and tested under another suffers a structured,
-predictable accuracy collapse. We measure it across four MOABB motor-imagery
-datasets and seven reference operators using the CSP+LDA pipeline from
-MOABB's canonical `CSP.yml`.
-
-Phase 1 (this drop) — seven reference operators, MOABB-matching CSP+LDA
-pipeline, four-dataset mismatch matrix, calibration against MOABB's published
-numbers, 19 passing unit tests.
-
-Phase 2 (planned) — EEGNet / ShallowFBCSPNet / ATCNet via
-[braindecode](https://github.com/braindecode/braindecode), full-jitter
-training intervention, SSL with reference-pair positives. Not in this drop.
+predictable accuracy collapse. We measure this across four MOABB
+motor-imagery datasets, three decoder families (CSP+LDA,
+ShallowFBCSPNet, EEGNet), seven reference operators, and one mitigation
+(per-sample reference jitter).
 
 ## Reference operators
 
@@ -27,28 +21,30 @@ training intervention, SSL with reference-pair positives. Not in this drop.
 |  | `gs` | X − leave-one-out mean projection (Gram-Schmidt) |
 | Spatial-differential | `laplacian` | X − mean of k=4 nearest neighbours |
 |  | `bipolar` | X − single nearest neighbour |
-| Source-model | `rest` | Yao 2001 Reference Electrode Standardization Technique (estimates the potential at infinity via a three-layer spherical head model) |
+| Source-model | `rest` | Yao 2001 Reference Electrode Standardization Technique |
 
-Nearest-neighbour graphs are computed from MNE's `standard_1005` montage,
-which covers every EEG channel in the four datasets. REST is built from the
-same montage via `mne.make_sphere_model` + `mne.make_forward_solution` —
-10–60 seconds per dataset, computed once and cached.
+Nearest-neighbour graphs are computed from MNE's `standard_1005` montage.
+REST is built from the same montage via a three-layer spherical head model
+(`mne.make_sphere_model` + `mne.make_forward_solution`), 10–60 seconds per
+dataset, computed once.
 
 ## Package layout
 
 ```
 Reference-Mismatch-MI-Net/
 ├── refshift/
-│   ├── __init__.py       public API
+│   ├── __init__.py       public API surface
 │   ├── reference.py      7 operators, neighbour graph, REST matrix, sklearn transformer
 │   ├── pipelines.py      make_csp_lda_pipeline (matches MOABB CSP.yml verbatim)
-│   ├── experiments.py    calibrate_csp_lda, run_mismatch, mismatch_matrix
-│   ├── env.py            Kaggle setup + per-dataset cache symlinks + Dreyer patch
-│   ├── plotting.py       plot_mismatch_matrix (viridis 0–100, diagonal boxes)
-│   └── analysis.py       std matrix, hierarchical clustering, operator-distance correlation
-├── tests/
-│   ├── test_reference.py   19 pure-numpy tests (operators, graph, REST)
-│   └── test_analysis.py    10 pure-numpy tests (std/clustering/op-distance)
+│   ├── experiments.py    calibrate_csp_lda, run_mismatch, run_mismatch_jitter
+│   ├── dl.py             load_dl_data, make_dl_model (braindecode + skorch)
+│   ├── jitter.py         RandomReferenceTransform for per-sample reference jitter
+│   ├── analysis.py       std matrix, clustering, op-distance correlation, Wilcoxon
+│   ├── plotting.py       plot_mismatch_matrix
+│   ├── env.py            Kaggle setup + per-dataset cache symlinks
+│   └── compat.py         MOABB / braindecode workarounds (one place, documented)
+├── tests/                87 unit tests, none requires MOABB or network
+├── KNOWN_LIMITATIONS.md  methodological caveats and upstream-bug workarounds
 ├── pyproject.toml
 ├── requirements.txt
 ├── LICENSE
@@ -59,11 +55,11 @@ Reference-Mismatch-MI-Net/
 
 ```bash
 pip install -r requirements.txt
-pip install -e .
+pip install -e .[dl]   # `[dl]` adds torch / braindecode / skorch
 ```
 
-MOABB is pinned to **1.5.0**. Loosen only after re-verifying the 65.99 ± 15.47
-IV-2a CSP+LDA calibration target against MOABB's published benchmark.
+MOABB is pinned to 1.5.0. See `KNOWN_LIMITATIONS.md` for upstream issues
+the codebase works around at this version.
 
 ## Tests
 
@@ -71,13 +67,12 @@ IV-2a CSP+LDA calibration target against MOABB's published benchmark.
 pytest tests/ -v
 ```
 
-Expect **29/29 passing** (19 reference operator tests + 10 analysis tests).
-None requires MOABB or network access.
+Expect **87/87 passing**. None requires MOABB downloads or network access.
 
 ## Kaggle usage
 
-Clone → install → setup → calibrate → run. The notebook API is the intended
-entry point; there is no CLI.
+Clone → install → setup → run. The notebook API is the intended entry
+point; there is no CLI.
 
 ### Cell 1 — clone, install, environment
 
@@ -94,7 +89,7 @@ subprocess.run(
 os.chdir("Reference-Mismatch-MI-Net")
 
 !pip install -r requirements.txt --quiet
-!pip install -e . --quiet
+!pip install -e .[dl] --quiet
 
 from refshift import setup_kaggle_env
 setup_kaggle_env()
@@ -105,10 +100,10 @@ os.makedirs(RESULTS, exist_ok=True)
 
 `setup_kaggle_env()` sets `MNE_DATA=/kaggle/working/mne_data`,
 `MOABB_RESULTS=/kaggle/working/moabb_results`, caps BLAS threads at 1, and
-symlinks the Kaggle input datasets into MOABB's cache layout so MOABB does
-not re-download.
+symlinks Kaggle input datasets into MOABB's cache layout so MOABB does not
+re-download.
 
-Known Kaggle paths (override with env vars if yours differ):
+Known Kaggle paths (override via env vars if yours differ):
 
 | Dataset | Env var | Default Kaggle path |
 |---|---|---|
@@ -117,7 +112,7 @@ Known Kaggle paths (override with env vars if yours differ):
 | Cho2017 | `REFSHIFT_CHO2017_ROOT` | `/kaggle/input/datasets/delhialli/cho2017` |
 | Dreyer2023 | `REFSHIFT_DREYER_ROOT` | `/kaggle/input/datasets/delhialli/dreyer2023/MNE-Dreyer2023-data` |
 
-### Cell 2 — calibration
+### Cell 2 — calibration (optional but recommended for first-time setup)
 
 ```python
 from refshift import calibrate_csp_lda
@@ -125,83 +120,81 @@ _, summary, passed = calibrate_csp_lda("iv2a")
 assert passed, "calibration FAILED — do not trust downstream numbers"
 ```
 
-Expected: `CSP+LDA (bare)` ≈ 65.99 ± 15, identity check within 0.5% of bare.
-If this doesn't pass, stop and debug before any further runs.
+Expected: CSP+LDA (bare) ≈ 65.99 ± 15 on IV-2a, identity check within 0.5%
+of bare. If this fails, stop and debug before running the mismatch matrix.
 
-### Cell 3 — the 7×7 mismatch matrix
+### Cell 3 — Phase 1: CSP+LDA mismatch matrix per dataset
 
 ```python
 from refshift import run_mismatch, mismatch_matrix, plot_mismatch_matrix
 import matplotlib.pyplot as plt
 
-df = run_mismatch("iv2a", seeds=[0])
-df.to_csv(f"{RESULTS}/iv2a_csp_lda.csv", index=False)
-
-print(mismatch_matrix(df).round(3))
-
-fig = plot_mismatch_matrix(
-    df, out_path=f"{RESULTS}/iv2a_heatmap.png",
-    title="CSP+LDA IV-2a (cross-session, 9 subjects)",
-)
-plt.close(fig)
-```
-
-Repeat for `openbmi`, `cho2017`, `dreyer2023`:
-
-```python
-openbmi_subjects = [s for s in range(1, 55) if s != 29]  # exclude corrupted sub 29
-
-for ds, kwargs in [
-    ("openbmi",    {"subjects": openbmi_subjects, "seeds": [0]}),
-    ("cho2017",    {"seeds": [0, 1, 2]}),
-    ("dreyer2023", {"seeds": [0, 1, 2]}),
-]:
-    df = run_mismatch(ds, **kwargs)
+for ds in ["iv2a", "openbmi", "cho2017", "dreyer2023"]:
+    df = run_mismatch(ds, model="csp_lda", seeds=[0])
     df.to_csv(f"{RESULTS}/{ds}_csp_lda.csv", index=False)
-    fig = plot_mismatch_matrix(df, out_path=f"{RESULTS}/{ds}_heatmap.png",
-                                title=f"CSP+LDA {ds}")
+    fig = plot_mismatch_matrix(
+        df, out_path=f"{RESULTS}/{ds}_heatmap.png",
+        title=f"CSP+LDA {ds}",
+    )
     plt.close(fig)
+    print(mismatch_matrix(df).round(3))
 ```
 
-`run_mismatch` shows a single tqdm progress bar over (subject, seed) pairs.
-No per-subject logging.
+`subjects=None` (default) excludes any known-bad subjects automatically; see
+`KNOWN_LIMITATIONS.md` for the OpenBMI subject-29 exclusion. Pass
+`subjects=[...]` to override.
 
-First call on a fresh subject triggers MOABB's full pipeline
-(load → filter-on-raw → epoch → scale); repeat calls read MOABB's disk
-cache under `$MNE_DATA`. Pass `cache=False` to force fresh loads.
-
-### Cell 4 — MOABB-native cross-session sanity check (optional but recommended)
-
-Calibration (Cell 2) uses `WithinSessionEvaluation`. `run_mismatch` uses a
-cross-session split. These are different evaluation protocols and will yield
-different diagonal numbers. This cell validates the cross-session number
-against MOABB's own `CrossSessionEvaluation`:
+### Cell 4 — Phase 2: DL mismatch matrix (Shallow / EEGNet)
 
 ```python
-from moabb.evaluations import CrossSessionEvaluation
-from moabb.datasets import BNCI2014_001
-from moabb.paradigms import MotorImagery
-from refshift.pipelines import make_csp_lda_pipeline
-
-evaluation = CrossSessionEvaluation(
-    paradigm=MotorImagery(n_classes=4),
-    datasets=[BNCI2014_001()],
-    overwrite=True,
-    random_state=42,
+df = run_mismatch(
+    "iv2a",
+    model="shallow",                  # or "eegnet"
+    seeds=[0, 1, 2],
+    dl_max_epochs=200,
+    dl_batch_size=32,
+    dl_cache_dir="/kaggle/working/cache",   # preprocessed-tensor cache
 )
-cross_results = evaluation.process({
-    "CSP+LDA (bare, cross-session)": make_csp_lda_pipeline(reference_mode=None),
-})
-cross_mean = 100 * cross_results["score"].mean()
-cross_std  = 100 * cross_results["score"].std()
-print(f"MOABB CrossSession IV-2a: {cross_mean:.2f} ± {cross_std:.2f}")
+df.to_csv(f"{RESULTS}/iv2a_shallow_seeds012.csv", index=False)
 ```
 
-`run_mismatch`'s diagonal `[native, native]` should match this within ~1
-percentage point. If it doesn't, there is a split-logic bug and all
-downstream numbers are suspect.
+`dl_cache_dir=` saves the preprocessed (X, y, metadata) tuple to disk per
+subject, keyed on a hash of all preprocessing parameters. Subsequent runs
+on the same dataset (different architecture, different seed, jitter
+condition) skip re-preprocessing.
 
-### Cell 5 — post-hoc analyses (runs on the CSVs from Cell 3)
+EEGNet on Cho2017 specifically is sensitive to learning rate; pass
+`dl_lr=5e-4` (Lawhern et al. 2018) to recover from the chance-level result
+under `dl_lr=1e-3` defaults. See `KNOWN_LIMITATIONS.md`.
+
+### Cell 5 — Phase 2 intervention: per-sample reference jitter
+
+```python
+from refshift import run_mismatch_jitter
+
+# Full-jitter: each training sample gets a random reference from all 7 modes
+df = run_mismatch_jitter(
+    "iv2a",
+    model="shallow",
+    condition="full",
+    seeds=[0, 1, 2],
+    dl_cache_dir="/kaggle/working/cache",
+)
+df.to_csv(f"{RESULTS}/iv2a_shallow_jitter_full_seeds012.csv", index=False)
+
+# Leave-one-reference-out: bipolar held out; train on the other 6
+df = run_mismatch_jitter(
+    "iv2a",
+    model="shallow",
+    condition="lofo",
+    holdout_ref="bipolar",
+    seeds=[0, 1, 2],
+    dl_cache_dir="/kaggle/working/cache",
+)
+df.to_csv(f"{RESULTS}/iv2a_shallow_jitter_lofo_bipolar_seeds012.csv", index=False)
+```
+
+### Cell 6 — post-hoc analyses
 
 Three analyses, all pure numpy/scipy, no MOABB, ~1 second each:
 
@@ -212,47 +205,33 @@ from refshift import (
     mismatch_matrix, mismatch_std_matrix,
     cluster_references, plot_dendrogram,
     operator_distance_correlation, plot_operator_distance_scatter,
+    paired_wilcoxon_per_test_ref,
+    baseline_diagonal_view, baseline_col_off_diag_view,
 )
 
-# IV-2a channel names (match the order in run_mismatch)
 IV2A_CHS = ["Fz","FC3","FC1","FCz","FC2","FC4","C5","C3","C1","Cz","C2","C4","C6",
             "CP3","CP1","CPz","CP2","CP4","P1","Pz","P2","POz"]
-# Channel lists for the other datasets are on the dataset's info object;
-# pull them from the first run_mismatch call or from MOABB docs.
 
-for ds, chs in [("iv2a", IV2A_CHS)]:  # extend with other datasets as needed
-    df = pd.read_csv(f"{RESULTS}/{ds}_csp_lda.csv")
-    M = mismatch_matrix(df)
-    S = mismatch_std_matrix(df)
+baseline = pd.read_csv(f"{RESULTS}/iv2a_shallow_seeds012.csv")
+M = mismatch_matrix(baseline)
 
-    print(f"\n=== {ds} ===")
-    print("Mean:\n", M.round(3))
-    print("Std (across subjects x seeds):\n", S.round(3))
+# Hierarchical clustering of references by transfer pattern
+cluster = cluster_references(M)
+plot_dendrogram(cluster, out_path=f"{RESULTS}/iv2a_dendrogram.png")
 
-    # Hierarchical clustering → dendrogram
-    cluster = cluster_references(M)
-    print(f"Clusters at k=3: {cluster.clusters[3]}")
-    fig = plot_dendrogram(cluster, out_path=f"{RESULTS}/{ds}_dendrogram.png",
-                           title=f"Reference clustering — {ds}")
-    plt.close(fig)
+# Spearman ρ between operator-matrix Frobenius distance and transfer gap
+odc = operator_distance_correlation(M, IV2A_CHS)
+print(f"Spearman ρ = {odc.spearman_rho:.3f} (p={odc.spearman_p:.1e})")
 
-    # Operator-distance correlation → scatter
-    odc = operator_distance_correlation(M, chs)
-    print(f"Spearman ρ(op-distance, transfer-gap) = {odc.spearman_rho:.3f} "
-          f"(p={odc.spearman_p:.1e}, n={len(odc.pair_table)})")
-    fig = plot_operator_distance_scatter(odc, out_path=f"{RESULTS}/{ds}_op_distance.png",
-                                          title=f"Operator distance vs transfer gap — {ds}")
-    plt.close(fig)
+# Significance of jitter intervention vs baseline
+jitter = pd.read_csv(f"{RESULTS}/iv2a_shallow_jitter_full_seeds012.csv")
+result = paired_wilcoxon_per_test_ref(
+    jitter, baseline_diagonal_view(baseline),
+    label_a="full_jitter", label_b="baseline_diag",
+    alternative="two-sided",
+)
+print(result.round(4).to_string(index=False))
 ```
-
-Expected for IV-2a (prototype run on the v1 draft matrix):
-- Clusters at k=3: `[['native','car','median','gs','rest'], ['laplacian'], ['bipolar']]`
-- Spearman ρ ≈ 0.80, p < 0.0001 (n=21 reference pairs)
-
-The dendrogram formalises the "one global-mean cluster + two spatial
-isolates" story from the heatmaps; the operator-distance scatter gives
-the Ben-David-style theoretical framing (transfer gap predicted by how
-far apart the operators are in matrix-valued space).
 
 ## Design notes
 
@@ -261,19 +240,16 @@ evaluators train once and score once per fold. The mismatch matrix needs
 one training per `train_ref` and seven scorings per fitted model. Wrapping
 MOABB's evaluation to extract the fitted classifier mid-fold requires
 private-API access. Instead, `run_mismatch` calls `paradigm.get_data()`
-directly (which carries all of MOABB's preprocessing: filter-on-raw,
-dataset-native epoch windows, correct scaling, dataset-specific quirks)
-and loops over train/test reference pairs in ~50 library lines. The
-calibration function uses `WithinSessionEvaluation` to validate the
-pipeline components against MOABB's published 65.99% number, and the
-mismatch runner inherits trust from the shared `make_csp_lda_pipeline`.
+directly and loops over train/test reference pairs in ~50 lines. The
+calibration function (Cell 2) uses `WithinSessionEvaluation` to validate
+against MOABB's published 65.99% number, and the mismatch runner inherits
+trust from the shared `make_csp_lda_pipeline`.
 
-**Cross-session vs within-session.** Calibration is within-session
-(5-fold CV per session, matches MOABB's 65.99%). `run_mismatch` is
-cross-session for multi-session datasets (IV-2a, OpenBMI) and stratified
-80/20 for single-session datasets (Cho2017, Dreyer2023). The diagonal of
-the mismatch matrix is therefore a few points below the calibration
-number — expected, not a bug.
+**Cross-session vs within-session.** The mismatch runner uses cross-session
+splits where the dataset has more than one MOABB session (IV-2a, OpenBMI),
+and stratified 80/20 within-session splits otherwise (Cho2017,
+Dreyer2023). The diagonal of the mismatch matrix is therefore a few points
+below the calibration number — expected, not a bug.
 
 **`ReferenceTransformer('native')` is a true identity but we still
 calibrate it.** `calibrate_csp_lda` runs both the bare CSP+LDA and the
@@ -285,36 +261,26 @@ the mismatch matrix.
 
 **REST (Yao 2001).** Implemented as a linear transformation matrix built
 from a three-layer spherical head model fit to the channel montage. The
-transform incorporates the centering operator `(I − 1_C 1_C^T / C)` so
-the result is invariant to additive re-referencing. Validated by unit
-tests: `T @ 1_C = 0` (reference invariance) and `REST(V) ≠ V` (non-trivial).
-Built on demand (`build_graph(..., include_rest=True)`); skip if you are
-not running the 'rest' mode to avoid a 10–60 s forward-solution compute
-per dataset.
+transform incorporates the centering operator `(I − 1_C 1_C^T / C)` so the
+result is invariant to additive re-referencing. Validated by unit tests:
+`T @ 1_C = 0` (reference invariance) and `REST(V) ≠ V` (non-trivial).
 
-**Graph construction uses `standard_1005`.** Every EEG channel in the
-four datasets is present. C3's single nearest neighbour on IV-2a under
-this montage is CP3 (anatomically correct; unit-tested).
-
-**Standardization.** Phase 1 uses none — CSP's OAS covariance estimator
-handles scale. Phase 2 will use braindecode's
+**Standardization.** Phase 1 (CSP+LDA) uses none — CSP's OAS covariance
+estimator handles scale. Phase 2 (DL) uses braindecode's
 `exponential_moving_standardize` on continuous raw before epoching, which
-is applied per-channel and therefore does not interact with the
-reference operator.
+is applied per-channel and therefore does not interact with the reference
+operator.
 
-## Calibration reference run (2026-04-22)
+**Per-sample reference jitter.** Implemented as a braindecode `Transform`
+plugged into `AugmentedDataLoader`. Each training sample independently
+gets a reference drawn uniformly from `allowed_modes`. The full-jitter
+condition uses all 7; LOFO uses 6 (one held out). See `refshift/jitter.py`.
 
-```
-CSP+LDA (bare)                              65.99 ± 15.92
-CSP+LDA (ReferenceTransformer='native')     65.96 ± 15.96
-Target 1 (MOABB 65.99% ± 2.0%):  got 65.99% -> PASS
-Target 2 (identity within 0.5%):  delta=-0.04% -> PASS
-```
-
-IV-2a 6×6 CSP+LDA (9 subjects, seed 0, cross-session, pre-REST):
-diagonal mean 0.609, off-diagonal mean 0.380, gap +0.229. Bipolar column
-off-diagonals 0.25–0.33 (at chance for 4-class). The 7×7 result with REST
-and the three remaining datasets are pending the next run.
+**Compatibility shims.** All MOABB / braindecode workarounds live in
+`refshift/compat.py` so the rest of the codebase stays library-faithful.
+Each shim documents the upstream issue, the version the workaround was
+needed at, and what would let it be removed. See also
+`KNOWN_LIMITATIONS.md`.
 
 ## License
 

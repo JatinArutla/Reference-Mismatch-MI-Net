@@ -6,8 +6,21 @@ Two things:
    cache directories. Idempotent — safe to call multiple times.
 
 2. ``setup_moabb_symlinks()``: symlinks Kaggle input datasets into MOABB's
-   expected cache layout so MOABB doesn't re-download. Ported from v2's
-   ``_ensure_moabb_cache_symlinks``. Paths are overridable via env vars.
+   expected cache layout so MOABB doesn't re-download. Paths overridable via
+   env vars (REFSHIFT_*_ROOT — see README).
+
+Two datasets need more than plain symlinking:
+
+  - **OpenBMI** has a flat file layout (``sess01_subj01_EEG_MI.mat``) but
+    MOABB expects nested directories (``session1/s1/...``). Per-file path
+    rewriting in ``_setup_openbmi_symlinks``.
+
+  - **Dreyer2023** uses ``mne_bids`` lock files. MOABB writes lock files
+    into the dataset directory; on Kaggle's read-only ``/kaggle/input``
+    mount, this raises a ``PermissionError`` on first access. We mirror
+    the directory tree under writable ``$MNE_DATA`` with per-file symlinks,
+    plus a monkey-patch of MOABB's ``download_by_subject`` to skip the
+    re-download step. See KNOWN_LIMITATIONS.md.
 
 MOABB's own cache layout per dataset:
     $MNE_DATA / MNE-{sign.lower()}-data / ...
@@ -18,9 +31,9 @@ Known sign values (from moabb/datasets/{bnci,gigadb,Lee2019,dreyer2023}.py):
     Lee2019_MI    -> sign="Lee2019-MI"   (via Lee2019.data_path)
     Dreyer2023    -> sign="Dreyer2023"   (via dreyer2023.data_path)
 
-Cho2017 path drift risk: v2 used "MNE-gigadb-data"; current MOABB may use
-"MNE-cho2017-data". If the symlink path is wrong on your MOABB version,
-the fallback is just re-download (slow, not broken).
+Cho2017 path drift risk: older MOABB used "MNE-gigadb-data"; newer MOABB
+may use "MNE-cho2017-data". If the symlink path is wrong on your MOABB
+version, the fallback is just re-download (slow, not broken).
 """
 
 from __future__ import annotations

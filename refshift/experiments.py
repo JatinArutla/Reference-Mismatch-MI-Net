@@ -52,6 +52,10 @@ def _resolve_dataset(dataset_id: str):
     ``_KNOWN_BAD_SUBJECTS[dataset_id]``. This is the *default* subject list
     used when the caller passes ``subjects=None``; explicit ``subjects=``
     overrides bypass the filter entirely.
+
+    OpenBMI requires a configured ``Lee2019_MI`` to expose all 400
+    trials/subject; the configuration is in ``refshift.compat`` so the
+    DL path can share it.
     """
     dataset_id = dataset_id.lower()
     if dataset_id == "iv2a":
@@ -59,31 +63,9 @@ def _resolve_dataset(dataset_id: str):
         from moabb.paradigms import MotorImagery
         ds, paradigm = BNCI2014_001(), MotorImagery(n_classes=4)
     elif dataset_id == "openbmi":
-        from moabb.datasets import Lee2019_MI
         from moabb.paradigms import LeftRightImagery
-        # ----------------------------------------------------------------
-        # OpenBMI loading: capture both sessions and both runs (n=400/subj)
-        # ----------------------------------------------------------------
-        # Lee2019_MI by default loads only `1train` from each session
-        # (n=100/subject after the MOABB 1.5.0 session-filter bug below).
-        # We pass test_run=True so both '1train' and '4test' are loaded;
-        # both are pure MI data per the Lee2019 paper, and standard
-        # published OpenBMI benchmarks use both. This brings n to
-        # 200/subject before the next fix.
-        ds = Lee2019_MI(test_run=True)
-
-        # MOABB 1.5.0 has an inconsistency in Lee2019: __init__ stores
-        # the user-facing sessions=(1,2) as `_selected_sessions`, but the
-        # loader writes session keys as '0'/'1' (zero-indexed). The
-        # session filter in BaseDataset.get_data then drops everything
-        # not matching the user-facing labels — silently throwing away
-        # session '0' on every call. Bypassing the filter restores the
-        # second session (n=200 -> n=400/subject).
-        # Tracking: this should be removed once MOABB fixes the upstream
-        # mismatch between session-label storage and validation.
-        ds._selected_sessions = None
-
-        paradigm = LeftRightImagery()
+        from refshift.compat import make_openbmi_dataset
+        ds, paradigm = make_openbmi_dataset(), LeftRightImagery()
     elif dataset_id == "cho2017":
         from moabb.datasets import Cho2017
         from moabb.paradigms import LeftRightImagery

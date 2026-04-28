@@ -31,7 +31,6 @@ Phase 2 (DL):
 
 from refshift.reference import (
     REFERENCE_MODES,
-    DatasetGraph,
     ReferenceTransformer,
     build_graph,
 )
@@ -73,10 +72,9 @@ __all__ = [
     "baseline_diagonal_view",
     "baseline_col_off_diag_view",
     "REFERENCE_MODES",
-    "DatasetGraph",
     "ReferenceTransformer",
     "build_graph",
     "make_csp_lda_pipeline",
 ]
 
-__version__ = "0.7.2"
+__version__ = "0.8.1"
