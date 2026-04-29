@@ -22,14 +22,20 @@ Two datasets need more than plain symlinking:
     plus a monkey-patch of MOABB's ``download_by_subject`` to skip the
     re-download step. See KNOWN_LIMITATIONS.md.
 
+  - **Schirrmeister2017** has a two-subdirectory layout
+    (``train/{N}.edf`` + ``test/{N}.edf``) which MOABB expects verbatim.
+    Per-file symlinking that preserves the train/test split lives in
+    ``_setup_schirrmeister_symlinks``.
+
 MOABB's own cache layout per dataset:
     $MNE_DATA / MNE-{sign.lower()}-data / ...
 
-Known sign values (from moabb/datasets/{bnci,gigadb,Lee2019,dreyer2023}.py):
-    BNCI2014_001  -> sign="BNCI"         (via bnci.utils.bnci_data_path)
-    Cho2017       -> sign="Cho2017"      (via Cho2017.data_path)
-    Lee2019_MI    -> sign="Lee2019-MI"   (via Lee2019.data_path)
-    Dreyer2023    -> sign="Dreyer2023"   (via dreyer2023.data_path)
+Known sign values (from moabb/datasets/{bnci,gigadb,Lee2019,dreyer2023,schirrmeister2017}.py):
+    BNCI2014_001       -> sign="BNCI"               (via bnci.utils.bnci_data_path)
+    Cho2017            -> sign="Cho2017"            (via Cho2017.data_path)
+    Lee2019_MI         -> sign="Lee2019-MI"         (via Lee2019.data_path)
+    Dreyer2023         -> sign="Dreyer2023"         (via dreyer2023.data_path)
+    Schirrmeister2017  -> sign="SCHIRRMEISTER2017"  (via schirrmeister2017.data_path)
 
 Cho2017 path drift risk: older MOABB used "MNE-gigadb-data"; newer MOABB
 may use "MNE-cho2017-data". If the symlink path is wrong on your MOABB
@@ -129,7 +135,7 @@ def setup_moabb_symlinks(
                 pass
 
     if datasets is None:
-        datasets = list(_KAGGLE_SOURCES) + ["openbmi", "dreyer2023"]
+        datasets = list(_KAGGLE_SOURCES) + ["openbmi", "dreyer2023", "schirrmeister2017"]
 
     counts: Dict[str, int] = {}
     for ds_id in datasets:
@@ -138,6 +144,9 @@ def setup_moabb_symlinks(
             continue
         if ds_id == "dreyer2023":
             counts[ds_id] = _setup_dreyer_symlinks(mne_data_path, verbose=verbose)
+            continue
+        if ds_id == "schirrmeister2017":
+            counts[ds_id] = _setup_schirrmeister_symlinks(mne_data_path, verbose=verbose)
             continue
         if ds_id not in _KAGGLE_SOURCES:
             if verbose:
@@ -344,7 +353,56 @@ def _setup_dreyer_symlinks(mne_data_path: Path, verbose: bool) -> int:
     return n_total
 
 
-def _patch_moabb_dreyer_no_unzip(verbose: bool = True) -> None:
+def _setup_schirrmeister_symlinks(mne_data_path: Path, verbose: bool) -> int:
+    """Symlink Schirrmeister2017 EDFs from a Kaggle dataset directory.
+
+    The source layout (e.g. the public 'high-gamma-dts' Kaggle dataset) is::
+
+        $REFSHIFT_SCHIRRMEISTER_ROOT/
+          train/{1..14}.edf
+          test/{1..14}.edf
+
+    MOABB's ``Schirrmeister2017`` loader expects exactly the same structure
+    under ``$MNE_DATA/MNE-schirrmeister2017-data/``, so we symlink file-by-file
+    while preserving the ``train`` / ``test`` subdirectories. 14 subjects x
+    2 runs = 28 expected files; partial uploads are tolerated (we link
+    whatever is present and report the count).
+
+    Returns the number of *new* symlinks created (existing links are kept).
+    """
+    src_root = Path(os.environ.get(
+        "REFSHIFT_SCHIRRMEISTER_ROOT",
+        "/kaggle/input/datasets/hangtrance/high-gamma-dts",
+    ))
+    dst_root = mne_data_path / "MNE-schirrmeister2017-data"
+
+    if not src_root.exists():
+        if verbose:
+            print(f"  schirrmeister2017: source not found ({src_root}); skipping")
+        return 0
+
+    n_new = 0
+    for subdir in ("train", "test"):
+        src_dir = src_root / subdir
+        if not src_dir.is_dir():
+            if verbose:
+                print(f"  schirrmeister2017: missing {subdir}/ subdir under {src_root}")
+            continue
+        for f in src_dir.glob("*.edf"):
+            if _link(f, dst_root / subdir / f.name):
+                n_new += 1
+
+    if verbose:
+        n_total = sum(
+            1 for _ in dst_root.rglob("*.edf")
+        ) if dst_root.exists() else 0
+        print(
+            f"  schirrmeister2017: +{n_new} new links ({n_total} total under {dst_root})"
+        )
+    return n_new
+
+
+
     """Replace ``Dreyer2023.download_by_subject`` with a variant that skips
     the unzip loop. The download loop (for BIDS metadata files listed in
     the manifest) is preserved. Idempotent — safe to call multiple times.

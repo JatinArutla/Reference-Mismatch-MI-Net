@@ -27,7 +27,7 @@ from refshift.reference import REFERENCE_MODES, apply_reference, build_graph
 # Dataset registry (lazy MOABB imports so `from refshift import *` is cheap)
 # ---------------------------------------------------------------------------
 
-DATASET_IDS = ("iv2a", "openbmi", "cho2017", "dreyer2023")
+DATASET_IDS = ("iv2a", "openbmi", "cho2017", "dreyer2023", "schirrmeister2017")
 
 
 # Subjects with known data-quality issues in the public dataset release.
@@ -43,6 +43,13 @@ DATASET_IDS = ("iv2a", "openbmi", "cho2017", "dreyer2023")
 _KNOWN_BAD_SUBJECTS: dict = {
     "openbmi": frozenset({29}),
 }
+
+
+# Datasets where the train/test split is run-based (not session-based).
+# The dataset returns a single MOABB session with two runs ('0train' / '1test'),
+# and we want to honour that natural split rather than fall back to stratified
+# 80/20. ``_split_train_test`` consults this set when strategy='auto'.
+_RUN_SPLIT_DATASETS = frozenset({"schirrmeister2017"})
 
 
 def _resolve_dataset(dataset_id: str):
@@ -74,6 +81,15 @@ def _resolve_dataset(dataset_id: str):
         from moabb.datasets import Dreyer2023
         from moabb.paradigms import LeftRightImagery
         ds, paradigm = Dreyer2023(), LeftRightImagery()
+    elif dataset_id == "schirrmeister2017":
+        from moabb.datasets import Schirrmeister2017
+        from moabb.paradigms import MotorImagery
+        # 4-class MI (left_hand, right_hand, feet, rest), single session per
+        # subject with a natural train/test run split (~880 train + ~160
+        # test trials per subject). The run-level split is honoured via
+        # ``_RUN_SPLIT_DATASETS``; otherwise this is a standard MOABB
+        # dataset that needs no compatibility shim.
+        ds, paradigm = Schirrmeister2017(), MotorImagery(n_classes=4)
     else:
         raise ValueError(
             f"Unknown dataset_id: {dataset_id!r}. Known: {DATASET_IDS}"
@@ -115,17 +131,44 @@ def _encode_labels(y: np.ndarray) -> Tuple[np.ndarray, List[str]]:
 def _split_train_test(
     X: np.ndarray, y: np.ndarray, metadata: pd.DataFrame,
     *, strategy: str = "auto", test_size: float = 0.2, seed: int = 0,
+    dataset_id: Optional[str] = None,
 ):
     """(X_tr, y_tr, X_te, y_te) for a single subject.
 
-    'auto': cross-session if >1 session, else stratified 80/20.
+    Strategy resolution under ``'auto'``:
+      - dataset is in ``_RUN_SPLIT_DATASETS`` -> split on ``metadata['run']``,
+        with ``'0train'`` -> train and ``'1test'`` -> test.
+      - >1 session in ``metadata['session']`` -> cross-session
+        (first session train, second test).
+      - otherwise -> stratified ``test_size`` within the single session.
     """
     sessions = sorted(metadata["session"].unique())
-    effective = strategy if strategy != "auto" else (
-        "session" if len(sessions) > 1 else "stratify"
-    )
+    if strategy == "auto":
+        if dataset_id is not None and dataset_id in _RUN_SPLIT_DATASETS:
+            effective = "run"
+        elif len(sessions) > 1:
+            effective = "session"
+        else:
+            effective = "stratify"
+    else:
+        effective = strategy
+
     if effective == "session":
         train_mask = (metadata["session"] == sessions[0]).to_numpy()
+        return X[train_mask], y[train_mask], X[~train_mask], y[~train_mask]
+    if effective == "run":
+        if "run" not in metadata.columns:
+            raise ValueError(
+                "split strategy 'run' requires a 'run' column in metadata"
+            )
+        runs = sorted(metadata["run"].unique())
+        if len(runs) < 2:
+            raise ValueError(
+                f"split strategy 'run' needs >=2 runs; got {runs}"
+            )
+        # Convention: first run alphabetically is train, last is test.
+        # For Schirrmeister2017 this gives '0train' -> train, '1test' -> test.
+        train_mask = (metadata["run"] == runs[0]).to_numpy()
         return X[train_mask], y[train_mask], X[~train_mask], y[~train_mask]
     if effective == "stratify":
         from sklearn.model_selection import StratifiedShuffleSplit
@@ -370,6 +413,7 @@ def run_mismatch(
 
         X_tr, y_tr, X_te, y_te = _split_train_test(
             X, y_int, metadata, strategy=split_strategy, seed=seed,
+            dataset_id=dataset_id,
         )
 
         # Pre-compute all 7 test variants once.
@@ -592,6 +636,7 @@ def run_mismatch_jitter(
 
         X_tr, y_tr, X_te, y_te = _split_train_test(
             X, y_int, metadata, strategy=split_strategy, seed=seed,
+            dataset_id=dataset_id,
         )
 
         # Pre-compute every test variant once. We intentionally compute all

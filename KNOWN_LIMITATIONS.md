@@ -90,18 +90,22 @@ default. Pass `subjects=[...]` explicitly to override.
 
 ### Train/test split protocol differs across datasets
 
-| Dataset | Sessions in MOABB | Split protocol |
+| Dataset | Sessions / structure | Split protocol |
 |---|---|---|
-| IV-2a (BNCI2014_001) | 2 (different days) | Cross-session: session 0 train, session 1 test |
-| OpenBMI (Lee2019_MI) | 2 (different days, with our compat shim) | Cross-session: session 0 train, session 1 test |
-| Cho2017 | 1 | Stratified 80/20 within session |
-| Dreyer2023 | 1 | Stratified 80/20 within session |
+| IV-2a (BNCI2014_001) | 2 sessions (different days) | Cross-session: session 0 train, session 1 test |
+| OpenBMI (Lee2019_MI) | 2 sessions (different days, with our compat shim) | Cross-session: session 0 train, session 1 test |
+| Cho2017 | 1 session | Stratified 80/20 within session |
+| Dreyer2023 | 1 session | Stratified 80/20 within session |
+| Schirrmeister2017 | 1 session, 2 runs (`0train` ~880 trials + `1test` ~160 trials) | Run-based: `0train` train, `1test` test (matches the original Schirrmeister 2017 paper) |
 
-**Implication.** The reference-shift effect is being tested against a
-genuinely held-out *recording day* on IV-2a and OpenBMI, and against a
-held-out *trial subset* on Cho2017 and Dreyer2023. Effects measured on
-the cross-session datasets are stronger evidence of the phenomenon being
-robust to natural inter-session variation.
+**Implication.** The reference-shift effect is being tested against:
+
+- a held-out *recording day* on IV-2a and OpenBMI (strongest evidence of
+  robustness to natural inter-session variation),
+- a held-out *trial subset* on Cho2017 and Dreyer2023 (single-session
+  datasets in their MOABB releases),
+- a held-out *run* on Schirrmeister2017 (within the same recording day,
+  but matching the dataset's documented evaluation protocol).
 
 This is documented in the methods section of any paper using these
 results.

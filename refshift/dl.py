@@ -44,6 +44,7 @@ _DATASET_ID_TO_MOABB = {
     "openbmi": "Lee2019_MI",
     "cho2017": "Cho2017",
     "dreyer2023": "Dreyer2023",
+    "schirrmeister2017": "Schirrmeister2017",
 }
 
 

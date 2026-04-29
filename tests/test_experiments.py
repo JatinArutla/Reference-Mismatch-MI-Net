@@ -44,3 +44,76 @@ def test_resolve_dataset_unknown_id_raises():
     from refshift.experiments import _resolve_dataset
     with pytest.raises(ValueError, match="Unknown dataset_id"):
         _resolve_dataset("not_a_dataset")
+
+
+def test_resolve_dataset_schirrmeister2017():
+    """Schirrmeister2017: 4-class MI, ~14 subjects, single session with
+    natural train/test run split. No compatibility shim required."""
+    from refshift.experiments import _resolve_dataset
+    from moabb.datasets import Schirrmeister2017
+    ds, paradigm = _resolve_dataset("schirrmeister2017")
+    assert isinstance(ds, Schirrmeister2017)
+    # 4 events: left_hand, right_hand, feet, rest
+    assert paradigm.n_classes == 4
+
+
+def test_split_train_test_run_strategy():
+    """Run-based split: '0train' rows -> train, '1test' rows -> test."""
+    import numpy as np
+    import pandas as pd
+    from refshift.experiments import _split_train_test
+
+    # Synthetic: 6 trials, 4 channels, 100 samples; runs '0train' and '1test'.
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((6, 4, 100)).astype(np.float32)
+    y = np.array([0, 1, 0, 1, 0, 1], dtype=np.int64)
+    metadata = pd.DataFrame({
+        "session": ["0"] * 6,
+        "run": ["0train", "0train", "0train", "1test", "1test", "1test"],
+    })
+
+    Xtr, ytr, Xte, yte = _split_train_test(
+        X, y, metadata, strategy="auto", dataset_id="schirrmeister2017",
+    )
+    assert Xtr.shape == (3, 4, 100)
+    assert Xte.shape == (3, 4, 100)
+    np.testing.assert_array_equal(ytr, [0, 1, 0])
+    np.testing.assert_array_equal(yte, [1, 0, 1])
+
+
+def test_split_train_test_run_strategy_explicit():
+    """Explicit strategy='run' works for any dataset, not just registered ones."""
+    import numpy as np
+    import pandas as pd
+    from refshift.experiments import _split_train_test
+
+    X = np.zeros((4, 2, 10), dtype=np.float32)
+    y = np.array([0, 1, 0, 1])
+    metadata = pd.DataFrame({
+        "session": ["0"] * 4,
+        "run": ["A", "A", "B", "B"],
+    })
+    Xtr, ytr, Xte, yte = _split_train_test(X, y, metadata, strategy="run")
+    # 'A' sorts before 'B' -> A is train, B is test
+    assert Xtr.shape == (2, 2, 10)
+    np.testing.assert_array_equal(ytr, [0, 1])
+    np.testing.assert_array_equal(yte, [0, 1])
+
+
+def test_split_train_test_session_strategy_unchanged():
+    """Sanity: pre-existing session-split behaviour is preserved."""
+    import numpy as np
+    import pandas as pd
+    from refshift.experiments import _split_train_test
+
+    X = np.zeros((4, 2, 10), dtype=np.float32)
+    y = np.array([0, 1, 0, 1])
+    metadata = pd.DataFrame({
+        "session": ["0", "0", "1", "1"],
+        "run": ["r"] * 4,
+    })
+    # Without dataset_id, defaults to session split when 2+ sessions
+    Xtr, ytr, Xte, yte = _split_train_test(X, y, metadata, strategy="auto")
+    assert Xtr.shape == (2, 2, 10)
+    np.testing.assert_array_equal(ytr, [0, 1])  # session '0'
+    np.testing.assert_array_equal(yte, [0, 1])  # session '1'

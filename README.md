@@ -111,6 +111,7 @@ Known Kaggle paths (override via env vars if yours differ):
 | OpenBMI | `REFSHIFT_OPENBMI_ROOT` | `/kaggle/input/datasets/imaginer369/openbmi-dataset` |
 | Cho2017 | `REFSHIFT_CHO2017_ROOT` | `/kaggle/input/datasets/delhialli/cho2017` |
 | Dreyer2023 | `REFSHIFT_DREYER_ROOT` | `/kaggle/input/datasets/delhialli/dreyer2023/MNE-Dreyer2023-data` |
+| Schirrmeister2017 | `REFSHIFT_SCHIRRMEISTER_ROOT` | `/kaggle/input/datasets/hangtrance/high-gamma-dts` |
 
 ### Cell 2 — calibration (optional but recommended for first-time setup)
 
@@ -247,9 +248,11 @@ trust from the shared `make_csp_lda_pipeline`.
 
 **Cross-session vs within-session.** The mismatch runner uses cross-session
 splits where the dataset has more than one MOABB session (IV-2a, OpenBMI),
-and stratified 80/20 within-session splits otherwise (Cho2017,
-Dreyer2023). The diagonal of the mismatch matrix is therefore a few points
-below the calibration number — expected, not a bug.
+run-based splits where the dataset has a natural train/test run split
+within a single session (Schirrmeister2017), and stratified 80/20
+within-session splits otherwise (Cho2017, Dreyer2023). The diagonal of the
+mismatch matrix is therefore a few points below the calibration number —
+expected, not a bug.
 
 **`ReferenceTransformer('native')` is a true identity but we still
 calibrate it.** `calibrate_csp_lda` runs both the bare CSP+LDA and the
