@@ -231,6 +231,23 @@ def load_dl_data(
 
     preprocessors = [
         Preprocessor("pick_types", eeg=True, meg=False, stim=False),
+    ]
+
+    # Schirrmeister2017: restrict to motor-cortex channel subset to match
+    # the original paper's protocol (44 channels, Section 2.7.1) and keep
+    # CSP/DL compute tractable. The full list lives in experiments.py to
+    # stay co-located with _resolve_dataset's MOABB-side subsetting.
+    if dataset_id == "schirrmeister2017":
+        from refshift.experiments import _SCHIRRMEISTER_MOTOR_CHANNELS
+        preprocessors.append(
+            Preprocessor(
+                "pick_channels",
+                ch_names=list(_SCHIRRMEISTER_MOTOR_CHANNELS),
+                ordered=False,
+            )
+        )
+
+    preprocessors.extend([
         Preprocessor(_scale_volts_to_microvolts, apply_on_array=True),
         Preprocessor("filter", l_freq=l_freq, h_freq=h_freq),
         Preprocessor(
@@ -238,7 +255,7 @@ def load_dl_data(
             factor_new=ems_factor_new,
             init_block_size=ems_init_block_size,
         ),
-    ]
+    ])
     preprocess(dataset, preprocessors, n_jobs=n_jobs)
 
     # sfreq + channel names from first raw; enforce consistency across runs.

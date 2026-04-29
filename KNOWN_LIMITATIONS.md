@@ -88,6 +88,35 @@ This is a defect in the public dataset, not in our code.
 **Behavior.** `_resolve_dataset("openbmi")` returns 53/54 subjects by
 default. Pass `subjects=[...]` explicitly to override.
 
+### Schirrmeister2017 uses the canonical 44-channel motor subset
+
+**Affects:** Schirrmeister2017, both CSP+LDA and DL paths.
+
+**What we do.** The pipeline restricts Schirrmeister2017 to the 44 motor
+channels published in Schirrmeister et al. 2017 (Section 2.7.1) and the
+canonical ``high-gamma-dataset`` example code (FC*, C*, CP* and their
+h-suffix high-density variants; Cz is excluded as the recording
+reference). The full 128-channel cap is not used.
+
+**Why.** Schirrmeister et al. (2017) report that this 44-channel subset
+gave *better* accuracy than using all 128 channels for both ConvNets
+and FBCSP — using all electrodes "led to worse accuracies" per their
+Section A.7. CSP also scales as O(C^3) in the channel count, so the
+restriction additionally cuts per-subject CSP+LDA runtime from ~13 min
+to ~1 min on CPU. There is no loss of relevant signal: the dropped
+channels are over occipital, frontal-pole, and temporal sites that
+don't contribute to motor decoding.
+
+**Implication.** Our channel selection matches the published HGD
+protocol exactly. Other deviations from the canonical Schirrmeister
+2017 pipeline — bandpass to 8–32 Hz instead of 0–125 Hz, trial-wise
+training instead of cropped, no FBCSP feature selection — are
+deliberate cross-dataset standardization choices for this paper, not
+mistakes; they are why our absolute accuracies (~70% diagonal CSP+LDA)
+are below their published 91.2% but they do not affect the
+reference-shift effect we measure.
+
+
 ### Train/test split protocol differs across datasets
 
 | Dataset | Sessions / structure | Split protocol |

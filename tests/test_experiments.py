@@ -57,6 +57,26 @@ def test_resolve_dataset_schirrmeister2017():
     assert paradigm.n_classes == 4
 
 
+def test_schirrmeister_motor_channels_subset_used():
+    """Schirrmeister paradigm restricted to motor-cortex subset (~44 channels,
+    matching Schirrmeister 2017 Section 2.7.1) instead of full 128."""
+    from refshift.experiments import (
+        _resolve_dataset,
+        _SCHIRRMEISTER_MOTOR_CHANNELS,
+    )
+    _, paradigm = _resolve_dataset("schirrmeister2017")
+    assert paradigm.channels is not None
+    assert len(paradigm.channels) == 44
+    assert len(paradigm.channels) == len(_SCHIRRMEISTER_MOTOR_CHANNELS)
+    # Schirrmeister 2017 Section 2.7.1 specifies exactly 44 motor channels
+    # (Cz excluded as recording reference); subset must be much smaller
+    # than the full 128.
+    assert "Cz" not in paradigm.channels
+    # Sanity: includes the canonical motor channels
+    for required in ("C3", "C4", "FC3", "FC4", "CP3", "CP4"):
+        assert required in paradigm.channels
+
+
 def test_split_train_test_run_strategy():
     """Run-based split: '0train' rows -> train, '1test' rows -> test."""
     import numpy as np
