@@ -77,6 +77,49 @@ def test_schirrmeister_motor_channels_subset_used():
         assert required in paradigm.channels
 
 
+def test_schirrmeister_resamples_to_250_hz():
+    """Schirrmeister paradigm resamples to 250 Hz to match IV-2a's rate
+    and the canonical HGD pipeline (Schirrmeister 2017 example.py)."""
+    from refshift.experiments import _resolve_dataset
+    _, paradigm = _resolve_dataset("schirrmeister2017")
+    assert paradigm.resample == 250.0
+
+
+def test_get_eeg_channel_names_respects_paradigm_channels():
+    """When paradigm.channels is set, _get_eeg_channel_names returns that
+    subset in *paradigm-supplied* order. MOABB picks with ordered=True
+    so the X array has channels in paradigm-supplied order, not raw
+    order — the graph must match.
+
+    Without a paradigm, all EEG channels are returned in raw-channel
+    order.
+    """
+    from unittest.mock import MagicMock
+    from refshift.experiments import _get_eeg_channel_names
+
+    fake_raw = MagicMock()
+    fake_raw.ch_names = ["C3", "Cz", "C4", "Fp1", "Fp2"]
+    fake_raw.get_channel_types.return_value = ["eeg"] * 5
+    fake_dataset = MagicMock()
+    fake_dataset.subject_list = [1]
+    fake_dataset.get_data.return_value = {1: {"0": {"0train": fake_raw}}}
+
+    # Without paradigm: all 5 EEG channels in raw order
+    assert _get_eeg_channel_names(fake_dataset) == ["C3", "Cz", "C4", "Fp1", "Fp2"]
+
+    # With paradigm.channels = subset: returned in paradigm-supplied order
+    # (matching MOABB's mne.pick_channels(include=..., ordered=True))
+    fake_paradigm = MagicMock()
+    fake_paradigm.channels = ["C4", "C3"]
+    assert _get_eeg_channel_names(fake_dataset, paradigm=fake_paradigm) == ["C4", "C3"]
+
+    # With paradigm but channels=None: behaves like no paradigm
+    fake_paradigm.channels = None
+    assert _get_eeg_channel_names(fake_dataset, paradigm=fake_paradigm) == [
+        "C3", "Cz", "C4", "Fp1", "Fp2"
+    ]
+
+
 def test_split_train_test_run_strategy():
     """Run-based split: '0train' rows -> train, '1test' rows -> test."""
     import numpy as np

@@ -116,18 +116,22 @@ def _resolve_dataset(dataset_id: str):
         # test trials per subject). The run-level split is honoured via
         # ``_RUN_SPLIT_DATASETS``.
         #
-        # Channel subset: Schirrmeister 2017 (Section 2.7.1) used 44 motor
-        # channels rather than all 128. The original 44-channel list isn't
-        # in the public MOABB code but the motor ROI is canonical: a dense
-        # block around the central sulcus (FC*, C*, CP*) plus their h-suffix
-        # high-density variants present in the 128-channel cap. This
-        # ~36-channel subset is well within the spirit of "44 motor sensors"
-        # and brings CSP+LDA per-subject runtime from ~13min to ~1min on CPU.
-        # All 36 channels exist in Schirrmeister's electrode layout.
+        # Channel subset: 44 motor channels (FC*/C*/CP* + h-suffix
+        # high-density variants). See ``_SCHIRRMEISTER_MOTOR_CHANNELS`` for
+        # the full list and rationale.
+        #
+        # Resample to 250 Hz to match (a) IV-2a's native rate and (b) the
+        # canonical HGD pipeline (Schirrmeister 2017 example.py:
+        # ``resample_cnt(cnt, 250.0)``). HGD is recorded at 500 Hz; given
+        # the 8-32 Hz bandpass we apply downstream, 250 Hz is well above
+        # Nyquist and incurs no signal loss. Resampling halves the per-trial
+        # sample count (2000 -> 1000), keeping Shallow's ``filter_time_length``
+        # in the same physical-time regime as on IV-2a (~100 ms).
         ds = Schirrmeister2017()
         paradigm = MotorImagery(
             n_classes=4,
             channels=_SCHIRRMEISTER_MOTOR_CHANNELS,
+            resample=250.0,
         )
     else:
         raise ValueError(
@@ -144,8 +148,34 @@ def _resolve_dataset(dataset_id: str):
 # Small private helpers
 # ---------------------------------------------------------------------------
 
-def _get_eeg_channel_names(dataset, subject: Optional[int] = None) -> List[str]:
-    """Return EEG channel names in MOABB's native order, peeking at one subject."""
+def _get_eeg_channel_names(
+    dataset, subject: Optional[int] = None, paradigm=None,
+) -> List[str]:
+    """Return the EEG channel names that match the data the paradigm will
+    deliver, in the same order as the channel axis of the X array.
+
+    If ``paradigm.channels`` is set (e.g. Schirrmeister2017's 44-channel
+    motor subset), the returned list is *that* subset in the order the
+    user supplied it. MOABB's ``RawToEpochs`` step calls
+    ``mne.pick_channels(..., include=self.channels, ordered=True)``,
+    which preserves the order of the ``include`` list — so the X array
+    has channels in ``paradigm.channels`` order, not raw-channel order.
+    Returning that order here keeps the neighbour graph aligned with the
+    channel axis of X.
+
+    If ``paradigm.channels`` is unset, all EEG channels in the raw are
+    returned in raw-channel order.
+
+    The neighbour graph for spatial-differential references (laplacian,
+    bipolar) and REST is built from this list, so it is critical that
+    it matches the channel axis of the X array the paradigm produces.
+    Mismatches here surface as ``IndexError: index N is out of bounds``
+    inside ``_laplacian`` / ``_bipolar``.
+    """
+    if paradigm is not None and getattr(paradigm, "channels", None):
+        # MOABB picks with ordered=True, which preserves include-list
+        # order. We do not need to peek at the raw to determine order.
+        return list(paradigm.channels)
     if subject is None:
         subject = dataset.subject_list[0]
     raws = dataset.get_data(subjects=[subject])
@@ -405,7 +435,7 @@ def run_mismatch(
     needs_rest = "rest" in modes
     graph = None
     if needs_graph:
-        ch_names = _get_eeg_channel_names(dataset, subject=subjects[0])
+        ch_names = _get_eeg_channel_names(dataset, subject=subjects[0], paradigm=paradigm)
         graph = build_graph(
             ch_names, k=laplacian_k, montage=montage,
             include_rest=needs_rest,
@@ -639,7 +669,7 @@ def run_mismatch_jitter(
     needs_rest = ("rest" in train_modes) or ("rest" in test_modes)
     graph = None
     if needs_graph:
-        ch_names = _get_eeg_channel_names(dataset, subject=subjects[0])
+        ch_names = _get_eeg_channel_names(dataset, subject=subjects[0], paradigm=paradigm)
         graph = build_graph(
             ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
         )
