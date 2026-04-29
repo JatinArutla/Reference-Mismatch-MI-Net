@@ -362,11 +362,24 @@ def _setup_schirrmeister_symlinks(mne_data_path: Path, verbose: bool) -> int:
           train/{1..14}.edf
           test/{1..14}.edf
 
-    MOABB's ``Schirrmeister2017`` loader expects exactly the same structure
-    under ``$MNE_DATA/MNE-schirrmeister2017-data/``, so we symlink file-by-file
-    while preserving the ``train`` / ``test`` subdirectories. 14 subjects x
-    2 runs = 28 expected files; partial uploads are tolerated (we link
-    whatever is present and report the count).
+    MOABB's ``Schirrmeister2017`` loader has a two-stage path scheme:
+
+    1. ``data_dl`` (pooch) checks for the file at a URL-derived path::
+
+           {base}/robintibor/high-gamma-dataset/raw/master/data/{train,test}/{N}.edf
+
+       and downloads from gin if missing. We symlink here so pooch's
+       existence check passes and no network download is attempted.
+
+    2. The loader then ``shutil.move``s the file to a flat post-move path::
+
+           {base}/{train,test}/{N}.edf
+
+       and reads from there. The move is guarded by
+       ``if not os.path.exists(new_path)``, so we *also* symlink at the
+       post-move path. That way ``shutil.move`` is skipped (which would
+       otherwise dereference our pooch-path symlink and try to move the
+       real file out of read-only ``/kaggle/input``).
 
     Returns the number of *new* symlinks created (existing links are kept).
     """
@@ -374,7 +387,11 @@ def _setup_schirrmeister_symlinks(mne_data_path: Path, verbose: bool) -> int:
         "REFSHIFT_SCHIRRMEISTER_ROOT",
         "/kaggle/input/datasets/hangtrance/high-gamma-dts",
     ))
-    dst_root = mne_data_path / "MNE-schirrmeister2017-data"
+    dataset_folder = mne_data_path / "MNE-schirrmeister2017-data"
+    pooch_root = (
+        dataset_folder / "robintibor" / "high-gamma-dataset" /
+        "raw" / "master" / "data"
+    )
 
     if not src_root.exists():
         if verbose:
@@ -389,15 +406,19 @@ def _setup_schirrmeister_symlinks(mne_data_path: Path, verbose: bool) -> int:
                 print(f"  schirrmeister2017: missing {subdir}/ subdir under {src_root}")
             continue
         for f in src_dir.glob("*.edf"):
-            if _link(f, dst_root / subdir / f.name):
+            # 1) URL-derived path that pooch checks
+            if _link(f, pooch_root / subdir / f.name):
+                n_new += 1
+            # 2) Post-move path the loader actually opens
+            if _link(f, dataset_folder / subdir / f.name):
                 n_new += 1
 
     if verbose:
         n_total = sum(
-            1 for _ in dst_root.rglob("*.edf")
-        ) if dst_root.exists() else 0
+            1 for _ in dataset_folder.rglob("*.edf")
+        ) if dataset_folder.exists() else 0
         print(
-            f"  schirrmeister2017: +{n_new} new links ({n_total} total under {dst_root})"
+            f"  schirrmeister2017: +{n_new} new links ({n_total} total under {dataset_folder})"
         )
     return n_new
 
