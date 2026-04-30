@@ -21,12 +21,14 @@ def _params(**overrides):
     base = dict(
         dataset_id="iv2a",
         subject=3,
+        resample=250.0,
         l_freq=8.0,
         h_freq=32.0,
         ems_factor_new=1e-3,
         ems_init_block_size=1000,
         trial_start_offset_s=0.0,
         trial_stop_offset_s=0.0,
+        pre_ems_reference=None,
     )
     base.update(overrides)
     return base
@@ -56,18 +58,28 @@ def test_cache_path_deterministic():
 
 def test_cache_path_differs_by_dataset_subject_filter_offsets():
     """Each parameter that affects the preprocessed output must produce a
-    distinct path."""
+    distinct path. Includes the v0.11 additions: resample and
+    pre_ems_reference. Covers the regression that v0.11 was supposed to
+    fix, where pre_ems_reference was set in params but missing from the
+    cache key tuple.
+    """
     from refshift.dl import _cache_path
     with tempfile.TemporaryDirectory() as tmp:
         ref = _cache_path(tmp, _params())
         for override in (
             {"dataset_id": "openbmi"},
             {"subject": 7},
+            {"resample": 500.0},
             {"l_freq": 4.0},
             {"h_freq": 38.0},
             {"trial_start_offset_s": -0.5},
+            {"pre_ems_reference": "car"},
         ):
-            assert _cache_path(tmp, _params(**override)) != ref
+            assert _cache_path(tmp, _params(**override)) != ref, (
+                f"override {override} did not change the cache path; "
+                f"the parameter must be part of _CACHE_KEY_PARAMS or "
+                f"distinct preprocessed outputs will share a cache slot."
+            )
 
 
 def test_cache_path_directory_layout():
