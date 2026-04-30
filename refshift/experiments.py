@@ -264,6 +264,169 @@ def _free_cuda():
 
 
 # ---------------------------------------------------------------------------
+# Shared DL-runner scaffolding
+# ---------------------------------------------------------------------------
+#
+# Three of the four DL runners (run_mismatch DL branch, run_mismatch_jitter,
+# run_bandpass_mismatch train side) share the same setup and per-(subject,
+# seed) iteration: resolve dataset, build neighbour graph if any reference
+# mode needs one, tqdm over (subject, seed) jobs with subject-level data
+# caching, and per-iteration train/test split. The two helpers below
+# extract that scaffolding so each runner expresses only its own
+# train-once-evaluate-many logic.
+#
+# run_pre_ems_diagonal does NOT use these helpers because its iteration
+# is per-(subject, seed, ref) and each ref triggers a fresh load_dl_data
+# call (the reference is part of the preprocessing). The CSP+LDA branch
+# of run_mismatch does NOT use these helpers either because it goes
+# through paradigm.get_data, not load_dl_data. Both are kept inline.
+
+from dataclasses import dataclass
+
+
+@dataclass
+class _DLRunContext:
+    """Shared state for the DL runners.
+
+    Built once by ``_setup_dl_run`` per call to a runner. Holds the
+    resolved MOABB dataset id and code, the per-dataset neighbour graph
+    (if any of the run's reference modes need one), and the subject and
+    seed lists.
+    """
+    dataset_id: str
+    dataset_code: str
+    subjects: List[int]
+    seeds: List[int]
+    graph: 'Optional["DatasetGraph"]'  # forward ref; built lazily
+
+
+def _setup_dl_run(
+    dataset_id: str,
+    *,
+    subjects: Optional[List[int]],
+    seeds: List[int],
+    reference_modes_for_graph: tuple,
+    laplacian_k: int = 4,
+    montage: str = "standard_1005",
+    progress: bool = True,
+) -> _DLRunContext:
+    """Resolve a dataset and build the neighbour graph if any of the
+    declared reference modes need one.
+
+    ``reference_modes_for_graph`` is the set of operators the run will
+    apply (train side and test side). The graph is built iff any of
+    them require neighbour indices (laplacian / nn_diff / rest). REST
+    is included in the graph iff 'rest' is among the modes; this
+    avoids the spherical-model construction cost when REST isn't used.
+    Logs the NN-diff rank diagnostic and (if applicable) REST condition
+    number once per run, so reviewers can see those quantities.
+    """
+    dataset, paradigm = _resolve_dataset(dataset_id)
+    if subjects is None:
+        subjects = list(dataset.subject_list)
+
+    needs_graph = any(
+        m in ("laplacian", "nn_diff", "rest") for m in reference_modes_for_graph
+    )
+    needs_rest = "rest" in reference_modes_for_graph
+    graph = None
+    if needs_graph:
+        ch_names = _get_eeg_channel_names(
+            dataset, subject=subjects[0], paradigm=paradigm,
+        )
+        graph = build_graph(
+            ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
+        )
+        if progress:
+            extra = (
+                f", REST cond={graph.rest_cond:.2e}"
+                if graph.rest_cond is not None else ""
+            )
+            print(
+                f"[{dataset.code}] graph: C={len(graph.ch_names)}, "
+                f"NN-diff rank={graph.nn_diff_rank}/{len(graph.ch_names)} "
+                f"(nullity={graph.nn_diff_nullity}){extra}"
+            )
+
+    return _DLRunContext(
+        dataset_id=dataset_id,
+        dataset_code=dataset.code,
+        subjects=list(subjects),
+        seeds=list(seeds),
+        graph=graph,
+    )
+
+
+def _iter_per_subject_dl_jobs(
+    ctx: _DLRunContext,
+    *,
+    split_strategy: str = "auto",
+    desc: str = "",
+    progress: bool = True,
+    dl_resample: float = 250.0,
+    dl_l_freq: float = 8.0,
+    dl_h_freq: float = 32.0,
+    dl_trial_start_offset_s: float = 0.0,
+    dl_trial_stop_offset_s: float = 0.0,
+    dl_cache_dir: Optional[str] = None,
+):
+    """Generator yielding ``(subject, seed, X_tr, y_tr, X_te, y_te, sfreq)``
+    per (subject, seed) job, with subject-level data caching.
+
+    The underlying ``load_dl_data`` call happens only when the subject
+    changes; subsequent seeds reuse the in-memory tensor. The
+    channel-order assertion against ``ctx.graph`` runs once per subject
+    reload so a downstream operator that indexes into X with graph
+    indices cannot silently apply to the wrong channels.
+
+    Intended for the train-once-evaluate-many runners (``run_mismatch``
+    DL branch, ``run_mismatch_jitter``, ``run_bandpass_mismatch`` train
+    side). Other iteration shapes call ``load_dl_data`` directly.
+    """
+    from refshift.dl import load_dl_data
+
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:  # pragma: no cover
+        def _tqdm(it, **kwargs):
+            return it
+
+    jobs = [(s, k) for s in ctx.subjects for k in ctx.seeds]
+    iterator = _tqdm(
+        jobs, desc=desc or f"[{ctx.dataset_code}]",
+        disable=not progress, leave=True,
+    )
+
+    last_subject: Optional[int] = None
+    X = y_int = metadata = None
+    sfreq: Optional[float] = None
+
+    for subject, seed in iterator:
+        if subject != last_subject:
+            X, y_int, metadata, sfreq, ch_names_subj = load_dl_data(
+                ctx.dataset_id, subject,
+                resample=dl_resample,
+                l_freq=dl_l_freq, h_freq=dl_h_freq,
+                trial_start_offset_s=dl_trial_start_offset_s,
+                trial_stop_offset_s=dl_trial_stop_offset_s,
+                cache_dir=dl_cache_dir,
+            )
+            if ctx.graph is not None:
+                assert list(ch_names_subj) == ctx.graph.ch_names, (
+                    f"Channel order mismatch for subject {subject}: "
+                    f"data has {ch_names_subj[:5]}... but graph was "
+                    f"built from {ctx.graph.ch_names[:5]}..."
+                )
+            last_subject = subject
+
+        X_tr, y_tr, X_te, y_te = _split_train_test(
+            X, y_int, metadata,
+            strategy=split_strategy, seed=seed, dataset_id=ctx.dataset_id,
+        )
+        yield subject, seed, X_tr, y_tr, X_te, y_te, sfreq
+
+
+# ---------------------------------------------------------------------------
 # Calibration (Phase 1 CSP+LDA MOABB match)
 # ---------------------------------------------------------------------------
 
@@ -434,113 +597,35 @@ def run_mismatch(
         is_dl = True
 
     modes = tuple(reference_modes)
-    dataset, paradigm = _resolve_dataset(dataset_id)
-    if subjects is None:
-        subjects = list(dataset.subject_list)
-    seeds = list(seeds)
-
-    # Build the neighbor graph once per dataset (only if needed).
-    needs_graph = any(m in ("laplacian", "nn_diff", "rest") for m in modes)
-    needs_rest = "rest" in modes
-    graph = None
-    if needs_graph:
-        ch_names = _get_eeg_channel_names(dataset, subject=subjects[0], paradigm=paradigm)
-        graph = build_graph(
-            ch_names, k=laplacian_k, montage=montage,
-            include_rest=needs_rest,
-        )
-        # Diagnostic: log NN-diff rank/nullity and (if applicable) REST
-        # condition number once per dataset. This is the headline
-        # methodological control for the local-spatial-derivative cluster:
-        # if NN-diff drives a large effect, we want it on record that the
-        # operator is not pathologically rank-collapsed.
-        if progress:
-            print(
-                f"[{dataset.code}] graph: C={len(graph.ch_names)}, "
-                f"NN-diff rank={graph.nn_diff_rank}/{len(graph.ch_names)} "
-                f"(nullity={graph.nn_diff_nullity})"
-                + (
-                    f", REST cond={graph.rest_cond:.2e}"
-                    if graph.rest_cond is not None else ""
-                )
-            )
-
-    cache_config = _build_cache_config() if (cache and not is_dl) else None
-    cache_kwargs = {"cache_config": cache_config} if cache_config else {}
-
-    try:
-        from tqdm.auto import tqdm as _tqdm
-    except ImportError:  # pragma: no cover
-        def _tqdm(it, **kwargs):
-            return it
-
-    jobs = [(s, k) for s in subjects for k in seeds]
-    iterator = _tqdm(
-        jobs, desc=f"[{dataset.code}] {model_lc} mismatch",
-        disable=not progress, leave=True,
-    )
-
     rows: List[dict] = []
-    last_subject: Optional[int] = None
-    X = y_int = metadata = None
-    sfreq: Optional[float] = None
 
-    for subject, seed in iterator:
-        # Reload data only when subject changes (shared across seeds).
-        if subject != last_subject:
-            if is_dl:
-                from refshift.dl import load_dl_data
-                X, y_int, metadata, sfreq, ch_names_subj = load_dl_data(
-                    dataset_id, subject,
-                    resample=dl_resample,
-                    l_freq=dl_l_freq, h_freq=dl_h_freq,
-                    trial_start_offset_s=dl_trial_start_offset_s,
-                    trial_stop_offset_s=dl_trial_stop_offset_s,
-                    cache_dir=dl_cache_dir,
-                )
-                # Critical check: if a graph is in use, the per-subject channel
-                # order must match the order the graph was built from. A
-                # silent mismatch here would propagate as wrong neighbour
-                # indices being applied to the wrong channels.
-                if graph is not None:
-                    assert list(ch_names_subj) == graph.ch_names, (
-                        f"Channel order mismatch for subject {subject}: "
-                        f"data has {ch_names_subj[:5]}... but graph was "
-                        f"built from {graph.ch_names[:5]}..."
-                    )
-            else:
-                X, y_raw, metadata = paradigm.get_data(
-                    dataset=dataset, subjects=[subject], **cache_kwargs,
-                )
-                y_int, _ = _encode_labels(y_raw)
-                # CSP path: re-confirm channel order via paradigm.channels if
-                # set, or trust that all subjects share the dataset's native
-                # order. We assert the channel count for a cheap sanity check.
-                if graph is not None:
-                    assert X.shape[1] == len(graph.ch_names), (
-                        f"Channel count mismatch for subject {subject}: "
-                        f"data has {X.shape[1]} channels but graph has "
-                        f"{len(graph.ch_names)}."
-                    )
-            last_subject = subject
+    if is_dl:
+        # DL path: helpers handle dataset resolution, graph build, tqdm,
+        # subject-level caching, and the train/test split.
+        from refshift.dl import make_dl_model
 
-        X_tr, y_tr, X_te, y_te = _split_train_test(
-            X, y_int, metadata, strategy=split_strategy, seed=seed,
-            dataset_id=dataset_id,
+        ctx = _setup_dl_run(
+            dataset_id, subjects=subjects, seeds=seeds,
+            reference_modes_for_graph=modes,
+            laplacian_k=laplacian_k, montage=montage, progress=progress,
         )
+        for subject, seed, X_tr, y_tr, X_te, y_te, sfreq in _iter_per_subject_dl_jobs(
+            ctx, split_strategy=split_strategy,
+            desc=f"[{ctx.dataset_code}] {model_lc} mismatch",
+            progress=progress,
+            dl_resample=dl_resample,
+            dl_l_freq=dl_l_freq, dl_h_freq=dl_h_freq,
+            dl_trial_start_offset_s=dl_trial_start_offset_s,
+            dl_trial_stop_offset_s=dl_trial_stop_offset_s,
+            dl_cache_dir=dl_cache_dir,
+        ):
+            X_te_by_ref = {
+                m: apply_reference(X_te, m, graph=ctx.graph) for m in modes
+            }
+            n_classes = int(max(int(y_tr.max()), int(y_te.max()))) + 1
 
-        # Pre-compute all 6 test variants once.
-        X_te_by_ref = {
-            m: apply_reference(X_te, m, graph=graph) for m in modes
-        }
-
-        n_classes = int(max(int(y_tr.max()), int(y_te.max()))) + 1
-
-        for train_ref in modes:
-            X_tr_ref = apply_reference(X_tr, train_ref, graph=graph)
-
-            if is_dl:
-                from refshift.dl import make_dl_model
+            for train_ref in modes:
+                X_tr_ref = apply_reference(X_tr, train_ref, graph=ctx.graph)
                 pipe = make_dl_model(
                     model=model_lc,
                     n_channels=X_tr_ref.shape[1],
@@ -555,11 +640,99 @@ def run_mismatch(
                     device=dl_device,
                     verbose=dl_verbose,
                 )
-            else:
-                pipe = make_csp_lda_pipeline(
-                    reference_mode=None, n_filters=n_filters,
-                )
+                pipe.fit(X_tr_ref, y_tr)
+                for test_ref in modes:
+                    y_pred = pipe.predict(X_te_by_ref[test_ref])
+                    rows.append({
+                        "dataset":   ctx.dataset_code,
+                        "subject":   subject,
+                        "seed":      seed,
+                        "train_ref": train_ref,
+                        "test_ref":  test_ref,
+                        "accuracy":  float(accuracy_score(y_te, y_pred)),
+                        "kappa":     float(cohen_kappa_score(y_te, y_pred)),
+                        "n_train":   int(len(y_tr)),
+                        "n_test":    int(len(y_te)),
+                    })
+                del pipe
+                _free_cuda()
 
+        return pd.DataFrame(rows)
+
+    # CSP+LDA path: paradigm.get_data is its own data loader and the loop
+    # is simple enough to keep inline. The helpers above target the DL
+    # path specifically.
+    dataset, paradigm = _resolve_dataset(dataset_id)
+    if subjects is None:
+        subjects = list(dataset.subject_list)
+    seeds = list(seeds)
+
+    needs_graph = any(m in ("laplacian", "nn_diff", "rest") for m in modes)
+    needs_rest = "rest" in modes
+    graph = None
+    if needs_graph:
+        ch_names = _get_eeg_channel_names(
+            dataset, subject=subjects[0], paradigm=paradigm,
+        )
+        graph = build_graph(
+            ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
+        )
+        if progress:
+            extra = (
+                f", REST cond={graph.rest_cond:.2e}"
+                if graph.rest_cond is not None else ""
+            )
+            print(
+                f"[{dataset.code}] graph: C={len(graph.ch_names)}, "
+                f"NN-diff rank={graph.nn_diff_rank}/{len(graph.ch_names)} "
+                f"(nullity={graph.nn_diff_nullity}){extra}"
+            )
+
+    cache_config = _build_cache_config() if cache else None
+    cache_kwargs = {"cache_config": cache_config} if cache_config else {}
+
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:  # pragma: no cover
+        def _tqdm(it, **kwargs):
+            return it
+
+    jobs = [(s, k) for s in subjects for k in seeds]
+    iterator = _tqdm(
+        jobs, desc=f"[{dataset.code}] {model_lc} mismatch",
+        disable=not progress, leave=True,
+    )
+
+    last_subject: Optional[int] = None
+    X = y_int = metadata = None
+
+    for subject, seed in iterator:
+        if subject != last_subject:
+            X, y_raw, metadata = paradigm.get_data(
+                dataset=dataset, subjects=[subject], **cache_kwargs,
+            )
+            y_int, _ = _encode_labels(y_raw)
+            if graph is not None:
+                assert X.shape[1] == len(graph.ch_names), (
+                    f"Channel count mismatch for subject {subject}: "
+                    f"data has {X.shape[1]} channels but graph has "
+                    f"{len(graph.ch_names)}."
+                )
+            last_subject = subject
+
+        X_tr, y_tr, X_te, y_te = _split_train_test(
+            X, y_int, metadata, strategy=split_strategy, seed=seed,
+            dataset_id=dataset_id,
+        )
+        X_te_by_ref = {
+            m: apply_reference(X_te, m, graph=graph) for m in modes
+        }
+
+        for train_ref in modes:
+            X_tr_ref = apply_reference(X_tr, train_ref, graph=graph)
+            pipe = make_csp_lda_pipeline(
+                reference_mode=None, n_filters=n_filters,
+            )
             pipe.fit(X_tr_ref, y_tr)
             for test_ref in modes:
                 y_pred = pipe.predict(X_te_by_ref[test_ref])
@@ -574,11 +747,6 @@ def run_mismatch(
                     "n_train":   int(len(y_tr)),
                     "n_test":    int(len(y_te)),
                 })
-
-            # Release GPU memory between cells to keep Kaggle P100 stable.
-            if is_dl:
-                del pipe
-                _free_cuda()
 
     return pd.DataFrame(rows)
 
@@ -674,7 +842,7 @@ def run_mismatch_jitter(
     There is no ``train_ref`` column because each sample sees a different
     reference; ``train_modes`` is the comma-joined set the sampler drew from.
     """
-    from refshift.dl import SUPPORTED_DL_MODELS, load_dl_data, make_dl_model
+    from refshift.dl import SUPPORTED_DL_MODELS, make_dl_model
     from refshift.jitter import make_random_reference_transform
 
     model_lc = model.lower()
@@ -691,13 +859,7 @@ def run_mismatch_jitter(
             f"holdout_ref={holdout_ref!r} not in REFERENCE_MODES={REFERENCE_MODES}"
         )
 
-    dataset, paradigm = _resolve_dataset(dataset_id)
-    if subjects is None:
-        subjects = list(dataset.subject_list)
-    seeds = list(seeds)
     test_modes = tuple(test_reference_modes)
-
-    # Reference set for the train-time sampler
     if cond == "full":
         train_modes = tuple(REFERENCE_MODES)
         holdout_label = ""
@@ -706,77 +868,37 @@ def run_mismatch_jitter(
         holdout_label = holdout_ref
     train_modes_str = ",".join(train_modes)
 
-    # Graph for spatial / REST modes (needed by the train-time sampler if
-    # any of laplacian/nn_diff/rest is in train_modes, AND/OR by test-time
-    # apply_reference for any spatial test mode).
-    needs_graph = any(
-        m in ("laplacian", "nn_diff", "rest")
-        for m in set(train_modes) | set(test_modes)
-    )
-    needs_rest = ("rest" in train_modes) or ("rest" in test_modes)
-    graph = None
-    if needs_graph:
-        ch_names = _get_eeg_channel_names(dataset, subject=subjects[0], paradigm=paradigm)
-        graph = build_graph(
-            ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
-        )
-
-    try:
-        from tqdm.auto import tqdm as _tqdm
-    except ImportError:
-        def _tqdm(it, **kwargs):
-            return it
-
-    jobs = [(s, k) for s in subjects for k in seeds]
-    iterator = _tqdm(
-        jobs,
-        desc=f"[{dataset.code}] {model_lc} jitter-{cond}",
-        disable=not progress, leave=True,
+    # Graph must cover both train-time sampler modes and test-time apply_reference modes.
+    ctx = _setup_dl_run(
+        dataset_id, subjects=subjects, seeds=seeds,
+        reference_modes_for_graph=tuple(set(train_modes) | set(test_modes)),
+        laplacian_k=laplacian_k, montage=montage, progress=progress,
     )
 
     rows: List[dict] = []
-    last_subject: Optional[int] = None
-    X = y_int = metadata = None
-    sfreq: Optional[float] = None
-
-    for subject, seed in iterator:
-        if subject != last_subject:
-            X, y_int, metadata, sfreq, ch_names_subj = load_dl_data(
-                dataset_id, subject,
-                resample=dl_resample,
-                l_freq=dl_l_freq, h_freq=dl_h_freq,
-                trial_start_offset_s=dl_trial_start_offset_s,
-                trial_stop_offset_s=dl_trial_stop_offset_s,
-                cache_dir=dl_cache_dir,
-            )
-            if graph is not None:
-                assert list(ch_names_subj) == graph.ch_names, (
-                    f"Channel order mismatch for subject {subject}: "
-                    f"data has {ch_names_subj[:5]}... but graph was "
-                    f"built from {graph.ch_names[:5]}..."
-                )
-            last_subject = subject
-
-        X_tr, y_tr, X_te, y_te = _split_train_test(
-            X, y_int, metadata, strategy=split_strategy, seed=seed,
-            dataset_id=dataset_id,
-        )
-
-        # Pre-compute every test variant once. We intentionally compute all
-        # 7 even under LOFO so the table includes the held-out test-ref
-        # accuracy in the same row layout as the full-jitter table.
+    for subject, seed, X_tr, y_tr, X_te, y_te, sfreq in _iter_per_subject_dl_jobs(
+        ctx, split_strategy=split_strategy,
+        desc=f"[{ctx.dataset_code}] {model_lc} jitter-{cond}",
+        progress=progress,
+        dl_resample=dl_resample,
+        dl_l_freq=dl_l_freq, dl_h_freq=dl_h_freq,
+        dl_trial_start_offset_s=dl_trial_start_offset_s,
+        dl_trial_stop_offset_s=dl_trial_stop_offset_s,
+        dl_cache_dir=dl_cache_dir,
+    ):
+        # Pre-compute every test variant once. Under LOFO we still compute
+        # the held-out test variant so the row layout matches full-jitter.
         X_te_by_ref = {
-            m: apply_reference(X_te, m, graph=graph) for m in test_modes
+            m: apply_reference(X_te, m, graph=ctx.graph) for m in test_modes
         }
         n_classes = int(max(int(y_tr.max()), int(y_te.max()))) + 1
 
-        # Build the per-sample random-reference transform. random_state is
-        # tied to the (subject, seed, condition) triple so reproducibility
-        # is preserved across re-runs.
+        # Per-sample random-reference transform. Seeded from (subject, seed)
+        # so reproducibility is preserved across re-runs.
         rng_seed = int(1_000_003 * int(seed) + 7919 * int(subject))
         ref_transform = make_random_reference_transform(
             allowed_modes=train_modes,
-            graph=graph,
+            graph=ctx.graph,
             probability=1.0,
             random_state=rng_seed,
         )
@@ -796,16 +918,15 @@ def run_mismatch_jitter(
             verbose=dl_verbose,
             transforms=[ref_transform],
         )
-
-        # The training data is intentionally passed in *native* form. The
-        # transform re-references each sample at batch-time; if we apply a
-        # reference here too, we'd be transforming twice.
+        # Train data is passed in native form; the transform re-references
+        # each sample at batch-time. Applying a reference here too would
+        # double-transform.
         pipe.fit(X_tr, y_tr)
 
         for test_ref in test_modes:
             y_pred = pipe.predict(X_te_by_ref[test_ref])
             rows.append({
-                "dataset":     dataset.code,
+                "dataset":     ctx.dataset_code,
                 "subject":     subject,
                 "seed":        seed,
                 "condition":   cond,
@@ -1118,57 +1239,30 @@ def run_bandpass_mismatch(
             f"reference_mode={reference_mode!r} not in REFERENCE_MODES"
         )
 
-    dataset, paradigm = _resolve_dataset(dataset_id)
-    if subjects is None:
-        subjects = list(dataset.subject_list)
-    seeds = list(seeds)
-
-    needs_graph = reference_mode in ("laplacian", "nn_diff", "rest")
-    needs_rest = reference_mode == "rest"
-    graph = None
-    if needs_graph:
-        ch_names = _get_eeg_channel_names(
-            dataset, subject=subjects[0], paradigm=paradigm,
-        )
-        graph = build_graph(
-            ch_names, montage="standard_1005", include_rest=needs_rest,
-        )
+    # Train side uses the shared helpers; the graph only needs to support
+    # `reference_mode` (the single ref applied to both train and test).
+    ctx = _setup_dl_run(
+        dataset_id, subjects=subjects, seeds=seeds,
+        reference_modes_for_graph=(reference_mode,),
+        montage="standard_1005", progress=progress,
+    )
 
     # All bands to evaluate (train_band always included as the diagonal).
     all_test_bands = (train_band,) + tuple(b for b in test_bands if b != train_band)
     bands_str = lambda b: f"{b[0]:.1f}-{b[1]:.1f}"
 
-    try:
-        from tqdm.auto import tqdm as _tqdm
-    except ImportError:
-        def _tqdm(it, **kwargs):
-            return it
-
-    jobs = [(s, k) for s in subjects for k in seeds]
-    iterator = _tqdm(
-        jobs, desc=f"[{dataset.code}] {model_lc} bandpass",
-        disable=not progress, leave=True,
-    )
-
     rows: List[dict] = []
-    for subject, seed in iterator:
-        # Train preprocessing
-        X_tr_raw, y_tr_raw, meta_tr, sfreq, ch_names_subj = load_dl_data(
-            dataset_id, subject,
-            resample=dl_resample,
-            l_freq=train_band[0], h_freq=train_band[1],
-            trial_start_offset_s=dl_trial_start_offset_s,
-            trial_stop_offset_s=dl_trial_stop_offset_s,
-            cache_dir=dl_cache_dir,
-        )
-        if graph is not None:
-            assert list(ch_names_subj) == graph.ch_names
-
-        X_tr_split, y_tr, _Xdrop, _ydrop = _split_train_test(
-            X_tr_raw, y_tr_raw, meta_tr,
-            strategy=split_strategy, seed=seed, dataset_id=dataset_id,
-        )
-        X_tr_ref = apply_reference(X_tr_split, reference_mode, graph=graph)
+    for subject, seed, X_tr_split, y_tr, _Xdrop, _ydrop, sfreq in _iter_per_subject_dl_jobs(
+        ctx, split_strategy=split_strategy,
+        desc=f"[{ctx.dataset_code}] {model_lc} bandpass",
+        progress=progress,
+        dl_resample=dl_resample,
+        dl_l_freq=train_band[0], dl_h_freq=train_band[1],
+        dl_trial_start_offset_s=dl_trial_start_offset_s,
+        dl_trial_stop_offset_s=dl_trial_stop_offset_s,
+        dl_cache_dir=dl_cache_dir,
+    ):
+        X_tr_ref = apply_reference(X_tr_split, reference_mode, graph=ctx.graph)
         n_classes = int(max(int(y_tr.max()), int(_ydrop.max()))) + 1
 
         net = make_dl_model(
@@ -1188,8 +1282,10 @@ def run_bandpass_mismatch(
         net.fit(X_tr_ref, y_tr)
 
         # For each test band, re-preprocess with that band and evaluate.
+        # The helper can't drive this loop because the bandpass changes
+        # per iteration (different cache key, different load).
         for tb in all_test_bands:
-            X_te_raw, y_te_raw, meta_te, sfreq_te, _chs = load_dl_data(
+            X_te_raw, y_te_raw, meta_te, _sfreq_te, _chs = load_dl_data(
                 dataset_id, subject,
                 resample=dl_resample,
                 l_freq=tb[0], h_freq=tb[1],
@@ -1197,15 +1293,15 @@ def run_bandpass_mismatch(
                 trial_stop_offset_s=dl_trial_stop_offset_s,
                 cache_dir=dl_cache_dir,
             )
-            _Xdrop, _ydrop, X_te_split, y_te = _split_train_test(
+            _Xdrop2, _ydrop2, X_te_split, y_te = _split_train_test(
                 X_te_raw, y_te_raw, meta_te,
                 strategy=split_strategy, seed=seed, dataset_id=dataset_id,
             )
-            X_te_ref = apply_reference(X_te_split, reference_mode, graph=graph)
+            X_te_ref = apply_reference(X_te_split, reference_mode, graph=ctx.graph)
             y_pred = net.predict(X_te_ref)
 
             rows.append({
-                "dataset":    dataset.code,
+                "dataset":    ctx.dataset_code,
                 "subject":    int(subject),
                 "seed":       int(seed),
                 "reference":  reference_mode,

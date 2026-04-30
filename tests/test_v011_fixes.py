@@ -338,3 +338,124 @@ def test_operator_distance_correlation_returns_ci_and_perm_p():
     # corrected, so strictly > 0)
     assert 0.0 < res.perm_p_spearman <= 1.0
     assert 0.0 < res.perm_p_pearson <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# DL-runner helper scaffolding
+# ---------------------------------------------------------------------------
+
+def test_setup_dl_run_skips_graph_when_no_spatial_modes():
+    """If the run only uses non-spatial references (native, car, median),
+    no neighbour graph should be built — saving the spherical-model
+    construction cost when REST is not in the run, and avoiding a MOABB
+    raw fetch entirely if no graph is needed at all."""
+    from unittest.mock import MagicMock, patch
+    from refshift.experiments import _setup_dl_run
+
+    fake_ds = MagicMock()
+    fake_ds.code = "FAKE"
+    fake_ds.subject_list = [1, 2]
+    fake_paradigm = MagicMock()
+
+    with patch("refshift.experiments._resolve_dataset",
+               return_value=(fake_ds, fake_paradigm)):
+        ctx = _setup_dl_run(
+            "iv2a", subjects=None, seeds=[0],
+            reference_modes_for_graph=("native", "car", "median"),
+            progress=False,
+        )
+    assert ctx.graph is None
+    assert ctx.subjects == [1, 2]
+    assert ctx.seeds == [0]
+    assert ctx.dataset_code == "FAKE"
+
+
+def test_setup_dl_run_includes_rest_only_when_requested():
+    """include_rest in build_graph should be True iff 'rest' is in the
+    declared reference modes; otherwise the spherical model is skipped."""
+    from unittest.mock import MagicMock, patch
+    from refshift.experiments import _setup_dl_run
+
+    fake_ds = MagicMock()
+    fake_ds.code = "FAKE"
+    fake_ds.subject_list = [1]
+    fake_paradigm = MagicMock()
+    fake_paradigm.channels = [
+        "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1", "Cz",
+        "C2", "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz",
+        "P2", "POz",
+    ]
+
+    with patch("refshift.experiments._resolve_dataset",
+               return_value=(fake_ds, fake_paradigm)):
+        # laplacian + nn_diff but no rest -> graph built without rest matrix
+        ctx = _setup_dl_run(
+            "iv2a", subjects=None, seeds=[0],
+            reference_modes_for_graph=("laplacian", "nn_diff"),
+            progress=False,
+        )
+        assert ctx.graph is not None
+        assert ctx.graph.rest_matrix is None
+
+        # rest in the modes -> graph built WITH rest matrix
+        ctx2 = _setup_dl_run(
+            "iv2a", subjects=None, seeds=[0],
+            reference_modes_for_graph=("car", "rest"),
+            progress=False,
+        )
+        assert ctx2.graph is not None
+        assert ctx2.graph.rest_matrix is not None
+
+
+def test_iter_per_subject_dl_jobs_loads_once_per_subject(monkeypatch):
+    """The generator must reload underlying data only when the subject
+    changes; subsequent seeds reuse the in-memory tensor. This is the
+    main reason the helper exists.
+    """
+    import numpy as np
+    import pandas as pd
+    from refshift.experiments import _iter_per_subject_dl_jobs, _DLRunContext
+
+    load_calls: list = []
+
+    def fake_load_dl_data(dataset_id, subject, **kwargs):
+        load_calls.append(int(subject))
+        n = 8
+        X = np.random.RandomState(int(subject)).standard_normal((n, 22, 100)).astype(np.float32)
+        y = np.array([0, 1] * (n // 2), dtype=np.int64)
+        meta = pd.DataFrame({
+            "session": ["0"] * n,
+            "run": ["0"] * n,
+            "subject": [int(subject)] * n,
+        })
+        ch_names = [
+            "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1", "Cz",
+            "C2", "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz",
+            "P2", "POz",
+        ]
+        return X, y, meta, 250.0, ch_names
+
+    # Patch the symbol where _iter_per_subject_dl_jobs imports it
+    import refshift.dl as dl_mod
+    monkeypatch.setattr(dl_mod, "load_dl_data", fake_load_dl_data)
+
+    ctx = _DLRunContext(
+        dataset_id="iv2a",
+        dataset_code="FAKE",
+        subjects=[1, 2],
+        seeds=[0, 1, 2],
+        graph=None,
+    )
+
+    yielded = list(_iter_per_subject_dl_jobs(
+        ctx, split_strategy="stratify", progress=False,
+    ))
+
+    # 2 subjects x 3 seeds = 6 jobs, but only 2 underlying loads
+    assert len(yielded) == 6
+    assert load_calls == [1, 2], f"expected [1, 2], got {load_calls}"
+
+    # Sanity check the yielded shapes
+    for subject, seed, X_tr, y_tr, X_te, y_te, sfreq in yielded:
+        assert X_tr.ndim == 3 and X_te.ndim == 3
+        assert sfreq == 250.0
