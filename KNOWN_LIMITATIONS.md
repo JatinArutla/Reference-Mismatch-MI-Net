@@ -10,6 +10,154 @@ in your methods section.
 
 ---
 
+## Reference-operator set (v0.10 redesign after peer review)
+
+Three rounds of peer review on the v0.9 reference set led to a
+6-operator scheme in v0.10. The changes, in order of importance:
+
+**1. `gs` was dropped.** The natural data-dependent Gram-Schmidt
+projection is not a fixed C×C linear operator; it is per-trial,
+per-channel, depends on the input time-series, and behaves nonlinearly
+under input scaling. It does not fit the operator-shift framework the
+paper advances. We did not replace `gs` with a linear "leave-one-out
+mean" alternative because LOO_i = (C/(C−1)) · CAR_i — they are a
+constant scaling of each other and produce identical decoder outputs
+under any scale-invariant decoder (CSP+LDA's eigenvalue problem and
+batch-normalised neural networks both qualify). LOO would appear as a
+duplicate of CAR in every empirical result.
+
+**2. `bipolar` was renamed to `nn_diff`.** The operation `X_i − X_{nn(i)}`
+is a dimension-preserving nearest-neighbour local-difference operator,
+*not* a clinical bipolar montage. Clinical bipolar montages use
+predefined electrode pairs and typically reduce the channel count.
+Calling our operator "bipolar" overloaded a clinical term; "NN-diff" is
+honest about what we compute. The implementation is unchanged.
+
+**3. NN-diff rank diagnostic.** When nearest-neighbour pairs are mutual
+(e.g. C3↔CP3 are each other's nearest neighbours), the operator
+destroys two dimensions instead of one. `build_graph` now computes the
+rank of `(I − P)` where P is the channel-permutation matrix from
+`nn_diff_idx`, and stores it on `DatasetGraph.nn_diff_rank` /
+`nn_diff_nullity`. Logged at run start so the operator's effective
+rank is on record per dataset.
+
+**4. REST regularization.** REST's pseudo-inverse uses `rcond=1e-4`
+explicitly, matching the realistic-head-model REST literature. The
+default numpy `pinv` rcond depends on the largest singular value and
+can be too aggressive for well-conditioned but small leadfields.
+
+**5. Pre-EMS reference control (`run_pre_ems_diagonal`).** Exponential
+moving standardization in the deep-learning pipeline runs *before*
+reference operators in `run_mismatch`, because EMS happens in
+`load_dl_data` and reference operators are applied to the windowed X
+array. EMS is per-channel and adaptive; it does not commute with
+channel-mixing reference operators. The standard pipeline therefore
+measures "reference applied to EMS-standardized signals" rather than
+"reference applied to raw filtered signals, then standardized." The
+function `run_pre_ems_diagonal` runs the corresponding control: for
+each reference r, preprocess with r applied *before* EMS, train and
+test on the same r, return a 6-element diagonal. Compare to the
+diagonal of `run_mismatch` to verify EMS-after-reference is not
+materially distorting per-reference accuracies. Use only as an
+ablation; the headline matrix uses the standard pipeline.
+
+**6. Naming throughout.** "kNN local Laplacian (not formal CSD)";
+"REST-like spherical-model re-reference (not validated against a
+canonical REST implementation)"; "median as robustness control, not a
+mainstream MI reference"; "NN-diff (not clinical bipolar)". The paper
+should mirror these qualifications.
+
+---
+
+## v0.11 changes (current)
+
+These changes consolidate the codebase against issues that surfaced
+during a deep code review prior to the multi-decoder, multi-dataset
+re-run.
+
+**1. DL pipeline resamples to a common rate.** Previously the DL path ran
+each dataset at its native acquisition rate (IV-2a 250 Hz, OpenBMI
+1000 Hz, Cho2017/Dreyer2023 512 Hz, Schirrmeister 500 Hz), so
+ShallowFBCSPNet's `filter_time_length=25` corresponded to wildly
+different physical-time receptive fields (~25 ms to ~100 ms). The DL
+pipeline now resamples every dataset to a common rate
+(`load_dl_data(resample=250.0)` default), with `resample` part of the
+disk-cache key so different rates get separate cache entries. The
+CSP+LDA path is left at MOABB's native paradigm settings (only
+Schirrmeister has `paradigm.resample=250.0`); CSP-based decoders are
+not sensitive to absolute sample rate, so the path inconsistency does
+not affect cross-dataset CSP+LDA comparability.
+
+**2. Uniform EEGNet learning rate.** `make_dl_model("eegnet", ...)` now
+defaults to `lr=5e-4` for all datasets — Lawhern et al. 2018's
+recommendation for small-data MI. The previous default of 1e-3
+produced chance-level results on Cho2017 specifically (EEGNet has
+~3,000 parameters; 80 train trials per subject under stratified 80/20
+overshoots at higher LRs). The earlier per-dataset override of 5e-4
+for Cho2017 only is removed.
+
+**3. Bug fixes that prevented prior releases from running:**
+
+  - `run_pre_ems_diagonal` (the EMS-control ablation, listed as the
+    highest-priority unrun experiment in earlier handoffs) was calling
+    `make_dl_model` with parameter names `name=` / `n_chans=` /
+    `input_window_samples=` against a function whose signature is
+    `model=` / `n_channels=` / `n_times=`. It would TypeError on the
+    first iteration and never produced a result. Fixed.
+
+  - `run_mismatch_jitter` referenced a variable `paradigm` that was
+    bound as `_paradigm` two lines earlier. NameError on every default
+    call (because `REFERENCE_MODES` always includes graph-requiring
+    spatial modes). Fixed.
+
+  - `dl.py`'s Schirrmeister branch used `pick_channels(ordered=False)`
+    while `_get_eeg_channel_names` returns `paradigm.channels` in
+    user-supplied order (because MOABB's `RawToEpochs` calls
+    `pick_channels(ordered=True)`). The graph and X-axis-1 channel
+    orders therefore disagreed; the runtime assertion
+    `list(ch_names_subj) == graph.ch_names` would have caught it and
+    crashed. Now `ordered=True`.
+
+  - The `load_dl_data` cache-key tuple `_CACHE_KEY_PARAMS` did not
+    include `pre_ems_reference`, even though the function set the value
+    in `params`. Calls with `pre_ems_reference=X` would silently return
+    cached results from `pre_ems_reference=None`. Fixed; the cache key
+    now includes both `pre_ems_reference` and `resample`. Old caches
+    are invalidated by the key change (this is intentional — the
+    contents change too).
+
+**4. Documentation alignment.** The previous `dl.py` module docstring
+asserted that applying linear references to the EMS-standardized
+windowed tensor was "numerically equivalent to applying them in
+raw-space." This was false; CAR(EMS(X)) and EMS(CAR(X)) differ because
+EMS divides each channel by its own running standard deviation, so
+per-channel scales are not identical at the moment CAR sums them. The
+docstring is now consistent with this section's caveat (§5 above).
+
+**5. Operator-distance statistics tightened.** With 6 operators we have
+n=15 pairs in the upper triangle; the asymptotic Spearman/Pearson
+p-values used in v0.9/v0.10 were not reliable at this n. The function
+`operator_distance_correlation` now returns: a bootstrap 95% confidence
+interval over pairs (resampling pair indices with replacement); a
+permutation p-value computed by shuffling operator labels of the gap
+matrix while keeping the distance matrix fixed; and an averaged
+linear-operator estimate over multiple Gaussian probes (default 8) to
+reduce variance in the median operator's linear-tangent estimate. The
+asymptotic values are still returned for completeness; the bootstrap CI
+and permutation p are the values to report in the paper.
+
+**6. Two new experiment runners.** `run_lofo_matrix` wraps
+`run_mismatch_jitter(condition='lofo', ...)` in a loop over each
+reference in `REFERENCE_MODES`, producing the full
+holdout-by-test-reference table in one call. `run_bandpass_mismatch`
+trains under one bandpass and tests under others (default train
+8-32 Hz, test 6-32 Hz and 8-30 Hz, reference held fixed at native);
+the resulting accuracy drops give a baseline for "how big is the drop
+under any preprocessing change of comparable magnitude" against which
+the reference-mismatch gap can be compared. Both are DL-only.
+
+---
+
 ## Upstream-library workarounds
 
 ### MOABB Lee2019_MI session-filter inconsistency
@@ -137,44 +285,57 @@ reference-shift effect we measure.
   but matching the dataset's documented evaluation protocol).
 
 This is documented in the methods section of any paper using these
-results.
+results. To address the obvious reviewer objection that the multi-dataset
+gap variation might be partly attributable to protocol heterogeneity,
+the paper should also report an 80/20 sensitivity check on IV-2a and
+OpenBMI: rerun with `split_strategy='stratify'` and compare the mean
+gap to the cross-session result. If they agree to within seed noise,
+the cluster structure is not driven by the split protocol.
 
 ---
 
 ## Decoder-specific notes
 
-### EEGNet on Cho2017 underperforms at the default learning rate
-
-**Symptom.** `model="eegnet"` on Cho2017 with default `dl_lr=1e-3`
-yields a diagonal accuracy of ~55% (chance is 50% for 2-class), making
-reference-shift effects on this row of the result matrix uninterpretable.
-
-**Cause.** EEGNet has ~3,000 parameters; on small per-subject training
-sets (Cho2017 has 80 train trials per subject under stratified 80/20),
-the default learning rate of 1e-3 is too aggressive. Lawhern et al.
-(2018) recommend 5e-4 for small-data MI.
-
-**Workaround.** Pass `dl_lr=5e-4` for EEGNet on Cho2017. Other
-architectures and other datasets do not need this adjustment.
-
-**Disclosure.** When comparing decoders, report the per-architecture
-learning rate explicitly:
-- ShallowFBCSPNet: 6.25e-4 (braindecode's MOABB-example default,
-  Schirrmeister 2017)
-- EEGNet: 1e-3 default; 5e-4 on small-data datasets
-  (Lawhern et al. 2018)
-
 ### Single-seed DL on large datasets
 
 **Disclosure.** Phase 2 DL experiments on OpenBMI, Cho2017, and
-Dreyer2023 are single-seed (seed=0) due to compute budget. IV-2a uses 3
-seeds across all conditions.
+Dreyer2023 have historically been single-seed (seed=0) due to compute
+budget; IV-2a uses 3 seeds across all conditions. With v0.11's resample
+standardization the DL preprocessing cache is invalidated, so the
+re-run sweep is the right time to bring at least one secondary dataset
+to 3 seeds (Schirrmeister is the natural choice given the largest
+absolute gap reported in v0.9).
 
 **Justification.** On IV-2a we have measured seed-level variability at
-~2pt vs subject-level variability at ~13pt. Subject variability dominates
-seed variability by ~6×, so single-seed runs on the larger datasets are
-methodologically defensible. Where this matters for a result, we report
-it.
+~2 pt vs subject-level variability at ~13 pt. Subject variability
+dominates seed variability by ~6×, so single-seed runs on the larger
+datasets are methodologically defensible for headline numbers but cost
+statistical power on per-test-ref Wilcoxon tests.
+
+### CSP+LDA path runs at native sample rates (except Schirrmeister)
+
+**Affects:** CSP+LDA on OpenBMI, Cho2017, Dreyer2023.
+
+**What we do.** Only Schirrmeister2017 sets `paradigm.resample=250.0`
+in `_resolve_dataset`. The other paradigms inherit MOABB's defaults
+(no resampling), so OpenBMI runs at 1000 Hz, Cho2017 and Dreyer2023 at
+512 Hz, IV-2a at its native 250 Hz.
+
+**Why.** CSP's covariance-based decoder is insensitive to absolute
+sample rate (the eigenvalue problem is scale-invariant; the bandpass
+strips content above 32 Hz on every dataset). The IV-2a 65.99% MOABB
+calibration target was computed at native 250 Hz, and we want to
+preserve direct comparability to MOABB's published results where
+possible. Adding resample=250.0 universally would silently invalidate
+that comparability for non-IV-2a datasets.
+
+**Implication for the DL path.** The DL path *does* resample to a
+common 250 Hz on every dataset (see `dl_resample` in `run_mismatch`).
+The CSP+LDA and DL paths therefore see slightly different inputs on
+non-IV-2a datasets. This is documented in methods; CSP+LDA and DL
+results are not directly comparable on the same dataset because of
+this and other architectural differences (covariance vs convolutional
+features), so the path inconsistency is not a confound.
 
 ---
 

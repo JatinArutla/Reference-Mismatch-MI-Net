@@ -7,12 +7,12 @@ Per-sample randomized reference selection, implemented as a braindecode
 Two interventions are supported:
 
   - **full-jitter**: each training sample independently gets a reference
-    drawn uniformly from all 7 modes. The model never sees a fixed reference;
+    drawn uniformly from all 6 modes. The model never sees a fixed reference;
     test-time evaluation under any reference is then "in-distribution" w.r.t.
     the training distribution of references.
 
   - **leave-one-out (LOFO)**: same as above but with one mode held out (e.g.
-    `bipolar`). Test-time evaluation on the held-out mode is the cleanest
+    `nn_diff`). Test-time evaluation on the held-out mode is the cleanest
     distribution-shift probe — the model has never seen that operator, so
     transfer to it must come from invariance, not memorization.
 
@@ -48,7 +48,7 @@ def _random_reference_op(
 
     ``modes`` must have length equal to ``X.shape[0]``. The reference operator
     for sample ``i`` is ``modes[i]``. ``graph`` is required iff any mode in
-    ``modes`` is one of (laplacian, bipolar, rest).
+    ``modes`` is one of (laplacian, nn_diff, rest).
     """
     if X.ndim != 3:
         raise ValueError(f"Expected (B, C, T) tensor, got shape {tuple(X.shape)}.")
@@ -93,9 +93,9 @@ def make_random_reference_transform(
     allowed_modes : sequence of str
         Subset of ``REFERENCE_MODES``. Each training sample independently gets
         one of these drawn uniformly. For the full-jitter condition pass
-        ``REFERENCE_MODES``; for LOFO-bipolar pass the 6 modes excluding bipolar.
+        ``REFERENCE_MODES``; for LOFO-nn_diff pass the 6 modes excluding nn_diff.
     graph : DatasetGraph or None
-        Required if ``allowed_modes`` contains any of {laplacian, bipolar, rest}.
+        Required if ``allowed_modes`` contains any of {laplacian, nn_diff, rest}.
     probability : float, default 1.0
         Per-sample probability of applying the operation. With 1.0 the transform
         is deterministic in *that* it always re-references; the *which* reference
@@ -120,11 +120,11 @@ def make_random_reference_transform(
         raise ValueError(
             f"Unknown reference modes: {unknown}. Known: {REFERENCE_MODES}"
         )
-    needs_graph = any(m in ("laplacian", "bipolar", "rest") for m in allowed)
+    needs_graph = any(m in ("laplacian", "nn_diff", "rest") for m in allowed)
     if needs_graph and graph is None:
         raise ValueError(
             "graph=None but allowed_modes includes a graph-requiring mode "
-            f"({[m for m in allowed if m in ('laplacian', 'bipolar', 'rest')]})."
+            f"({[m for m in allowed if m in ('laplacian', 'nn_diff', 'rest')]})."
         )
     if "rest" in allowed and (graph is None or graph.rest_matrix is None):
         raise ValueError(

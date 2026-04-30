@@ -1,33 +1,56 @@
-"""Reference operators, neighbor graph, and a sklearn-compatible transformer.
+"""Reference and spatial-representation operators for EEG decoding.
 
-Seven operators, grouped by computational structure:
+Six operators, grouped by computational structure. The naming throughout
+deliberately distinguishes between *reference* operators (which redefine
+the zero-potential point) and *spatial-derivative* operators (which form
+local differences, a different category from rereferencing in the strict
+sense). The paper studies both as channel-space transformations.
 
-    Global-mean family      (reduce across all channels)
-        native              identity — use the dataset's native hardware reference
-        car                 common average: X - mean_c(X)
-        median              robust CAR: X - median_c(X)
-        gs                  Gram-Schmidt projection against the leave-one-out mean
+    Global / as-recorded family
+        native              identity — use the dataset's native hardware
+                            reference (e.g. left-mastoid for IV-2a)
+        car                 common average reference: X - mean_c(X)
+        median              robust common-reference control: X - median_c(X)
+                            included as a robustness control, not a
+                            mainstream MI reference
+        rest                REST-like spherical-model re-reference
+                            (Yao 2001 spherical-head approximation):
+                            linear transform that approximates the
+                            potential referenced to infinity, computed
+                            from a three-layer spherical head model and
+                            a regularized leadfield pseudo-inverse
+                            (rcond=1e-4). Not validated against a known
+                            REST implementation; we describe it as
+                            "REST-like" rather than "REST".
 
-    Spatial-differential family  (local neighbor subtraction)
-        laplacian           X - mean of k=4 nearest-neighbor channels
-        bipolar             X - single nearest-neighbor channel
+    Local spatial-derivative family
+        laplacian           kNN local Laplacian: X - mean of the k=4
+                            nearest-neighbour channels. *Not* formal
+                            CSD/spherical-spline Laplacian; this is the
+                            discrete neighbour-mean form used as a
+                            spatial-filter approximation.
+        nn_diff             nearest-neighbour local difference:
+                            X_i - X_{nn(i)}. Dimension-preserving local
+                            derivative. *Not* a clinical bipolar montage
+                            (which uses predefined electrode pairs and
+                            typically reduces channel count). The naming
+                            is deliberately "NN-diff" and not "bipolar".
+                            See ``DatasetGraph.nn_diff_rank`` for the
+                            per-dataset rank diagnostic.
 
-    Source-model family
-        rest                Reference Electrode Standardization Technique
-                            (Yao 2001): linear transform that approximates
-                            the potential referenced to infinity, via a
-                            three-layer spherical head model fit to the
-                            electrode montage.
+Note on omitted operators. We do not include a leave-one-out (LOO) mean
+reference because LOO_i = (C/(C-1)) * CAR_i — they differ only by a
+scalar factor and behave identically for any scale-invariant decoder
+(CSP+LDA, batch-normalized neural networks). We do not include a
+projection-based "GS" operator in the main set because the natural
+implementation is data-dependent and does not form a fixed C×C linear
+operator, putting it outside the operator-shift framework.
 
-Nearest-neighbor graphs are built from Euclidean distances in the MNE
-``standard_1005`` montage. The REST transformation matrix is built from the
-same montage via ``mne.make_sphere_model`` + ``mne.make_forward_solution``.
-The same montage covers every EEG channel in IV-2a, OpenBMI, Cho2017, and
-Dreyer2023.
-
-Operator implementations are numerically identical to the v2 implementation
-for the original six; REST is new and validated by the sum-to-zero spatial
-property of its output on any input reference (see tests/test_reference.py).
+Nearest-neighbour graphs are built from Euclidean distances in the MNE
+``standard_1005`` montage. REST uses the same montage via
+``mne.make_sphere_model`` + ``mne.make_forward_solution``. The same
+montage covers every EEG channel in IV-2a, OpenBMI, Cho2017, Dreyer2023,
+and Schirrmeister2017.
 """
 
 from __future__ import annotations
@@ -40,12 +63,12 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 
 REFERENCE_MODES = (
-    "native", "car", "median", "gs", "laplacian", "bipolar", "rest",
+    "native", "car", "median", "laplacian", "nn_diff", "rest",
 )
 
 # Modes that require a DatasetGraph (i.e. some dataset-specific precomputed
 # state: neighbor indices for spatial modes, leadfield transform for REST).
-_GRAPH_MODES = ("laplacian", "bipolar", "rest")
+_GRAPH_MODES = ("laplacian", "nn_diff", "rest")
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +179,13 @@ def _build_rest_matrix(
 
     C = G.shape[0]
     Ga = G - G.mean(axis=0, keepdims=True)
-    pinvGa = np.linalg.pinv(Ga)
+    # Regularized pseudo-inverse: rcond=1e-4 is the standard choice in
+    # realistic-head-model REST work. The default numpy rcond depends on
+    # the largest singular value and can be too aggressive for
+    # well-conditioned but small Ga, leading to numerical noise in the
+    # inverse. 1e-4 is conservative and matches the published REST
+    # toolbox recommendations.
+    pinvGa = np.linalg.pinv(Ga, rcond=1e-4)
     center = np.eye(C) - np.ones((C, C)) / C
     T = G @ pinvGa @ center
     return np.ascontiguousarray(T, dtype=np.float32)
@@ -175,9 +204,15 @@ class DatasetGraph:
         Channel names in the order used to build the graph. Must match the
         channel order of the arrays fed to the transformer.
     laplacian_idx : np.ndarray of shape (C, k), int64
-        Indices of each channel's k nearest spatial neighbors (for Laplacian).
-    bipolar_idx : np.ndarray of shape (C,), int64
-        Index of each channel's single nearest spatial neighbor (for bipolar).
+        Indices of each channel's k nearest spatial neighbors (for the
+        kNN local-Laplacian operator).
+    nn_diff_idx : np.ndarray of shape (C,), int64
+        Index of each channel's single nearest spatial neighbor (for the
+        nearest-neighbour local-difference operator). This is *not* a
+        clinical bipolar montage with predefined electrode pairs; it is
+        a dimension-preserving local-difference operator. See
+        ``nn_diff_rank`` and ``nn_diff_nullity`` for the per-dataset
+        rank diagnostic.
     k : int
         Neighbor count used for the Laplacian operator.
     montage : str
@@ -186,13 +221,32 @@ class DatasetGraph:
         REST transformation matrix. ``None`` if REST wasn't requested when
         the graph was built (avoids the ~10-30 s cost of computing a
         forward solution when the caller doesn't need REST).
+    nn_diff_rank : int
+        Rank of the (I - P) matrix where P is the channel permutation
+        induced by ``nn_diff_idx``. For a rank-(C-1) chain, rank = C-1.
+        Smaller ranks indicate that the nearest-neighbour graph contains
+        cycles (e.g. mutual nearest-neighbours), which inflate the operator's
+        nullity beyond the minimum. Logged alongside results so reviewers
+        can verify that the NN-diff effect is not driven by pathological
+        rank collapse.
+    nn_diff_nullity : int
+        ``C - nn_diff_rank``. Number of dimensions destroyed by the operator
+        beyond the single global-DC dimension that any local-difference
+        operator must remove.
+    rest_cond : float or None
+        Condition number of the REST transformation matrix (``np.linalg.cond``).
+        ``None`` if REST wasn't requested. Reported for transparency about
+        REST conditioning, which can be sensitive to electrode coverage.
     """
     ch_names: List[str]
     laplacian_idx: np.ndarray
-    bipolar_idx: np.ndarray
+    nn_diff_idx: np.ndarray
     k: int
     montage: str
     rest_matrix: Optional[np.ndarray] = field(default=None)
+    nn_diff_rank: int = field(default=0)
+    nn_diff_nullity: int = field(default=0)
+    rest_cond: Optional[float] = field(default=None)
 
 
 def build_graph(
@@ -216,23 +270,44 @@ def build_graph(
         If True, also compute and store the REST transformation matrix.
         Default False; set True only when the 'rest' reference mode is
         used, since forward-solution computation takes several seconds.
+
+    Notes
+    -----
+    The NN-diff operator is implemented as ``Y_i = X_i - X_{nn(i)}``,
+    which is equivalent to multiplication by ``(I - P)`` where ``P`` is
+    the channel-permutation matrix indexed by ``nn_diff_idx``. When the
+    nearest-neighbour graph has cycles (e.g. C3-C5 mutually nearest),
+    the operator destroys more than one dimension. We compute and store
+    the rank of ``(I - P)`` alongside the indices so the rank can be
+    inspected per dataset.
     """
     xyz = _get_channel_positions(ch_names, montage=montage)
     d = _pairwise_distances(xyz)
     lap = np.argsort(d, axis=1)[:, :k].astype(np.int64)
-    bip = np.argmin(d, axis=1).astype(np.int64)
+    nn = np.argmin(d, axis=1).astype(np.int64)
+
+    # Rank diagnostic for NN-diff
+    C = len(ch_names)
+    M = np.eye(C) - np.eye(C)[nn]  # M[i] = e_i - e_{nn(i)}
+    nn_rank = int(np.linalg.matrix_rank(M))
+    nn_nullity = C - nn_rank
 
     rest_matrix = None
+    rest_cond = None
     if include_rest:
         rest_matrix = _build_rest_matrix(ch_names, montage=montage)
+        rest_cond = float(np.linalg.cond(rest_matrix))
 
     return DatasetGraph(
         ch_names=list(ch_names),
         laplacian_idx=lap,
-        bipolar_idx=bip,
+        nn_diff_idx=nn,
         k=k,
         montage=montage,
         rest_matrix=rest_matrix,
+        nn_diff_rank=nn_rank,
+        nn_diff_nullity=nn_nullity,
+        rest_cond=rest_cond,
     )
 
 
@@ -263,25 +338,12 @@ def _median(X: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(X - np.median(X, axis=axis, keepdims=True), dtype=np.float32)
 
 
-def _gs(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Gram-Schmidt: for each (trial, channel) orthogonalize the channel's
-    time series against the mean of the *other* channels in that trial.
-    """
-    X = _ensure_f32(X)
-    squeeze = (X.ndim == 2)
-    if squeeze:
-        X = X[None, ...]
-    _, C, _ = X.shape
-    s = X.sum(axis=1, keepdims=True)                   # [N, 1, T]
-    r = (s - X) / max(C - 1, 1)                         # [N, C, T] LOO mean
-    num = np.sum(X * r, axis=2, keepdims=True)          # [N, C, 1]
-    den = np.sum(r * r, axis=2, keepdims=True) + eps
-    Y = X - (num / den) * r
-    Y = Y[0] if squeeze else Y
-    return np.ascontiguousarray(Y, dtype=np.float32)
-
-
 def _laplacian(X: np.ndarray, laplacian_idx: np.ndarray) -> np.ndarray:
+    """kNN local Laplacian: subtract the mean of the k nearest spatial
+    neighbours from each channel. Not formal CSD/spherical-spline
+    Laplacian; this is the discrete neighbour-mean form used as an EEG
+    spatial-filter approximation.
+    """
     X = _ensure_f32(X)
     if X.ndim == 2:
         ref = X[laplacian_idx].mean(axis=1)              # [C, k, T] -> [C, T]
@@ -290,11 +352,19 @@ def _laplacian(X: np.ndarray, laplacian_idx: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(X - ref, dtype=np.float32)
 
 
-def _bipolar(X: np.ndarray, bipolar_idx: np.ndarray) -> np.ndarray:
+def _nn_diff(X: np.ndarray, nn_diff_idx: np.ndarray) -> np.ndarray:
+    """Nearest-neighbour local difference: ``Y_i = X_i - X_{nn(i)}``.
+
+    Dimension-preserving local-derivative operator. *Not* a clinical
+    bipolar montage, which would use predefined electrode pairs and
+    typically reduces channel count. The naming "NN-diff" rather than
+    "bipolar" is deliberate. See ``DatasetGraph.nn_diff_rank`` for the
+    rank diagnostic per dataset.
+    """
     X = _ensure_f32(X)
     if X.ndim == 2:
-        return np.ascontiguousarray(X - X[bipolar_idx], dtype=np.float32)
-    return np.ascontiguousarray(X - X[:, bipolar_idx], dtype=np.float32)
+        return np.ascontiguousarray(X - X[nn_diff_idx], dtype=np.float32)
+    return np.ascontiguousarray(X - X[:, nn_diff_idx], dtype=np.float32)
 
 
 def _rest(X: np.ndarray, rest_matrix: np.ndarray) -> np.ndarray:
@@ -323,7 +393,7 @@ def apply_reference(
     """Dispatch X through the named reference operator.
 
     ``graph`` is required for any mode in ``_GRAPH_MODES``
-    ('laplacian', 'bipolar', 'rest'). For REST, the graph must have been
+    ('laplacian', 'nn_diff', 'rest'). For REST, the graph must have been
     built with ``include_rest=True``.
     """
     mode = mode.lower()
@@ -333,16 +403,14 @@ def apply_reference(
         return _car(X)
     if mode == "median":
         return _median(X)
-    if mode == "gs":
-        return _gs(X)
 
     if mode in _GRAPH_MODES:
         if graph is None:
             raise ValueError(f"Mode {mode!r} requires a DatasetGraph")
         if mode == "laplacian":
             return _laplacian(X, graph.laplacian_idx)
-        if mode == "bipolar":
-            return _bipolar(X, graph.bipolar_idx)
+        if mode == "nn_diff":
+            return _nn_diff(X, graph.nn_diff_idx)
         if mode == "rest":
             if graph.rest_matrix is None:
                 raise ValueError(
@@ -369,7 +437,7 @@ class ReferenceTransformer(BaseEstimator, TransformerMixin):
     ----------
     mode : one of REFERENCE_MODES
     graph : DatasetGraph or None, default None
-        Required for 'laplacian', 'bipolar', and 'rest'. Must match the
+        Required for 'laplacian', 'nn_diff', and 'rest'. Must match the
         channel ordering of the input arrays. For 'rest', the graph must
         have been built with ``include_rest=True``.
 

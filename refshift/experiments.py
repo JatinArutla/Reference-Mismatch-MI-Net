@@ -1,10 +1,14 @@
 """refshift.experiments — calibration and mismatch-matrix runners.
 
-Three entry points:
+Five entry points:
 
-    calibrate_csp_lda(dataset_id, ...)  - MOABB WithinSession calibration (Phase 1)
-    run_mismatch(dataset_id, ...)       - 7x7 mismatch matrix, CSP+LDA or DL
-    mismatch_matrix(df, ...)            - pivot long-form -> 7x7 table
+    calibrate_csp_lda(dataset_id, ...)   - MOABB WithinSession calibration (Phase 1)
+    run_mismatch(dataset_id, ...)        - 6x6 mismatch matrix, CSP+LDA or DL
+    run_mismatch_jitter(dataset_id, ...) - DL with per-sample jitter (full or LOFO)
+    run_lofo_matrix(dataset_id, ...)     - LOFO sweep across all 6 hold-outs
+    run_pre_ems_diagonal(dataset_id, ...) - EMS-control ablation
+    run_bandpass_mismatch(dataset_id, ...) - bandpass-mismatch preprocessing control
+    mismatch_matrix(df, ...)             - pivot long-form -> 6x6 table
 
 ``run_mismatch`` dispatches on ``model``: ``'csp_lda'`` uses MOABB's paradigm
 interface (Phase 1); ``'eegnet'`` / ``'shallow'`` use ``refshift.dl`` wrappers
@@ -13,7 +17,7 @@ around braindecode's canonical MOABB loader.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -166,11 +170,11 @@ def _get_eeg_channel_names(
     If ``paradigm.channels`` is unset, all EEG channels in the raw are
     returned in raw-channel order.
 
-    The neighbour graph for spatial-differential references (laplacian,
-    bipolar) and REST is built from this list, so it is critical that
+    The neighbour graph for spatial-differential references (kNN-laplacian,
+    NN-diff) and REST is built from this list, so it is critical that
     it matches the channel axis of the X array the paradigm produces.
     Mismatches here surface as ``IndexError: index N is out of bounds``
-    inside ``_laplacian`` / ``_bipolar``.
+    inside ``_laplacian`` / ``_nn_diff``.
     """
     if paradigm is not None and getattr(paradigm, "channels", None):
         # MOABB picks with ordered=True, which preserves include-list
@@ -368,21 +372,22 @@ def run_mismatch(
     dl_verbose: int = 0,
     dl_l_freq: float = 8.0,
     dl_h_freq: float = 32.0,
+    dl_resample: float = 250.0,
     dl_trial_start_offset_s: float = 0.0,
     dl_trial_stop_offset_s: float = 0.0,
     dl_cache_dir: 'Optional[str]' = None,
 ) -> pd.DataFrame:
-    """Run the 7x7 mismatch matrix on a dataset.
+    """Run the 6x6 mismatch matrix on a dataset.
 
     For each (subject, seed):
       1. Load epoched data (CSP path: MOABB paradigm; DL path: braindecode).
       2. Split train/test (session split if >1 session, else 80/20 stratified).
-      3. Pre-compute all 7 test variants once.
-      4. For each train_ref, train one model; score on all 7 test variants.
+      3. Pre-compute all 6 test variants once.
+      4. For each train_ref, train one model; score on all 6 test variants.
 
     Parameters
     ----------
-    dataset_id : {'iv2a', 'openbmi', 'cho2017', 'dreyer2023'}
+    dataset_id : {'iv2a', 'openbmi', 'cho2017', 'dreyer2023', 'schirrmeister2017'}
     model : {'csp_lda', 'eegnet', 'shallow'}
         ``csp_lda`` uses the MOABB paradigm path (Phase 1).
         ``eegnet`` / ``shallow`` use ``refshift.dl`` (Phase 2).
@@ -405,6 +410,10 @@ def run_mismatch(
         Show tqdm progress bar over (subject, seed) jobs.
 
     DL options (``dl_``-prefixed) are ignored when ``model='csp_lda'``.
+    ``dl_resample`` is the sample rate used for every dataset on the DL path
+    (default 250 Hz, matching IV-2a's native rate). Standardising this
+    across datasets keeps the time-domain receptive field of every model
+    identical regardless of native acquisition rate.
 
     Returns
     -------
@@ -431,7 +440,7 @@ def run_mismatch(
     seeds = list(seeds)
 
     # Build the neighbor graph once per dataset (only if needed).
-    needs_graph = any(m in ("laplacian", "bipolar", "rest") for m in modes)
+    needs_graph = any(m in ("laplacian", "nn_diff", "rest") for m in modes)
     needs_rest = "rest" in modes
     graph = None
     if needs_graph:
@@ -440,6 +449,21 @@ def run_mismatch(
             ch_names, k=laplacian_k, montage=montage,
             include_rest=needs_rest,
         )
+        # Diagnostic: log NN-diff rank/nullity and (if applicable) REST
+        # condition number once per dataset. This is the headline
+        # methodological control for the local-spatial-derivative cluster:
+        # if NN-diff drives a large effect, we want it on record that the
+        # operator is not pathologically rank-collapsed.
+        if progress:
+            print(
+                f"[{dataset.code}] graph: C={len(graph.ch_names)}, "
+                f"NN-diff rank={graph.nn_diff_rank}/{len(graph.ch_names)} "
+                f"(nullity={graph.nn_diff_nullity})"
+                + (
+                    f", REST cond={graph.rest_cond:.2e}"
+                    if graph.rest_cond is not None else ""
+                )
+            )
 
     cache_config = _build_cache_config() if (cache and not is_dl) else None
     cache_kwargs = {"cache_config": cache_config} if cache_config else {}
@@ -466,18 +490,38 @@ def run_mismatch(
         if subject != last_subject:
             if is_dl:
                 from refshift.dl import load_dl_data
-                X, y_int, metadata, sfreq, _ = load_dl_data(
+                X, y_int, metadata, sfreq, ch_names_subj = load_dl_data(
                     dataset_id, subject,
+                    resample=dl_resample,
                     l_freq=dl_l_freq, h_freq=dl_h_freq,
                     trial_start_offset_s=dl_trial_start_offset_s,
                     trial_stop_offset_s=dl_trial_stop_offset_s,
                     cache_dir=dl_cache_dir,
                 )
+                # Critical check: if a graph is in use, the per-subject channel
+                # order must match the order the graph was built from. A
+                # silent mismatch here would propagate as wrong neighbour
+                # indices being applied to the wrong channels.
+                if graph is not None:
+                    assert list(ch_names_subj) == graph.ch_names, (
+                        f"Channel order mismatch for subject {subject}: "
+                        f"data has {ch_names_subj[:5]}... but graph was "
+                        f"built from {graph.ch_names[:5]}..."
+                    )
             else:
                 X, y_raw, metadata = paradigm.get_data(
                     dataset=dataset, subjects=[subject], **cache_kwargs,
                 )
                 y_int, _ = _encode_labels(y_raw)
+                # CSP path: re-confirm channel order via paradigm.channels if
+                # set, or trust that all subjects share the dataset's native
+                # order. We assert the channel count for a cheap sanity check.
+                if graph is not None:
+                    assert X.shape[1] == len(graph.ch_names), (
+                        f"Channel count mismatch for subject {subject}: "
+                        f"data has {X.shape[1]} channels but graph has "
+                        f"{len(graph.ch_names)}."
+                    )
             last_subject = subject
 
         X_tr, y_tr, X_te, y_te = _split_train_test(
@@ -485,7 +529,7 @@ def run_mismatch(
             dataset_id=dataset_id,
         )
 
-        # Pre-compute all 7 test variants once.
+        # Pre-compute all 6 test variants once.
         X_te_by_ref = {
             m: apply_reference(X_te, m, graph=graph) for m in modes
         }
@@ -566,7 +610,7 @@ def run_mismatch_jitter(
     *,
     model: str,
     condition: str = "full",
-    holdout_ref: str = "bipolar",
+    holdout_ref: str = "nn_diff",
     subjects: Optional[List[int]] = None,
     seeds: List[int] = (0,),
     test_reference_modes: tuple = REFERENCE_MODES,
@@ -582,18 +626,19 @@ def run_mismatch_jitter(
     dl_verbose: int = 0,
     dl_l_freq: float = 8.0,
     dl_h_freq: float = 32.0,
+    dl_resample: float = 250.0,
     dl_trial_start_offset_s: float = 0.0,
     dl_trial_stop_offset_s: float = 0.0,
     dl_cache_dir: 'Optional[str]' = None,
 ) -> pd.DataFrame:
     """Train one model per (subject, seed) with reference-jitter augmentation,
-    evaluate on all 7 test references.
+    evaluate on all 6 test references.
 
     Two conditions:
 
       condition='full':
           Each training sample independently gets a reference drawn uniformly
-          from all 7 modes. Tests at-distribution generalization across all
+          from all 6 modes. Tests at-distribution generalization across all
           references the model has seen.
 
       condition='lofo':
@@ -605,17 +650,19 @@ def run_mismatch_jitter(
 
     Parameters
     ----------
-    dataset_id : {'iv2a', 'openbmi', 'cho2017', 'dreyer2023'}
+    dataset_id : {'iv2a', 'openbmi', 'cho2017', 'dreyer2023', 'schirrmeister2017'}
     model : {'eegnet', 'shallow'}
         DL only — jitter is meaningful for end-to-end models, not for the
         CSP+LDA pipeline (which has no batched training loop to inject
         per-sample reference randomness into).
     condition : {'full', 'lofo'}
     holdout_ref : str
-        Used only when condition='lofo'. Default 'bipolar' (the structurally
+        Used only when condition='lofo'. Default 'nn_diff' (the structurally
         most distinct operator and the strongest test of generalization).
+        For the full LOFO matrix across all 6 references, see
+        ``run_lofo_matrix`` which loops this function and concatenates.
     test_reference_modes : tuple of str
-        References to evaluate on at test time. Defaults to all 7.
+        References to evaluate on at test time. Defaults to all 6.
     Other parameters : see ``run_mismatch``.
 
     Returns
@@ -644,7 +691,7 @@ def run_mismatch_jitter(
             f"holdout_ref={holdout_ref!r} not in REFERENCE_MODES={REFERENCE_MODES}"
         )
 
-    dataset, _paradigm = _resolve_dataset(dataset_id)
+    dataset, paradigm = _resolve_dataset(dataset_id)
     if subjects is None:
         subjects = list(dataset.subject_list)
     seeds = list(seeds)
@@ -660,10 +707,10 @@ def run_mismatch_jitter(
     train_modes_str = ",".join(train_modes)
 
     # Graph for spatial / REST modes (needed by the train-time sampler if
-    # any of laplacian/bipolar/rest is in train_modes, AND/OR by test-time
+    # any of laplacian/nn_diff/rest is in train_modes, AND/OR by test-time
     # apply_reference for any spatial test mode).
     needs_graph = any(
-        m in ("laplacian", "bipolar", "rest")
+        m in ("laplacian", "nn_diff", "rest")
         for m in set(train_modes) | set(test_modes)
     )
     needs_rest = ("rest" in train_modes) or ("rest" in test_modes)
@@ -694,13 +741,20 @@ def run_mismatch_jitter(
 
     for subject, seed in iterator:
         if subject != last_subject:
-            X, y_int, metadata, sfreq, _ = load_dl_data(
+            X, y_int, metadata, sfreq, ch_names_subj = load_dl_data(
                 dataset_id, subject,
+                resample=dl_resample,
                 l_freq=dl_l_freq, h_freq=dl_h_freq,
                 trial_start_offset_s=dl_trial_start_offset_s,
                 trial_stop_offset_s=dl_trial_stop_offset_s,
                 cache_dir=dl_cache_dir,
             )
+            if graph is not None:
+                assert list(ch_names_subj) == graph.ch_names, (
+                    f"Channel order mismatch for subject {subject}: "
+                    f"data has {ch_names_subj[:5]}... but graph was "
+                    f"built from {graph.ch_names[:5]}..."
+                )
             last_subject = subject
 
         X_tr, y_tr, X_te, y_te = _split_train_test(
@@ -765,6 +819,405 @@ def run_mismatch_jitter(
             })
 
         del pipe
+        _free_cuda()
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# EMS-control diagonal experiment
+# ---------------------------------------------------------------------------
+
+def run_pre_ems_diagonal(
+    dataset_id: str,
+    *,
+    model: str = "shallow",
+    subjects: Optional[List[int]] = None,
+    seeds: Iterable[int] = (0,),
+    reference_modes: Iterable[str] = REFERENCE_MODES,
+    split_strategy: str = "auto",
+    laplacian_k: int = 4,
+    montage: str = "standard_1005",
+    progress: bool = True,
+    dl_max_epochs: int = 200,
+    dl_batch_size: int = 32,
+    dl_lr: float = 6.25e-4,
+    dl_weight_decay: float = 0.0,
+    dl_device: Optional[str] = None,
+    dl_verbose: int = 0,
+    dl_l_freq: float = 8.0,
+    dl_h_freq: float = 32.0,
+    dl_resample: float = 250.0,
+    dl_trial_start_offset_s: float = 0.0,
+    dl_trial_stop_offset_s: float = 0.0,
+    dl_cache_dir: Optional[str] = None,
+) -> pd.DataFrame:
+    """Diagonal-only EMS-control experiment for the deep-learning pipeline.
+
+    Motivation. The standard pipeline applies exponential moving
+    standardization (EMS) before the reference operator, because EMS
+    runs in ``load_dl_data`` and reference operators are applied to the
+    windowed X array by ``run_mismatch``. EMS is per-channel and
+    adaptive; it does not commute with channel-mixing reference
+    operators. So the standard pipeline measures "reference operators
+    applied to EMS-standardized signals," not "reference operators
+    applied to raw filtered signals, then standardized."
+
+    This function provides the corresponding control: for each reference
+    r in ``reference_modes``, preprocess the raw signal with r applied
+    *before* EMS (via ``load_dl_data(pre_ems_reference=r)``), train a
+    fresh model on the resulting data, and evaluate on the same-reference
+    test split. The output is a 6-element diagonal that can be compared
+    directly with the diagonal of the standard ``run_mismatch`` matrix.
+    If the two diagonals match closely (within seed noise), the EMS-
+    after-reference order doesn't materially affect the per-reference
+    accuracy — and by extension, the off-diagonal cluster structure is
+    unlikely to be an artifact of operator/EMS non-commutativity.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        subject, seed, reference, accuracy, kappa, n_train, n_test
+    one row per (subject, seed, reference) cell.
+    """
+    model_lc = model.lower()
+    if model_lc == "csp_lda":
+        raise ValueError(
+            "run_pre_ems_diagonal is a DL-only ablation. CSP+LDA does not "
+            "use exponential moving standardization, so the EMS-control "
+            "question doesn't apply. Use run_mismatch with model='csp_lda' "
+            "for the standard pipeline."
+        )
+
+    from refshift.dl import SUPPORTED_DL_MODELS, load_dl_data, make_dl_model
+    if model_lc not in SUPPORTED_DL_MODELS:
+        raise ValueError(
+            f"Unknown DL model {model!r}; expected one of {SUPPORTED_DL_MODELS}"
+        )
+
+    modes = tuple(reference_modes)
+    dataset, paradigm = _resolve_dataset(dataset_id)
+    if subjects is None:
+        subjects = list(dataset.subject_list)
+    seeds = list(seeds)
+
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:  # pragma: no cover
+        def _tqdm(it, **kwargs):
+            return it
+
+    jobs = [(s, k, r) for s in subjects for k in seeds for r in modes]
+    iterator = _tqdm(
+        jobs, desc=f"[{dataset.code}] {model_lc} pre-EMS diagonal",
+        disable=not progress, leave=True,
+    )
+
+    rows: List[dict] = []
+    for subject, seed, ref in iterator:
+        # Each (subject, ref) pair gets its own preprocess pass with the
+        # reference applied to the continuous Raw before EMS. The cache
+        # key in load_dl_data includes pre_ems_reference, so repeated
+        # calls with the same (subject, ref) reuse the cache.
+        X, y_int, metadata, sfreq, ch_names_subj = load_dl_data(
+            dataset_id, subject,
+            resample=dl_resample,
+            l_freq=dl_l_freq, h_freq=dl_h_freq,
+            trial_start_offset_s=dl_trial_start_offset_s,
+            trial_stop_offset_s=dl_trial_stop_offset_s,
+            cache_dir=dl_cache_dir,
+            pre_ems_reference=ref,
+        )
+
+        X_tr, y_tr, X_te, y_te = _split_train_test(
+            X, y_int, metadata, strategy=split_strategy, seed=seed,
+            dataset_id=dataset_id,
+        )
+        n_classes = int(max(int(y_tr.max()), int(y_te.max()))) + 1
+
+        net = make_dl_model(
+            model=model_lc,
+            n_channels=X_tr.shape[1],
+            n_classes=n_classes,
+            n_times=X_tr.shape[2],
+            sfreq=float(sfreq),
+            seed=int(seed),
+            max_epochs=dl_max_epochs,
+            batch_size=dl_batch_size,
+            lr=dl_lr,
+            weight_decay=dl_weight_decay,
+            device=dl_device,
+            verbose=dl_verbose,
+        )
+        net.fit(X_tr.astype(np.float32, copy=False), y_tr.astype(np.int64, copy=False))
+        y_pred = net.predict(X_te.astype(np.float32, copy=False))
+
+        rows.append({
+            "subject":   int(subject),
+            "seed":      int(seed),
+            "reference": ref,
+            "accuracy":  float(accuracy_score(y_te, y_pred)),
+            "kappa":     float(cohen_kappa_score(y_te, y_pred)),
+            "n_train":   int(len(y_tr)),
+            "n_test":    int(len(y_te)),
+        })
+
+        del net
+        _free_cuda()
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Multi-holdout LOFO sweep
+# ---------------------------------------------------------------------------
+
+def run_lofo_matrix(
+    dataset_id: str,
+    *,
+    model: str,
+    holdout_modes: tuple = REFERENCE_MODES,
+    seeds: List[int] = (0,),
+    subjects: Optional[List[int]] = None,
+    progress: bool = True,
+    **jitter_kwargs,
+) -> pd.DataFrame:
+    """Run leave-one-reference-out for every reference in ``holdout_modes``.
+
+    Equivalent to looping ``run_mismatch_jitter(condition='lofo',
+    holdout_ref=h, ...)`` over each ``h`` and concatenating, but with a
+    single tqdm-friendly entry point. Used to produce the full LOFO-by-
+    held-out-reference table for the C3 (jitter is distribution-matching,
+    not invariance) claim.
+
+    Parameters
+    ----------
+    dataset_id : str
+        Dataset id (see ``DATASET_IDS``).
+    model : {'eegnet', 'shallow'}
+        DL only.
+    holdout_modes : tuple of str
+        References to hold out one at a time. Defaults to all of
+        ``REFERENCE_MODES``. Each pass trains a fresh model with the
+        remaining 5 jittered, evaluated on all 6 test references; the
+        held-out test reference is the cell of interest, and the other 5
+        are reported for completeness so the seen-vs-unseen comparison is
+        on the same axis.
+    seeds, subjects, progress : forwarded to ``run_mismatch_jitter``.
+    **jitter_kwargs : forwarded to ``run_mismatch_jitter``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-form concatenation of per-holdout outputs. Same columns as
+        ``run_mismatch_jitter``. The ``holdout_ref`` column distinguishes
+        the rows corresponding to each LOFO pass.
+    """
+    frames: List[pd.DataFrame] = []
+    for h in holdout_modes:
+        if h not in REFERENCE_MODES:
+            raise ValueError(
+                f"holdout {h!r} not in REFERENCE_MODES={REFERENCE_MODES}"
+            )
+        df_h = run_mismatch_jitter(
+            dataset_id,
+            model=model,
+            condition="lofo",
+            holdout_ref=h,
+            seeds=seeds,
+            subjects=subjects,
+            progress=progress,
+            **jitter_kwargs,
+        )
+        frames.append(df_h)
+    return pd.concat(frames, ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Bandpass-mismatch control
+# ---------------------------------------------------------------------------
+
+def run_bandpass_mismatch(
+    dataset_id: str,
+    *,
+    model: str = "shallow",
+    train_band: Tuple[float, float] = (8.0, 32.0),
+    test_bands: Tuple[Tuple[float, float], ...] = ((6.0, 32.0), (8.0, 30.0)),
+    reference_mode: str = "native",
+    subjects: Optional[List[int]] = None,
+    seeds: List[int] = (0,),
+    split_strategy: str = "auto",
+    progress: bool = True,
+    dl_max_epochs: int = 200,
+    dl_batch_size: int = 32,
+    dl_lr: Optional[float] = None,
+    dl_weight_decay: float = 0.0,
+    dl_device: Optional[str] = None,
+    dl_verbose: int = 0,
+    dl_resample: float = 250.0,
+    dl_trial_start_offset_s: float = 0.0,
+    dl_trial_stop_offset_s: float = 0.0,
+    dl_cache_dir: Optional[str] = None,
+) -> pd.DataFrame:
+    """Preprocessing-mismatch control: train under one bandpass, test under another.
+
+    The reference-shift paper claims the off-diagonal collapse in
+    ``run_mismatch`` is specifically structured (operator-distance
+    predicts it; family clustering organizes it; jitter recovers it),
+    not generic preprocessing brittleness. To rule out the obvious
+    confounder, this function trains a model under ``train_band`` on a
+    fixed reference (default native) and evaluates the same model on
+    test data preprocessed with each of the ``test_bands``. The
+    expectation is that bandpass mismatch produces a much smaller
+    accuracy drop (typically <5 pts on IV-2a Shallow) than reference
+    mismatch (typically 20+ pts). Reporting both gives the reader a
+    quantitative baseline for "how big a drop is normal under any
+    preprocessing change" against which the reference-mismatch gap can
+    be compared.
+
+    The test bands are processed independently: each one triggers a
+    full ``load_dl_data`` re-preprocess on the test split. The train
+    split is preprocessed once. Reference operator is held fixed at
+    ``reference_mode`` throughout (not jittered, not mismatched) so the
+    only varying factor is the bandpass.
+
+    Parameters
+    ----------
+    dataset_id : str
+    model : {'eegnet', 'shallow'}
+        DL only — bandpass mismatch on CSP+LDA is uninteresting because
+        CSP is band-power agnostic up to scale.
+    train_band : (l_freq, h_freq)
+        Bandpass used for training.
+    test_bands : tuple of (l_freq, h_freq)
+        Bandpasses used for testing. The matched-band condition (=
+        ``train_band``) is added automatically as the diagonal control.
+    reference_mode : str
+        Reference operator applied to both train and test (always the
+        same one). Default 'native'.
+    Other parameters : as ``run_mismatch``.
+
+    Returns
+    -------
+    pd.DataFrame with columns
+        ``dataset, subject, seed, reference, train_band, test_band,
+        accuracy, kappa, n_train, n_test``.
+        ``train_band`` and ``test_band`` are stored as "Lf-Hf" strings
+        (e.g. "8.0-32.0") so the result is csv-friendly.
+    """
+    from refshift.dl import SUPPORTED_DL_MODELS, load_dl_data, make_dl_model
+
+    model_lc = model.lower()
+    if model_lc not in SUPPORTED_DL_MODELS:
+        raise ValueError(
+            f"run_bandpass_mismatch is DL-only. "
+            f"Got model={model!r}; supported: {SUPPORTED_DL_MODELS}."
+        )
+    if reference_mode not in REFERENCE_MODES:
+        raise ValueError(
+            f"reference_mode={reference_mode!r} not in REFERENCE_MODES"
+        )
+
+    dataset, paradigm = _resolve_dataset(dataset_id)
+    if subjects is None:
+        subjects = list(dataset.subject_list)
+    seeds = list(seeds)
+
+    needs_graph = reference_mode in ("laplacian", "nn_diff", "rest")
+    needs_rest = reference_mode == "rest"
+    graph = None
+    if needs_graph:
+        ch_names = _get_eeg_channel_names(
+            dataset, subject=subjects[0], paradigm=paradigm,
+        )
+        graph = build_graph(
+            ch_names, montage="standard_1005", include_rest=needs_rest,
+        )
+
+    # All bands to evaluate (train_band always included as the diagonal).
+    all_test_bands = (train_band,) + tuple(b for b in test_bands if b != train_band)
+    bands_str = lambda b: f"{b[0]:.1f}-{b[1]:.1f}"
+
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:
+        def _tqdm(it, **kwargs):
+            return it
+
+    jobs = [(s, k) for s in subjects for k in seeds]
+    iterator = _tqdm(
+        jobs, desc=f"[{dataset.code}] {model_lc} bandpass",
+        disable=not progress, leave=True,
+    )
+
+    rows: List[dict] = []
+    for subject, seed in iterator:
+        # Train preprocessing
+        X_tr_raw, y_tr_raw, meta_tr, sfreq, ch_names_subj = load_dl_data(
+            dataset_id, subject,
+            resample=dl_resample,
+            l_freq=train_band[0], h_freq=train_band[1],
+            trial_start_offset_s=dl_trial_start_offset_s,
+            trial_stop_offset_s=dl_trial_stop_offset_s,
+            cache_dir=dl_cache_dir,
+        )
+        if graph is not None:
+            assert list(ch_names_subj) == graph.ch_names
+
+        X_tr_split, y_tr, _Xdrop, _ydrop = _split_train_test(
+            X_tr_raw, y_tr_raw, meta_tr,
+            strategy=split_strategy, seed=seed, dataset_id=dataset_id,
+        )
+        X_tr_ref = apply_reference(X_tr_split, reference_mode, graph=graph)
+        n_classes = int(max(int(y_tr.max()), int(_ydrop.max()))) + 1
+
+        net = make_dl_model(
+            model=model_lc,
+            n_channels=X_tr_ref.shape[1],
+            n_classes=n_classes,
+            n_times=X_tr_ref.shape[2],
+            sfreq=float(sfreq),
+            seed=int(seed),
+            max_epochs=dl_max_epochs,
+            batch_size=dl_batch_size,
+            lr=dl_lr,
+            weight_decay=dl_weight_decay,
+            device=dl_device,
+            verbose=dl_verbose,
+        )
+        net.fit(X_tr_ref, y_tr)
+
+        # For each test band, re-preprocess with that band and evaluate.
+        for tb in all_test_bands:
+            X_te_raw, y_te_raw, meta_te, sfreq_te, _chs = load_dl_data(
+                dataset_id, subject,
+                resample=dl_resample,
+                l_freq=tb[0], h_freq=tb[1],
+                trial_start_offset_s=dl_trial_start_offset_s,
+                trial_stop_offset_s=dl_trial_stop_offset_s,
+                cache_dir=dl_cache_dir,
+            )
+            _Xdrop, _ydrop, X_te_split, y_te = _split_train_test(
+                X_te_raw, y_te_raw, meta_te,
+                strategy=split_strategy, seed=seed, dataset_id=dataset_id,
+            )
+            X_te_ref = apply_reference(X_te_split, reference_mode, graph=graph)
+            y_pred = net.predict(X_te_ref)
+
+            rows.append({
+                "dataset":    dataset.code,
+                "subject":    int(subject),
+                "seed":       int(seed),
+                "reference":  reference_mode,
+                "train_band": bands_str(train_band),
+                "test_band":  bands_str(tb),
+                "accuracy":   float(accuracy_score(y_te, y_pred)),
+                "kappa":      float(cohen_kappa_score(y_te, y_pred)),
+                "n_train":    int(len(y_tr)),
+                "n_test":     int(len(y_te)),
+            })
+
+        del net
         _free_cuda()
 
     return pd.DataFrame(rows)

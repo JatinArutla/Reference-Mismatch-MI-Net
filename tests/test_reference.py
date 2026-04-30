@@ -72,31 +72,29 @@ def test_median_residual_channel_median_is_zero(small_X):
     assert np.max(np.abs(resid)) < 1e-5
 
 
-def test_gs_orthogonality_per_trial_per_channel(small_X):
-    """After GS, Y[n,c,:] is orthogonal (time-domain inner product) to the
-    leave-one-out mean r[n,c,:] computed on the *input* X. This is the
-    algebraic guarantee of the GS projection: <Y, r_X> = 0, not <Y, r_Y>.
-    """
-    X = small_X
-    Y = apply_reference(X, "gs")
-    _, C, _ = X.shape
-    s = X.sum(axis=1, keepdims=True)
-    r = (s - X) / max(C - 1, 1)                      # LOO mean of X, not Y
-    inner = np.sum(Y * r, axis=2)                    # [N, C]
-    norm_r = np.sqrt(np.sum(r * r, axis=2))
-    norm_Y = np.sqrt(np.sum(Y * Y, axis=2))
-    cos = inner / np.maximum(norm_r * norm_Y, 1e-10)
-    assert np.max(np.abs(cos)) < 1e-5
-
-
 def test_2d_and_3d_shapes_equivalent(small_X):
     """Calling with [C, T] should give the same result as calling with
     [1, C, T] and squeezing."""
     single = small_X[0]                      # [C, T]
-    for mode in ("native", "car", "median", "gs"):
+    for mode in ("native", "car", "median"):
         Y2 = apply_reference(single, mode)
         Y3 = apply_reference(small_X[:1], mode)[0]
         np.testing.assert_allclose(Y2, Y3, atol=1e-6)
+
+
+def test_gs_no_longer_in_reference_modes():
+    """Sanity: 'gs' was dropped from REFERENCE_MODES in v0.10. The
+    rationale (per peer review) is that the natural data-dependent GS
+    projection is not a fixed C×C linear operator and therefore doesn't
+    fit the operator-shift framework. A linear LOO-mean alternative was
+    not added because LOO_i = (C/(C-1)) * CAR_i — they differ only by a
+    scalar and produce identical results for any scale-invariant
+    decoder.
+    """
+    from refshift.reference import REFERENCE_MODES
+    assert "gs" not in REFERENCE_MODES
+    assert "loo" not in REFERENCE_MODES
+    assert len(REFERENCE_MODES) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -113,29 +111,52 @@ def test_laplacian_hand_case():
     lap_idx = np.array([[1, 2],
                         [0, 2],
                         [0, 1]], dtype=np.int64)
-    # Manually:
-    #   ref[0] = mean([3,4], [5,6]) = [4,5]  -> Y[0] = [1-4, 2-5] = [-3,-3]
-    #   ref[1] = mean([1,2], [5,6]) = [3,4]  -> Y[1] = [0, 0]
-    #   ref[2] = mean([1,2], [3,4]) = [2,3]  -> Y[2] = [3, 3]
     from refshift.reference import _laplacian  # noqa: PLC0415
     Y = _laplacian(X, lap_idx)
     expected = np.array([[-3, -3], [0, 0], [3, 3]], dtype=np.float32)
     np.testing.assert_allclose(Y, expected, atol=1e-6)
 
 
-def test_bipolar_hand_case():
+def test_nn_diff_hand_case():
+    """NN-diff: Y_i = X_i - X_{nn(i)}. Renamed from "bipolar" in v0.10
+    to honestly reflect that this is a dimension-preserving local-
+    difference operator, not a clinical bipolar montage with
+    predefined electrode pairs.
+    """
     X = np.array([[1.0, 2.0],
                   [3.0, 4.0],
                   [5.0, 6.0]], dtype=np.float32)
-    # nearest neighbor: 0->1, 1->0, 2->1
-    bip_idx = np.array([1, 0, 1], dtype=np.int64)
-    from refshift.reference import _bipolar  # noqa: PLC0415
-    Y = _bipolar(X, bip_idx)
-    # Row 0: X[0] - X[1] = [1-3, 2-4] = [-2, -2]
-    # Row 1: X[1] - X[0] = [3-1, 4-2] = [+2, +2]
-    # Row 2: X[2] - X[1] = [5-3, 6-4] = [+2, +2]
+    nn_idx = np.array([1, 0, 1], dtype=np.int64)
+    from refshift.reference import _nn_diff  # noqa: PLC0415
+    Y = _nn_diff(X, nn_idx)
+    # Row 0: X[0] - X[1] = [-2, -2]
+    # Row 1: X[1] - X[0] = [+2, +2]
+    # Row 2: X[2] - X[1] = [+2, +2]
     expected = np.array([[-2, -2], [2, 2], [2, 2]], dtype=np.float32)
     np.testing.assert_allclose(Y, expected, atol=1e-6)
+
+
+def test_nn_diff_rank_diagnostic():
+    """build_graph reports nn_diff_rank/nullity for transparency. With
+    mutual nearest-neighbours (e.g. 0<->1), the operator destroys 2
+    dimensions instead of 1; rank goes down accordingly. This test
+    constructs a controlled mutual-NN case and checks the diagnostic.
+    """
+    pytest.importorskip("mne")
+    # IV-2a channel set: well-known to have many mutual-NN pairs
+    # (C3<->CP3, C4<->CP4, etc.). Rank should be < C.
+    iv2a_chs = [
+        "Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
+        "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+        "CP3", "CP1", "CPz", "CP2", "CP4",
+        "P1", "Pz", "P2", "POz",
+    ]
+    g = build_graph(iv2a_chs, k=4)
+    assert g.nn_diff_rank > 0
+    assert g.nn_diff_rank <= len(iv2a_chs)
+    assert g.nn_diff_nullity == len(iv2a_chs) - g.nn_diff_rank
+    # We expect at least some mutual-NN pairs => nullity >= 1
+    # (the diagnostic exists *because* the rank is typically less than C-1).
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +171,7 @@ def test_build_graph_iv2a_c3_nearest_is_cp3(iv2a_ch_names):
 
     c3 = iv2a_ch_names.index("C3")
     cp3 = iv2a_ch_names.index("CP3")
-    assert g.bipolar_idx[c3] == cp3
+    assert g.nn_diff_idx[c3] == cp3
 
     # k=4: CP3 should appear among C3's Laplacian neighbors.
     assert cp3 in g.laplacian_idx[c3].tolist()
@@ -162,7 +183,7 @@ def test_build_graph_no_self_loops(iv2a_ch_names):
     C = len(iv2a_ch_names)
     for c in range(C):
         assert c not in g.laplacian_idx[c].tolist(), f"self-loop in Laplacian at {c}"
-        assert g.bipolar_idx[c] != c, f"self-loop in bipolar at {c}"
+        assert g.nn_diff_idx[c] != c, f"self-loop in NN-diff at {c}"
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +225,7 @@ def test_transformer_roundtrip_all_modes(small_X, iv2a_ch_names):
     # has its transformation matrix available.
     g = build_graph(iv2a_ch_names[:8], k=4, include_rest=True)
     for mode in REFERENCE_MODES:
-        needs_graph = mode in ("laplacian", "bipolar", "rest")
+        needs_graph = mode in ("laplacian", "nn_diff", "rest")
         t = ReferenceTransformer(mode=mode, graph=g if needs_graph else None)
         out = t.fit_transform(small_X)
         assert out.shape == small_X.shape

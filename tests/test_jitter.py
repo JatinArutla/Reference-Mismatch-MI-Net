@@ -67,10 +67,10 @@ def test_make_random_reference_transform_rest_requires_rest_matrix():
 
 
 def test_make_random_reference_transform_global_modes_no_graph_ok():
-    """Global-mean modes (native, car, median, gs) don't need a graph."""
+    """Global-mean modes (native, car, median) don't need a graph."""
     from refshift.jitter import make_random_reference_transform
     t = make_random_reference_transform(
-        ["native", "car", "median", "gs"], graph=None,
+        ["native", "car", "median"], graph=None,
     )
     assert t is not None
 
@@ -111,11 +111,12 @@ def test_transform_car_only_zero_means():
 
 
 def test_transform_uses_multiple_modes_per_batch():
-    """With 7 allowed modes and a 32-trial batch, we should observe at least
-    a few distinct modes' fingerprints in the output. We test this by checking
-    that not all output samples have zero channel-mean (which would mean every
-    sample got CAR / median / Laplacian / bipolar / rest, but never native or
-    GS — extremely unlikely under uniform sampling).
+    """With all allowed modes and a 64-trial batch, we should observe at
+    least a few distinct modes' fingerprints in the output. We test this
+    by checking that not all output samples have zero channel-mean —
+    which would imply every sample got CAR / median / Laplacian /
+    NN-diff / REST, but never native (extremely unlikely under uniform
+    sampling).
     """
     from refshift.jitter import make_random_reference_transform
     g = _make_graph()
@@ -124,8 +125,8 @@ def test_transform_uses_multiple_modes_per_batch():
     X_t, _ = t(torch.from_numpy(X), torch.from_numpy(y))
     # Per-sample channel means
     means = np.abs(X_t.numpy().mean(axis=1)).max(axis=1)  # (B,)
-    # Some samples should retain a non-zero channel mean (native or laplacian
-    # or bipolar leave channel mean non-zero in general; CAR/median/gs/rest do not).
+    # Some samples should retain a non-zero channel mean (native, Laplacian
+    # or NN-diff leave channel mean non-zero in general; CAR/median/REST do not).
     assert (means > 1e-3).any(), "No sample retained non-zero channel mean"
 
 

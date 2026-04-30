@@ -1,5 +1,5 @@
 # Phase 1: CSP+LDA calibration and mismatch matrix.
-# MOABB is pinned for reproducibility of the 65.99% published benchmark.
+# MOABB pinned for reproducibility of the 65.99% IV-2a published benchmark.
 moabb==1.5.0
 mne>=1.5
 pyriemann>=0.5
@@ -8,14 +8,16 @@ numpy>=1.24
 pandas>=2.0
 scipy>=1.10
 
-# Runtime display: progress bar during run_mismatch, heatmap in plot_mismatch_matrix.
+# Runtime display: tqdm progress, matplotlib heatmaps.
 tqdm>=4.60
 matplotlib>=3.5
 
 # Testing
 pytest>=7.0
 
-# Phase 2 (uncomment when DL experiments start):
-# braindecode>=0.8
-# torch>=2.0
-# skorch>=0.15
+# Phase 2 (DL). Also declared as an optional extra in pyproject.toml.
+# Install everything together via `pip install -e ".[dl]"`. Matches
+# braindecode 1.x API (n_chans/n_outputs/n_times kwargs).
+braindecode>=1.0
+torch>=2.0
+skorch>=0.15

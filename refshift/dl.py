@@ -6,22 +6,32 @@ EEGNet_8_2 configuration benchmarked in MOABB) and ``shallow``
 model for motor-imagery decoding).
 
 Preprocessing follows braindecode's canonical MOABB example
-(``examples/model_building/plot_bcic_iv_2a_moabb_trial.py``) with one
-difference: bandpass is 8–32 Hz (MOABB's MI paradigm default, consistent
-with Phase 1 CSP+LDA) rather than 4–38 Hz. The pipeline is::
+(``examples/model_building/plot_bcic_iv_2a_moabb_trial.py``) with two
+deliberate differences: bandpass is 8-32 Hz (MOABB's MI paradigm default,
+consistent with Phase 1 CSP+LDA) rather than 4-38 Hz, and the signal is
+resampled to a common ``resample`` rate (default 250 Hz) before bandpass
+so the time-domain receptive field of every model is identical across
+datasets. The pipeline is::
 
     MOABBDataset -> Preprocessor(pick_types EEG)
+                 -> [optional pre-EMS reference operator]
                  -> Preprocessor(V->uV scale)
+                 -> Preprocessor(resample to common rate)
                  -> Preprocessor(filter l_freq..h_freq)
                  -> Preprocessor(exponential_moving_standardize)
                  -> create_windows_from_events
                  -> numpy (N, C, T) tensor
 
-The reference operator is applied to the windowed (N, C, T) tensor by
-``run_mismatch`` after this module returns. For the linear reference
-operators in ``refshift.reference`` this is numerically equivalent to
-applying them in raw-space, so the EMS-before-reference order is
-preserved by construction (EMS runs during preprocess).
+The standard reference operator is applied to the windowed (N, C, T)
+tensor by ``run_mismatch`` *after* this module returns, i.e. after EMS.
+EMS is per-channel and adaptive; it does **not** commute with channel-
+mixing reference operators. Concretely, ``CAR(EMS(X)) != EMS(CAR(X))``
+in general because EMS divides each channel by its own running standard
+deviation, so the per-channel scales differ at the moment CAR sums them.
+The standard pipeline measures "reference applied to EMS-standardized
+signals". The ``pre_ems_reference`` argument to ``load_dl_data`` flips
+this order to "reference applied first, then EMS", producing the data
+that ``run_pre_ems_diagonal`` uses for the EMS-control ablation.
 
 The model factory returns a ``braindecode.EEGClassifier`` (subclass of
 ``skorch.NeuralNetClassifier``) so it drops into sklearn-style
@@ -84,7 +94,7 @@ def _moabb_code(dataset_id: str) -> str:
 # point is purely to avoid re-running braindecode's filter + EMS on the
 # same Raws when we run multiple architectures / jitter conditions on the
 # same dataset. Reference operators are applied AFTER this layer, so all
-# 7 reference variants share a single cached entry.
+# 6 reference variants share a single cached entry.
 #
 # When future preprocessing-mismatch experiments add new knobs to
 # load_dl_data (resample target, filter type, window length), add them to
@@ -93,9 +103,10 @@ def _moabb_code(dataset_id: str) -> str:
 # If a cache file is corrupt, the user deletes the directory and reruns.
 
 _CACHE_KEY_PARAMS = (
-    "dataset_id", "subject", "l_freq", "h_freq",
+    "dataset_id", "subject", "resample", "l_freq", "h_freq",
     "ems_factor_new", "ems_init_block_size",
     "trial_start_offset_s", "trial_stop_offset_s",
+    "pre_ems_reference",
 )
 
 
@@ -120,6 +131,7 @@ def load_dl_data(
     dataset_id: str,
     subject: int,
     *,
+    resample: float = 250.0,
     l_freq: float = 8.0,
     h_freq: float = 32.0,
     ems_factor_new: float = 1e-3,
@@ -129,23 +141,36 @@ def load_dl_data(
     preload: bool = True,
     n_jobs: int = 1,
     cache_dir: Optional[str] = None,
+    pre_ems_reference: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float, List[str]]:
     """Load one subject's MI data in the braindecode + MOABB canonical protocol.
 
     Steps:
       1. ``MOABBDataset(dataset_name=<resolved>, subject_ids=[subject])``
       2. ``preprocess`` with pick_types EEG, V->uV scale, bandpass,
+         (optional pre-EMS reference operator),
          exponential_moving_standardize.
       3. ``create_windows_from_events`` with optional trial offsets.
       4. Concatenate windows across all runs/sessions into (X, y, metadata).
 
-    Reference operators are NOT applied here — ``run_mismatch`` applies them
-    to X after this returns.
+    Reference operators in the standard pipeline are applied *after* this
+    function returns — ``run_mismatch`` applies the chosen reference to
+    the windowed X array. The ``pre_ems_reference`` parameter supports a
+    methodological control: applying a reference *before* exponential
+    moving standardization, on the continuous filtered raw signal. EMS
+    is per-channel and adaptive, so it does not commute with channel-
+    mixing reference operators; the standard pipeline measures
+    "reference applied to EMS-standardized signals", whereas
+    ``pre_ems_reference`` measures "reference applied before
+    standardization, then standardize". The two are not mathematically
+    equivalent. Use ``pre_ems_reference`` for the EMS-control ablation
+    described in the paper. Do not also call ``apply_reference`` on the
+    returned X if you set this — they would compose.
 
     If ``cache_dir`` is provided, the preprocessed (X, y, metadata, sfreq,
     ch_names) tuple is read from / written to a per-subject ``.npz`` file
     keyed on a hash of all preprocessing parameters. Re-referencing happens
-    after this function returns, so all 7 reference variants share one cache
+    after this function returns, so all 6 reference variants share one cache
     entry. Filter band, EMS settings, and trial offsets are part of the key,
     so future preprocessing-mismatch experiments (e.g. filter-band mismatch)
     automatically get separate cache slots without code changes.
@@ -190,12 +215,14 @@ def load_dl_data(
     params = {
         "dataset_id": str(dataset_id).lower(),
         "subject": int(subject),
+        "resample": float(resample),
         "l_freq": float(l_freq),
         "h_freq": float(h_freq),
         "ems_factor_new": float(ems_factor_new),
         "ems_init_block_size": int(ems_init_block_size),
         "trial_start_offset_s": float(trial_start_offset_s),
         "trial_stop_offset_s": float(trial_stop_offset_s),
+        "pre_ems_reference": str(pre_ems_reference) if pre_ems_reference else None,
     }
 
     # Cache lookup. If the file exists, load it; if anything goes wrong,
@@ -237,18 +264,50 @@ def load_dl_data(
     # the original paper's protocol (44 channels, Section 2.7.1) and keep
     # CSP/DL compute tractable. The full list lives in experiments.py to
     # stay co-located with _resolve_dataset's MOABB-side subsetting.
+    #
+    # ordered=True is critical: the neighbour graph is built from
+    # paradigm.channels in the user-supplied order via
+    # _get_eeg_channel_names. With ordered=False, mne.pick_channels would
+    # return the subset in raw-channel order, breaking the graph alignment
+    # asserted in run_mismatch / run_mismatch_jitter.
     if dataset_id == "schirrmeister2017":
         from refshift.experiments import _SCHIRRMEISTER_MOTOR_CHANNELS
         preprocessors.append(
             Preprocessor(
                 "pick_channels",
                 ch_names=list(_SCHIRRMEISTER_MOTOR_CHANNELS),
-                ordered=False,
+                ordered=True,
             )
+        )
+
+    # Pre-EMS reference operator (optional methodological control).
+    # Applied to the continuous filtered raw, before EMS. EMS is
+    # per-channel adaptive and does not commute with channel-mixing
+    # reference operators, so the order matters. In the standard
+    # pipeline (pre_ems_reference=None), reference operators are applied
+    # to the windowed and standardized X — after EMS — by run_mismatch.
+    if pre_ems_reference is not None:
+        from refshift.reference import apply_reference, build_graph
+
+        def _apply_pre_ems_ref(raw):
+            """Re-reference the continuous Raw in place. Modifies
+            ``raw._data`` directly to keep mne metadata consistent."""
+            ch_names = list(raw.info["ch_names"])
+            needs_graph = pre_ems_reference in ("laplacian", "nn_diff", "rest")
+            graph = build_graph(
+                ch_names, include_rest=(pre_ems_reference == "rest"),
+            ) if needs_graph else None
+            data = raw.get_data()  # [C, T_total]
+            new_data = apply_reference(data, pre_ems_reference, graph=graph)
+            raw._data[:] = new_data.astype(raw._data.dtype, copy=False)
+
+        preprocessors.append(
+            Preprocessor(_apply_pre_ems_ref, apply_on_array=False)
         )
 
     preprocessors.extend([
         Preprocessor(_scale_volts_to_microvolts, apply_on_array=True),
+        Preprocessor("resample", sfreq=float(resample)),
         Preprocessor("filter", l_freq=l_freq, h_freq=h_freq),
         Preprocessor(
             exponential_moving_standardize,
@@ -336,11 +395,10 @@ def make_dl_model(
 ):
     """Construct a braindecode EEGClassifier for one supervised training run.
 
-    Architecture-specific hyperparameters follow braindecode's MOABB example
-    for ShallowFBCSPNet and the Lawhern-2018 defaults for EEGNet_8_2:
+    Architecture-specific learning-rate defaults:
 
-      - shallow: lr=6.25e-4 (= 0.0625 * 0.01, braindecode default)
-      - eegnet:  lr=1e-3
+      - shallow: lr=6.25e-4 (braindecode MOABB example default)
+      - eegnet:  lr=5e-4 (Lawhern et al. 2018 small-data MI recommendation)
 
     Both use AdamW, weight_decay=0, CosineAnnealingLR schedule,
     ``max_epochs`` epochs, ``batch_size`` batch size. No internal train/val
@@ -358,7 +416,7 @@ def make_dl_model(
     seed : int
         Seed for torch + numpy + random + cudnn.
     max_epochs : int
-        Default 200 (balances convergence and 7x7 runtime).
+        Default 200 (balances convergence and 6x6 runtime).
     batch_size : int
         Default 32 (small enough for ~150-250 train trials without losing
         the last partial batch too badly, when drop_last=False).
@@ -416,7 +474,13 @@ def make_dl_model(
         )
     else:  # eegnet
         if lr is None:
-            lr = 1e-3  # Lawhern-2018 canonical
+            # 5e-4 is the Lawhern et al. 2018 recommendation for small-data
+            # motor imagery. EEGNet has ~3,000 parameters; a higher LR
+            # (e.g. 1e-3) overshoots on per-subject training sets with
+            # ~80-300 trials, producing chance-level results on smaller
+            # datasets (Cho2017, Dreyer2023). Using 5e-4 uniformly across
+            # datasets removes the need for per-dataset LR overrides.
+            lr = 5e-4
         module = EEGNetv4(
             n_chans=int(n_channels),
             n_outputs=int(n_classes),

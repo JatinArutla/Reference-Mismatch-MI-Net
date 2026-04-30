@@ -25,7 +25,7 @@ returned by ``run_mismatch`` or the aggregate matrix returned by
 
 4. ``paired_wilcoxon_per_test_ref`` — paired Wilcoxon signed-rank tests
    across (subject, seed) pairs, per test reference, with Holm-Bonferroni
-   multiple-comparison correction across the 7 references. Companion
+   multiple-comparison correction across the 6 references. Companion
    helpers ``baseline_diagonal_view`` and ``baseline_col_off_diag_view``
    extract comparable subsets from a baseline ``run_mismatch`` DataFrame
    so jitter / LOFO results can be tested against single-reference
@@ -218,36 +218,55 @@ def _estimate_linear_operator(
     *,
     n_times: int = 2000,
     seed: int = 0,
+    n_probes: int = 1,
 ) -> np.ndarray:
     """Empirically estimate the linear operator matrix A for a reference op.
 
     For each op we compute Y = op(X) on a random Gaussian probe X, then
     solve A = Y @ pinv(X). This gives the best linear approximation in
-    the least-squares sense. For genuinely linear ops (native, CAR, GS,
-    Laplacian, bipolar, REST) this recovers the operator exactly. For
+    the least-squares sense. For genuinely linear ops (native, CAR, REST,
+    kNN-Laplacian, NN-diff) this recovers the operator exactly. For
     median (non-linear), it returns the linear tangent, which equals CAR
-    in expectation — the honest linearization.
+    in expectation — the honest linearization. With ``n_probes > 1`` the
+    estimate is averaged across independent Gaussian probes, which
+    reduces the variance of the median linearization without changing
+    the result for the linear operators.
     """
     C = len(graph.ch_names)
     rng = np.random.default_rng(seed)
-    X = rng.standard_normal((1, C, n_times)).astype(np.float32)  # [1, C, T]
-    Y = apply_reference(X, mode, graph=graph)
-    # Y[0] = A @ X[0]  with Y, X of shape [C, T]
-    A = Y[0] @ np.linalg.pinv(X[0])
-    return A.astype(np.float64)
+    A_acc = np.zeros((C, C), dtype=np.float64)
+    for p in range(int(n_probes)):
+        X = rng.standard_normal((1, C, n_times)).astype(np.float32)
+        Y = apply_reference(X, mode, graph=graph)
+        A_acc += Y[0] @ np.linalg.pinv(X[0])
+    return (A_acc / float(n_probes)).astype(np.float64)
 
 
 @dataclass
 class OperatorDistanceResult:
-    """Output of ``operator_distance_correlation``."""
+    """Output of ``operator_distance_correlation``.
+
+    spearman_rho, pearson_r are point estimates on the upper triangle.
+    spearman_p, pearson_p are asymptotic p-values; with n=15 pairs (6
+    operators) these are unreliable, so we additionally compute a
+    permutation p-value (perm_p_spearman, perm_p_pearson) by shuffling
+    the operator labels of the gap matrix and recomputing the
+    correlation many times. ci95_spearman / ci95_pearson are
+    bootstrap-resampled 95% confidence intervals on the correlations
+    over pairs.
+    """
     references: List[str]
-    distances_frobenius: np.ndarray        # [n_refs, n_refs]
-    transfer_gaps: np.ndarray              # [n_refs, n_refs] - diag - sym_transfer
+    distances_frobenius: np.ndarray
+    transfer_gaps: np.ndarray
     spearman_rho: float
     spearman_p: float
     pearson_r: float
     pearson_p: float
-    pair_table: pd.DataFrame               # per-pair distance/gap for plotting
+    perm_p_spearman: float
+    perm_p_pearson: float
+    ci95_spearman: Tuple[float, float]
+    ci95_pearson: Tuple[float, float]
+    pair_table: pd.DataFrame
 
 
 def operator_distance_correlation(
@@ -257,17 +276,32 @@ def operator_distance_correlation(
     k_laplacian: int = 4,
     montage: str = "standard_1005",
     n_probe_times: int = 2000,
+    n_probes: int = 8,
     seed: int = 0,
+    n_permutations: int = 10_000,
+    n_bootstrap: int = 5_000,
 ) -> OperatorDistanceResult:
     """Test whether Frobenius distance between reference operators predicts transfer gap.
 
     Procedure:
       1. For each reference in ``mean_matrix``, estimate its linear
-         operator matrix A (C x C) on the given channel set.
+         operator matrix A (C x C) on the given channel set, averaged
+         over ``n_probes`` independent Gaussian probes (relevant only
+         for the median operator's linear tangent estimate).
       2. Compute pairwise Frobenius distances between operators.
       3. Compute transfer gaps from the mean matrix:
          ``gap_ij = diag_mean - 0.5*(M_ij + M_ji)``.
-      4. Correlate the two (upper triangle only; n=21 for 7 references).
+      4. Correlate the upper triangle (n=15 pairs for 6 references).
+      5. Bootstrap CIs over the pairs (resampling pairs with replacement).
+      6. Permutation test by shuffling operator labels of the gap matrix
+         while keeping the distance matrix fixed.
+
+    We do not interpret this as a Ben-David H-divergence bound. Frobenius
+    distance is a data-free quantity; its empirical correlation with
+    transfer gap is an interesting structural finding, not a tight
+    theoretical bound. The paper should describe it as "operator-matrix
+    Frobenius distance, a data-free quantity, predicts the empirical
+    transfer gap with Spearman ρ = X (95% CI [a, b], permutation p < c)".
 
     Parameters
     ----------
@@ -277,12 +311,24 @@ def operator_distance_correlation(
         EEG channel names for the dataset. Needed to build neighbour
         graph and REST matrix at the correct dimensionality.
     k_laplacian, montage : passed through to ``build_graph``.
-    n_probe_times, seed : probe configuration.
+    n_probe_times : int
+        Length of the Gaussian probe used to recover each operator
+        matrix. 2000 is plenty for linear operators; helpful for
+        averaging the median linearization.
+    n_probes : int
+        Number of independent probes to average over. >1 helps for the
+        non-linear median operator; ignored otherwise. Default 8.
+    seed : int
+        RNG seed for probes, bootstrap, and permutation. Reproducible.
+    n_permutations : int
+        Permutations for the label-shuffle null. Default 10000.
+    n_bootstrap : int
+        Bootstrap resamples for the pair-wise CI. Default 5000.
 
     Returns
     -------
-    OperatorDistanceResult with correlations and a per-pair DataFrame
-    suitable for scatter plotting.
+    OperatorDistanceResult with point estimates, CIs, permutation
+    p-values, and the per-pair table for plotting.
     """
     from scipy.stats import pearsonr, spearmanr
 
@@ -295,11 +341,12 @@ def operator_distance_correlation(
         ch_names, k=k_laplacian, montage=montage, include_rest=need_rest,
     )
 
-    # Estimate linear operator per reference
+    # Estimate linear operator per reference (averaged over probes for
+    # median's linearization variance reduction).
     ops: Dict[str, np.ndarray] = {}
     for r in refs:
         ops[r] = _estimate_linear_operator(
-            r, graph, n_times=n_probe_times, seed=seed,
+            r, graph, n_times=n_probe_times, seed=seed, n_probes=n_probes,
         )
 
     # Pairwise Frobenius distance
@@ -324,7 +371,55 @@ def operator_distance_correlation(
     r_s, p_s = spearmanr(dist_flat, gap_flat)
     r_p, p_p = pearsonr(dist_flat, gap_flat)
 
-    # Per-pair table for plotting
+    # Bootstrap CIs over pairs (resample pair indices with replacement)
+    rng = np.random.default_rng(seed)
+    n_pairs = len(dist_flat)
+    boot_rho = np.empty(n_bootstrap, dtype=np.float64)
+    boot_pear = np.empty(n_bootstrap, dtype=np.float64)
+    for b in range(n_bootstrap):
+        idx = rng.integers(0, n_pairs, size=n_pairs)
+        d_b, g_b = dist_flat[idx], gap_flat[idx]
+        if np.std(d_b) == 0 or np.std(g_b) == 0:
+            boot_rho[b] = np.nan
+            boot_pear[b] = np.nan
+            continue
+        boot_rho[b], _ = spearmanr(d_b, g_b)
+        boot_pear[b], _ = pearsonr(d_b, g_b)
+    valid_rho = boot_rho[~np.isnan(boot_rho)]
+    valid_pear = boot_pear[~np.isnan(boot_pear)]
+    ci_rho = (
+        (float(np.percentile(valid_rho, 2.5)),
+         float(np.percentile(valid_rho, 97.5)))
+        if len(valid_rho) else (float("nan"), float("nan"))
+    )
+    ci_pear = (
+        (float(np.percentile(valid_pear, 2.5)),
+         float(np.percentile(valid_pear, 97.5)))
+        if len(valid_pear) else (float("nan"), float("nan"))
+    )
+
+    # Permutation test: shuffle operator-axis labels of the symmetric gap
+    # matrix, recompute upper-triangle correlation, count exceedances.
+    perm_count_s = 0
+    perm_count_p = 0
+    obs_abs_s = abs(r_s)
+    obs_abs_p = abs(r_p)
+    for _ in range(n_permutations):
+        perm = rng.permutation(n)
+        gap_perm = gap[np.ix_(perm, perm)]
+        gp = gap_perm[iu]
+        if np.std(gp) == 0:
+            continue
+        r_s_perm, _ = spearmanr(dist_flat, gp)
+        r_p_perm, _ = pearsonr(dist_flat, gp)
+        if abs(r_s_perm) >= obs_abs_s:
+            perm_count_s += 1
+        if abs(r_p_perm) >= obs_abs_p:
+            perm_count_p += 1
+    # +1 / +1 small-sample correction (Phipson & Smyth 2010)
+    perm_p_s = (perm_count_s + 1) / (n_permutations + 1)
+    perm_p_p = (perm_count_p + 1) / (n_permutations + 1)
+
     rows = []
     for i, j in zip(*iu):
         rows.append({
@@ -343,6 +438,10 @@ def operator_distance_correlation(
         spearman_p=float(p_s),
         pearson_r=float(r_p),
         pearson_p=float(p_p),
+        perm_p_spearman=float(perm_p_s),
+        perm_p_pearson=float(perm_p_p),
+        ci95_spearman=ci_rho,
+        ci95_pearson=ci_pear,
         pair_table=pair_table,
     )
 
