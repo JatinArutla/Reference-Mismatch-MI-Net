@@ -25,7 +25,9 @@ Notebook API:
 Primitives:
 
     ReferenceTransformer        sklearn transformer applying a reference op
-    build_graph                 kNN-Laplacian/NN-diff/REST neighbor indices
+    build_graph                 kNN-Laplacian / REST / cz_ref state for one
+                                channel set (neighbour indices, REST matrix,
+                                Cz channel index)
     REFERENCE_MODES             tuple of the six supported modes
     make_csp_lda_pipeline       CSP+LDA pipeline matching MOABB's canonical CSP.yml
 
@@ -99,4 +101,4 @@ __all__ = [
     "make_csp_lda_pipeline",
 ]
 
-__version__ = "0.11.0"
+__version__ = "0.13.0"

@@ -18,7 +18,7 @@ from refshift.analysis import (
 
 # ----- Fixtures --------------------------------------------------------------
 
-REFS = ["native", "car", "median", "laplacian", "nn_diff", "rest"]
+REFS = ["native", "car", "median", "laplacian", "rest", "cz_ref"]
 
 
 def _make_baseline_df(seed: int = 0, n_subjects: int = 9, n_seeds: int = 3,
@@ -209,7 +209,7 @@ def test_wilcoxon_holm_correction_monotone():
     df_b = _make_jitter_df(seed=0, noise_sd=0.0,
                            acc_by_ref={r: 0.55 for r in REFS})
     df_a = df_b.copy()
-    df_a.loc[df_a["test_ref"] == "nn_diff", "accuracy"] += 0.10
+    df_a.loc[df_a["test_ref"] == "cz_ref", "accuracy"] += 0.10
     out = paired_wilcoxon_per_test_ref(
         df_a, df_b, alternative="greater",
     )
@@ -271,20 +271,22 @@ def test_full_pipeline_baseline_diagonal_vs_jitter():
 
 
 def test_full_pipeline_baseline_off_vs_lofo():
-    """End-to-end: LOFO NN-diff should beat baseline col-off-diag for NN-diff
+    """End-to-end: LOFO cz_ref should beat baseline col-off-diag for cz_ref
     if we synthesize it that way."""
     baseline = _make_baseline_df(seed=0, diag_acc=0.65, off_acc=0.36, noise_sd=0.03)
-    # LOFO NN-diff mimics the user's actual result: NN-diff test ~0.43 vs
-    # other test refs ~0.65
+    # LOFO cz_ref: cz_ref test ~0.43 vs other test refs ~0.65 (typical
+    # LOFO recovery: held-out reference does worse than seen ones, but
+    # LOFO still beats fixed-reference baseline because the model has
+    # some operator-invariance).
     acc = {r: 0.65 for r in REFS}
-    acc["nn_diff"] = 0.43
+    acc["cz_ref"] = 0.43
     lofo = _make_jitter_df(seed=1, acc_by_ref=acc, noise_sd=0.03)
     off_view = baseline_col_off_diag_view(baseline)
     out = paired_wilcoxon_per_test_ref(
         lofo, off_view, label_a="lofo", label_b="baseline_off",
         alternative="greater",
     )
-    # Bipolar LOFO ~0.43 vs baseline off ~0.36 -> should be significant
-    bip = out[out["test_ref"] == "nn_diff"].iloc[0]
-    assert bip["mean_delta"] > 0.04  # ~7pt difference (0.43-0.36)
-    assert bip["p_value"] < 0.01
+    # cz_ref LOFO ~0.43 vs baseline off ~0.36 -> should be significant
+    cz = out[out["test_ref"] == "cz_ref"].iloc[0]
+    assert cz["mean_delta"] > 0.04  # ~7pt difference (0.43-0.36)
+    assert cz["p_value"] < 0.01

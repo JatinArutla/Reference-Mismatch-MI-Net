@@ -6,7 +6,7 @@ the zero-potential point) and *spatial-derivative* operators (which form
 local differences, a different category from rereferencing in the strict
 sense). The paper studies both as channel-space transformations.
 
-    Global / as-recorded family
+    Global / symmetric family
         native              identity — use the dataset's native hardware
                             reference (e.g. left-mastoid for IV-2a)
         car                 common average reference: X - mean_c(X)
@@ -23,20 +23,26 @@ sense). The paper studies both as channel-space transformations.
                             REST implementation; we describe it as
                             "REST-like" rather than "REST".
 
-    Local spatial-derivative family
+    Global / asymmetric family
+        cz_ref              single-electrode reference: X_i - X_{Cz}.
+                            Sets the Cz channel to identically zero.
+                            Cz sits over the foot/leg motor area at the
+                            midline; subtracting it from C3/C4 partially
+                            removes lateralized hand-MI signal, so on
+                            most MI datasets cz_ref is a more aggressive
+                            operator than the symmetric globals. Requires
+                            ``"Cz"`` to be present in the dataset's
+                            channel list. On Schirrmeister2017, where Cz
+                            was the recording reference and is therefore
+                            absent from the analysis montage, cz_ref is
+                            undefined and ``apply_reference`` raises.
+
+    Local spatial-filter family
         laplacian           kNN local Laplacian: X - mean of the k=4
                             nearest-neighbour channels. *Not* formal
                             CSD/spherical-spline Laplacian; this is the
                             discrete neighbour-mean form used as a
                             spatial-filter approximation.
-        nn_diff             nearest-neighbour local difference:
-                            X_i - X_{nn(i)}. Dimension-preserving local
-                            derivative. *Not* a clinical bipolar montage
-                            (which uses predefined electrode pairs and
-                            typically reduces channel count). The naming
-                            is deliberately "NN-diff" and not "bipolar".
-                            See ``DatasetGraph.nn_diff_rank`` for the
-                            per-dataset rank diagnostic.
 
 Note on omitted operators. We do not include a leave-one-out (LOO) mean
 reference because LOO_i = (C/(C-1)) * CAR_i — they differ only by a
@@ -44,7 +50,13 @@ scalar factor and behave identically for any scale-invariant decoder
 (CSP+LDA, batch-normalized neural networks). We do not include a
 projection-based "GS" operator in the main set because the natural
 implementation is data-dependent and does not form a fixed C×C linear
-operator, putting it outside the operator-shift framework.
+operator, putting it outside the operator-shift framework. Earlier
+versions of this codebase included an "NN-diff" operator (nearest-
+neighbour difference, ``Y_i = X_i - X_{nn(i)}``); it was removed in
+v0.13 because it is not a literature-recognised reference choice — it
+was constructed for this codebase as an analogue to clinical bipolar
+montages — and its dimension-reducing rank deficiency on dense montages
+would confound jitter and SSL experiments.
 
 Nearest-neighbour graphs are built from Euclidean distances in the MNE
 ``standard_1005`` montage. REST uses the same montage via
@@ -63,12 +75,16 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 
 REFERENCE_MODES = (
-    "native", "car", "median", "laplacian", "nn_diff", "rest",
+    "native", "car", "median", "laplacian", "rest", "cz_ref",
 )
 
 # Modes that require a DatasetGraph (i.e. some dataset-specific precomputed
-# state: neighbor indices for spatial modes, leadfield transform for REST).
-_GRAPH_MODES = ("laplacian", "nn_diff", "rest")
+# state: neighbor indices for spatial modes, leadfield transform for REST,
+# Cz channel index for cz_ref). This is the single source of truth: any
+# code that needs to know "should I build a graph?" should import this
+# tuple rather than hardcoding the list, so adding/removing operators
+# only requires changing reference.py.
+_GRAPH_MODES = ("laplacian", "rest", "cz_ref")
 
 
 # ---------------------------------------------------------------------------
@@ -206,13 +222,6 @@ class DatasetGraph:
     laplacian_idx : np.ndarray of shape (C, k), int64
         Indices of each channel's k nearest spatial neighbors (for the
         kNN local-Laplacian operator).
-    nn_diff_idx : np.ndarray of shape (C,), int64
-        Index of each channel's single nearest spatial neighbor (for the
-        nearest-neighbour local-difference operator). This is *not* a
-        clinical bipolar montage with predefined electrode pairs; it is
-        a dimension-preserving local-difference operator. See
-        ``nn_diff_rank`` and ``nn_diff_nullity`` for the per-dataset
-        rank diagnostic.
     k : int
         Neighbor count used for the Laplacian operator.
     montage : str
@@ -221,32 +230,25 @@ class DatasetGraph:
         REST transformation matrix. ``None`` if REST wasn't requested when
         the graph was built (avoids the ~10-30 s cost of computing a
         forward solution when the caller doesn't need REST).
-    nn_diff_rank : int
-        Rank of the (I - P) matrix where P is the channel permutation
-        induced by ``nn_diff_idx``. For a rank-(C-1) chain, rank = C-1.
-        Smaller ranks indicate that the nearest-neighbour graph contains
-        cycles (e.g. mutual nearest-neighbours), which inflate the operator's
-        nullity beyond the minimum. Logged alongside results so reviewers
-        can verify that the NN-diff effect is not driven by pathological
-        rank collapse.
-    nn_diff_nullity : int
-        ``C - nn_diff_rank``. Number of dimensions destroyed by the operator
-        beyond the single global-DC dimension that any local-difference
-        operator must remove.
     rest_cond : float or None
         Condition number of the REST transformation matrix (``np.linalg.cond``).
         ``None`` if REST wasn't requested. Reported for transparency about
         REST conditioning, which can be sensitive to electrode coverage.
+    cz_idx : int or None
+        Index of ``"Cz"`` in ``ch_names``, or ``None`` if Cz is not
+        recorded as a separate channel in this dataset (e.g. Schirrmeister
+        2017, where Cz was the recording reference and is therefore
+        excluded from the analysis montage). Used by the ``cz_ref``
+        operator. When ``None``, requesting ``cz_ref`` via
+        ``apply_reference`` raises a clear error.
     """
     ch_names: List[str]
     laplacian_idx: np.ndarray
-    nn_diff_idx: np.ndarray
     k: int
     montage: str
     rest_matrix: Optional[np.ndarray] = field(default=None)
-    nn_diff_rank: int = field(default=0)
-    nn_diff_nullity: int = field(default=0)
     rest_cond: Optional[float] = field(default=None)
+    cz_idx: Optional[int] = field(default=None)
 
 
 def build_graph(
@@ -270,27 +272,10 @@ def build_graph(
         If True, also compute and store the REST transformation matrix.
         Default False; set True only when the 'rest' reference mode is
         used, since forward-solution computation takes several seconds.
-
-    Notes
-    -----
-    The NN-diff operator is implemented as ``Y_i = X_i - X_{nn(i)}``,
-    which is equivalent to multiplication by ``(I - P)`` where ``P`` is
-    the channel-permutation matrix indexed by ``nn_diff_idx``. When the
-    nearest-neighbour graph has cycles (e.g. C3-C5 mutually nearest),
-    the operator destroys more than one dimension. We compute and store
-    the rank of ``(I - P)`` alongside the indices so the rank can be
-    inspected per dataset.
     """
     xyz = _get_channel_positions(ch_names, montage=montage)
     d = _pairwise_distances(xyz)
     lap = np.argsort(d, axis=1)[:, :k].astype(np.int64)
-    nn = np.argmin(d, axis=1).astype(np.int64)
-
-    # Rank diagnostic for NN-diff
-    C = len(ch_names)
-    M = np.eye(C) - np.eye(C)[nn]  # M[i] = e_i - e_{nn(i)}
-    nn_rank = int(np.linalg.matrix_rank(M))
-    nn_nullity = C - nn_rank
 
     rest_matrix = None
     rest_cond = None
@@ -298,16 +283,23 @@ def build_graph(
         rest_matrix = _build_rest_matrix(ch_names, montage=montage)
         rest_cond = float(np.linalg.cond(rest_matrix))
 
+    # Cz index for the cz_ref operator. None if Cz isn't recorded.
+    # Schirrmeister2017 uses Cz as the recording reference and excludes
+    # it from the analysis montage; cz_ref is undefined there.
+    cz_idx: Optional[int] = None
+    for i, name in enumerate(ch_names):
+        if name == "Cz":
+            cz_idx = i
+            break
+
     return DatasetGraph(
         ch_names=list(ch_names),
         laplacian_idx=lap,
-        nn_diff_idx=nn,
         k=k,
         montage=montage,
         rest_matrix=rest_matrix,
-        nn_diff_rank=nn_rank,
-        nn_diff_nullity=nn_nullity,
         rest_cond=rest_cond,
+        cz_idx=cz_idx,
     )
 
 
@@ -352,19 +344,29 @@ def _laplacian(X: np.ndarray, laplacian_idx: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(X - ref, dtype=np.float32)
 
 
-def _nn_diff(X: np.ndarray, nn_diff_idx: np.ndarray) -> np.ndarray:
-    """Nearest-neighbour local difference: ``Y_i = X_i - X_{nn(i)}``.
+def _cz_ref(X: np.ndarray, cz_idx: int) -> np.ndarray:
+    """Single-electrode reference using Cz: ``Y_i = X_i - X_{Cz}``.
 
-    Dimension-preserving local-derivative operator. *Not* a clinical
-    bipolar montage, which would use predefined electrode pairs and
-    typically reduces channel count. The naming "NN-diff" rather than
-    "bipolar" is deliberate. See ``DatasetGraph.nn_diff_rank`` for the
-    rank diagnostic per dataset.
+    Sets the Cz channel itself to identically zero. Linear, rank
+    ``C - 1``, with a 1-dimensional null space spanned by the Cz channel.
+    Caller is responsible for verifying that ``cz_idx`` corresponds to
+    the channel named "Cz" in the array's channel order; the typical
+    path is via ``DatasetGraph.cz_idx`` populated by ``build_graph``.
+
+    Note that Cz sits over the foot/leg motor area at the midline, so
+    on hand-MI datasets cz_ref is electrically more invasive than
+    symmetric global references like CAR — it removes signal that
+    contributes to the lateralized C3/C4 contrast that decodes the
+    task. Per-dataset diagonal accuracies are expected to be lower
+    under cz_ref than under CAR/median/REST, which is itself an
+    informative empirical observation rather than a defect.
     """
     X = _ensure_f32(X)
     if X.ndim == 2:
-        return np.ascontiguousarray(X - X[nn_diff_idx], dtype=np.float32)
-    return np.ascontiguousarray(X - X[:, nn_diff_idx], dtype=np.float32)
+        ref = X[cz_idx]                          # [T]
+        return np.ascontiguousarray(X - ref[np.newaxis, :], dtype=np.float32)
+    ref = X[:, cz_idx, :]                        # [N, T]
+    return np.ascontiguousarray(X - ref[:, np.newaxis, :], dtype=np.float32)
 
 
 def _rest(X: np.ndarray, rest_matrix: np.ndarray) -> np.ndarray:
@@ -393,8 +395,9 @@ def apply_reference(
     """Dispatch X through the named reference operator.
 
     ``graph`` is required for any mode in ``_GRAPH_MODES``
-    ('laplacian', 'nn_diff', 'rest'). For REST, the graph must have been
-    built with ``include_rest=True``.
+    ('laplacian', 'rest', 'cz_ref'). For REST, the graph must have been
+    built with ``include_rest=True``. For cz_ref, the graph's ``cz_idx``
+    must be set (i.e. 'Cz' must be present in the channel list).
     """
     mode = mode.lower()
     if mode == "native":
@@ -409,8 +412,6 @@ def apply_reference(
             raise ValueError(f"Mode {mode!r} requires a DatasetGraph")
         if mode == "laplacian":
             return _laplacian(X, graph.laplacian_idx)
-        if mode == "nn_diff":
-            return _nn_diff(X, graph.nn_diff_idx)
         if mode == "rest":
             if graph.rest_matrix is None:
                 raise ValueError(
@@ -418,6 +419,17 @@ def apply_reference(
                     "include_rest=True."
                 )
             return _rest(X, graph.rest_matrix)
+        if mode == "cz_ref":
+            if graph.cz_idx is None:
+                raise ValueError(
+                    "Mode 'cz_ref' requires 'Cz' to be present in the "
+                    "channel set, but the DatasetGraph reports cz_idx=None. "
+                    "This typically means the dataset uses Cz as the "
+                    "recording reference (e.g. Schirrmeister2017) and "
+                    "therefore excludes it from the analysis montage. "
+                    "Skip cz_ref for this dataset."
+                )
+            return _cz_ref(X, graph.cz_idx)
 
     raise ValueError(f"Unknown reference mode: {mode!r}. Known: {REFERENCE_MODES}")
 
@@ -437,9 +449,11 @@ class ReferenceTransformer(BaseEstimator, TransformerMixin):
     ----------
     mode : one of REFERENCE_MODES
     graph : DatasetGraph or None, default None
-        Required for 'laplacian', 'nn_diff', and 'rest'. Must match the
-        channel ordering of the input arrays. For 'rest', the graph must
-        have been built with ``include_rest=True``.
+        Required for any mode in ``_GRAPH_MODES`` ('laplacian', 'rest',
+        'cz_ref'). Must match the channel ordering of the input arrays.
+        For 'rest', the graph must have been built with
+        ``include_rest=True``. For 'cz_ref', the graph's ``cz_idx`` must
+        be set (i.e. 'Cz' must be present in the channel list).
 
     Notes
     -----
@@ -463,6 +477,13 @@ class ReferenceTransformer(BaseEstimator, TransformerMixin):
         ):
             raise ValueError(
                 "Mode 'rest' requires DatasetGraph built with include_rest=True."
+            )
+        if self.mode == "cz_ref" and (
+            self.graph is not None and self.graph.cz_idx is None
+        ):
+            raise ValueError(
+                "Mode 'cz_ref' requires 'Cz' in the channel set, but the "
+                "DatasetGraph reports cz_idx=None. Drop cz_ref for this dataset."
             )
 
     def fit(self, X, y=None):

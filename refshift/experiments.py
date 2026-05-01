@@ -24,7 +24,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, cohen_kappa_score
 
 from refshift.pipelines import make_csp_lda_pipeline
-from refshift.reference import REFERENCE_MODES, apply_reference, build_graph
+from refshift.reference import REFERENCE_MODES, _GRAPH_MODES, apply_reference, build_graph
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +170,11 @@ def _get_eeg_channel_names(
     If ``paradigm.channels`` is unset, all EEG channels in the raw are
     returned in raw-channel order.
 
-    The neighbour graph for spatial-differential references (kNN-laplacian,
-    NN-diff) and REST is built from this list, so it is critical that
-    it matches the channel axis of the X array the paradigm produces.
-    Mismatches here surface as ``IndexError: index N is out of bounds``
-    inside ``_laplacian`` / ``_nn_diff``.
+    The neighbour graph for spatial-derivative operators (kNN-Laplacian)
+    and REST is built from this list, so it is critical that it matches
+    the channel axis of the X array the paradigm produces. Mismatches
+    here surface as ``IndexError: index N is out of bounds`` inside
+    ``_laplacian``.
     """
     if paradigm is not None and getattr(paradigm, "channels", None):
         # MOABB picks with ordered=True, which preserves include-list
@@ -315,19 +315,17 @@ def _setup_dl_run(
 
     ``reference_modes_for_graph`` is the set of operators the run will
     apply (train side and test side). The graph is built iff any of
-    them require neighbour indices (laplacian / nn_diff / rest). REST
-    is included in the graph iff 'rest' is among the modes; this
-    avoids the spherical-model construction cost when REST isn't used.
-    Logs the NN-diff rank diagnostic and (if applicable) REST condition
-    number once per run, so reviewers can see those quantities.
+    them require neighbour indices, REST, or Cz indexing (i.e. any mode
+    in ``_GRAPH_MODES``). REST is included in the graph iff 'rest' is
+    among the modes; this avoids the spherical-model construction cost
+    when REST isn't used. Logs the REST condition number (when
+    applicable) once per run.
     """
     dataset, paradigm = _resolve_dataset(dataset_id)
     if subjects is None:
         subjects = list(dataset.subject_list)
 
-    needs_graph = any(
-        m in ("laplacian", "nn_diff", "rest") for m in reference_modes_for_graph
-    )
+    needs_graph = any(m in _GRAPH_MODES for m in reference_modes_for_graph)
     needs_rest = "rest" in reference_modes_for_graph
     graph = None
     if needs_graph:
@@ -338,14 +336,17 @@ def _setup_dl_run(
             ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
         )
         if progress:
-            extra = (
+            cz_msg = (
+                f", cz_idx={graph.cz_idx}"
+                if graph.cz_idx is not None else ", cz_idx=None (no Cz channel)"
+            )
+            rest_msg = (
                 f", REST cond={graph.rest_cond:.2e}"
                 if graph.rest_cond is not None else ""
             )
             print(
-                f"[{dataset.code}] graph: C={len(graph.ch_names)}, "
-                f"NN-diff rank={graph.nn_diff_rank}/{len(graph.ch_names)} "
-                f"(nullity={graph.nn_diff_nullity}){extra}"
+                f"[{dataset.code}] graph: C={len(graph.ch_names)}"
+                f"{cz_msg}{rest_msg}"
             )
 
     return _DLRunContext(
@@ -667,7 +668,7 @@ def run_mismatch(
         subjects = list(dataset.subject_list)
     seeds = list(seeds)
 
-    needs_graph = any(m in ("laplacian", "nn_diff", "rest") for m in modes)
+    needs_graph = any(m in _GRAPH_MODES for m in modes)
     needs_rest = "rest" in modes
     graph = None
     if needs_graph:
@@ -678,14 +679,17 @@ def run_mismatch(
             ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
         )
         if progress:
-            extra = (
+            cz_msg = (
+                f", cz_idx={graph.cz_idx}"
+                if graph.cz_idx is not None else ", cz_idx=None (no Cz channel)"
+            )
+            rest_msg = (
                 f", REST cond={graph.rest_cond:.2e}"
                 if graph.rest_cond is not None else ""
             )
             print(
-                f"[{dataset.code}] graph: C={len(graph.ch_names)}, "
-                f"NN-diff rank={graph.nn_diff_rank}/{len(graph.ch_names)} "
-                f"(nullity={graph.nn_diff_nullity}){extra}"
+                f"[{dataset.code}] graph: C={len(graph.ch_names)}"
+                f"{cz_msg}{rest_msg}"
             )
 
     cache_config = _build_cache_config() if cache else None
@@ -778,7 +782,7 @@ def run_mismatch_jitter(
     *,
     model: str,
     condition: str = "full",
-    holdout_ref: str = "nn_diff",
+    holdout_ref: str = "cz_ref",
     subjects: Optional[List[int]] = None,
     seeds: List[int] = (0,),
     test_reference_modes: tuple = REFERENCE_MODES,
@@ -800,14 +804,14 @@ def run_mismatch_jitter(
     dl_cache_dir: 'Optional[str]' = None,
 ) -> pd.DataFrame:
     """Train one model per (subject, seed) with reference-jitter augmentation,
-    evaluate on all 6 test references.
+    evaluate on all test references.
 
     Two conditions:
 
       condition='full':
           Each training sample independently gets a reference drawn uniformly
-          from all 6 modes. Tests at-distribution generalization across all
-          references the model has seen.
+          from all modes in REFERENCE_MODES. Tests at-distribution
+          generalization across all references the model has seen.
 
       condition='lofo':
           Each training sample independently gets a reference from
@@ -825,12 +829,14 @@ def run_mismatch_jitter(
         per-sample reference randomness into).
     condition : {'full', 'lofo'}
     holdout_ref : str
-        Used only when condition='lofo'. Default 'nn_diff' (the structurally
-        most distinct operator and the strongest test of generalization).
-        For the full LOFO matrix across all 6 references, see
+        Used only when condition='lofo'. Default 'cz_ref' (a global
+        single-electrode reference, structurally distinct from the
+        symmetric-globals cluster). Must be a member of REFERENCE_MODES.
+        For the full LOFO matrix across all references, see
         ``run_lofo_matrix`` which loops this function and concatenates.
     test_reference_modes : tuple of str
-        References to evaluate on at test time. Defaults to all 6.
+        References to evaluate on at test time. Defaults to all of
+        REFERENCE_MODES.
     Other parameters : see ``run_mismatch``.
 
     Returns

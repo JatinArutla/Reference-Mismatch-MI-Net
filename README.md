@@ -17,17 +17,25 @@ exponential moving standardization composes with reference operators.
 
 | Family | Operator | What it does |
 |---|---|---|
-| Global / as-recorded | `native` | identity (whatever the dataset was recorded with) |
+| Global / symmetric | `native` | identity (whatever the dataset was recorded with) |
 |  | `car` | X − mean across channels |
 |  | `median` | X − median across channels (robustness control) |
 |  | `rest` | REST-like spherical-model re-reference (Yao 2001 approximation) |
+| Global / asymmetric | `cz_ref` | X − X[Cz] (single-electrode reference; sets Cz channel to zero) |
 | Local spatial-derivative | `laplacian` | X − mean of k=4 nearest neighbours (kNN local Laplacian; not formal CSD) |
-|  | `nn_diff` | X − single nearest neighbour (dimension-preserving local difference; not a clinical bipolar montage) |
 
 Nearest-neighbour graphs are computed from MNE's `standard_1005` montage.
 REST is built from the same montage via a three-layer spherical head model
 (`mne.make_sphere_model` + `mne.make_forward_solution`) with a regularized
 pseudo-inverse (rcond=1e-4), 10–60 seconds per dataset, computed once.
+
+`cz_ref` requires `Cz` to be present in the dataset's analysis montage.
+On Schirrmeister2017, `Cz` was the recording reference and is excluded
+from the published 44-channel motor subset; `cz_ref` is therefore
+undefined on Schirrmeister2017, and `apply_reference(..., "cz_ref", ...)`
+raises a clear error there. Drop `cz_ref` from `reference_modes` for
+Schirrmeister runs. The other four datasets (IV-2a, OpenBMI, Cho2017,
+Dreyer2023) all have Cz as a separately-recorded channel.
 
 We deliberately do not include a leave-one-out (LOO) mean reference because
 LOO_i = (C/(C−1)) · CAR_i — a constant scaling of CAR that produces
@@ -35,7 +43,12 @@ identical results for any scale-invariant decoder (CSP+LDA's eigenvalue
 problem; batch-normalised neural networks). We do not include a
 projection-based "Gram-Schmidt" operator in the main set because the
 natural implementation is data-dependent and doesn't form a fixed C×C
-linear operator.
+linear operator. Earlier versions also included a "NN-diff" operator
+(nearest-neighbour difference, `Y_i = X_i − X_{nn(i)}`); it was removed
+in v0.13 because it is not a literature-recognised reference choice — it
+was constructed for this codebase as an analogue to clinical bipolar
+montages — and its dimension-reducing rank deficiency on dense montages
+would confound the per-sample jitter and SSL experiments.
 
 ## Package layout
 
@@ -358,7 +371,10 @@ override.
 **Per-sample reference jitter.** Implemented as a braindecode `Transform`
 plugged into `AugmentedDataLoader`. Each training sample independently
 gets a reference drawn uniformly from `allowed_modes`. Full-jitter uses
-all 6; LOFO uses 5 (one held out). See `refshift/jitter.py`.
+all available operators on the dataset (typically all 6; on
+Schirrmeister2017, drop `cz_ref` for 5); LOFO uses one fewer (the
+held-out operator excluded from the training distribution). See
+`refshift/jitter.py`.
 
 **Operator-distance correlation.** `operator_distance_correlation`
 estimates each reference operator's linear C×C matrix on a Gaussian probe

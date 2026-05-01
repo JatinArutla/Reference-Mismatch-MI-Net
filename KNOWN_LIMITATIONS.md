@@ -10,12 +10,24 @@ in your methods section.
 
 ---
 
-## Reference-operator set (v0.10 redesign after peer review)
+## Reference-operator set (v0.10 redesign, v0.12 expansion, v0.13 cleanup)
 
-Three rounds of peer review on the v0.9 reference set led to a
-6-operator scheme in v0.10. The changes, in order of importance:
+The current operator set is six modes:
 
-**1. `gs` was dropped.** The natural data-dependent Gram-Schmidt
+```python
+REFERENCE_MODES = ("native", "car", "median", "laplacian", "rest", "cz_ref")
+```
+
+Three families: global / symmetric (native, car, median, rest), global /
+asymmetric (cz_ref), local spatial-derivative (laplacian).
+
+The set has been through three rounds of peer review and three named
+revisions. The current shape reflects the cumulative history below;
+items marked **HISTORICAL** describe operators that were tried and
+removed and exist here only as a record so a future reader doesn't
+re-introduce them by mistake.
+
+**1. `gs` was dropped (v0.10).** The natural data-dependent Gram-Schmidt
 projection is not a fixed C×C linear operator; it is per-trial,
 per-channel, depends on the input time-series, and behaves nonlinearly
 under input scaling. It does not fit the operator-shift framework the
@@ -26,20 +38,28 @@ under any scale-invariant decoder (CSP+LDA's eigenvalue problem and
 batch-normalised neural networks both qualify). LOO would appear as a
 duplicate of CAR in every empirical result.
 
-**2. `bipolar` was renamed to `nn_diff`.** The operation `X_i − X_{nn(i)}`
-is a dimension-preserving nearest-neighbour local-difference operator,
-*not* a clinical bipolar montage. Clinical bipolar montages use
-predefined electrode pairs and typically reduce the channel count.
-Calling our operator "bipolar" overloaded a clinical term; "NN-diff" is
-honest about what we compute. The implementation is unchanged.
+**2. HISTORICAL — `bipolar` renamed to `nn_diff` in v0.10, removed in
+v0.13.** The operation `Y_i = X_i − X_{nn(i)}` (channel minus its
+single nearest spatial neighbour) was originally called `bipolar`. A
+reviewer correctly pointed out that this is not a clinical bipolar
+montage — clinical bipolar montages use predefined electrode pairs and
+typically reduce channel count, while ours is dimension-preserving and
+uses Euclidean nearest-neighbour. Renaming to `nn_diff` removed the
+clinical overload but did not address the deeper problem: the operator
+itself was a construction of this codebase, not a literature-recognised
+reference choice. v0.13 removed it entirely from `REFERENCE_MODES`.
+See item 8 below for the full rationale.
 
-**3. NN-diff rank diagnostic.** When nearest-neighbour pairs are mutual
-(e.g. C3↔CP3 are each other's nearest neighbours), the operator
-destroys two dimensions instead of one. `build_graph` now computes the
-rank of `(I − P)` where P is the channel-permutation matrix from
-`nn_diff_idx`, and stores it on `DatasetGraph.nn_diff_rank` /
-`nn_diff_nullity`. Logged at run start so the operator's effective
-rank is on record per dataset.
+**3. HISTORICAL — NN-diff rank diagnostic (v0.10, removed v0.13).**
+While `nn_diff` was in the operator set, `build_graph` computed and
+stored the rank of `(I − P)` where `P` was the channel-permutation
+matrix from the nearest-neighbour map. On dense montages the
+nearest-neighbour graph contains mutual pairs (e.g. C3↔CP3), causing
+the operator to destroy more dimensions than expected (5 null
+dimensions on IV-2a's 22-channel montage). Logging the rank at run
+start was the documented mitigation. With `nn_diff` removed in v0.13,
+the diagnostic and the `nn_diff_idx` / `nn_diff_rank` /
+`nn_diff_nullity` fields on `DatasetGraph` are gone too.
 
 **4. REST regularization.** REST's pseudo-inverse uses `rcond=1e-4`
 explicitly, matching the realistic-head-model REST literature. The
@@ -56,16 +76,96 @@ measures "reference applied to EMS-standardized signals" rather than
 "reference applied to raw filtered signals, then standardized." The
 function `run_pre_ems_diagonal` runs the corresponding control: for
 each reference r, preprocess with r applied *before* EMS, train and
-test on the same r, return a 6-element diagonal. Compare to the
-diagonal of `run_mismatch` to verify EMS-after-reference is not
-materially distorting per-reference accuracies. Use only as an
-ablation; the headline matrix uses the standard pipeline.
+test on the same r, return a per-reference diagonal (length equal to
+`len(reference_modes)`). Compare to the diagonal of `run_mismatch` to
+verify EMS-after-reference is not materially distorting per-reference
+accuracies. Use only as an ablation; the headline matrix uses the
+standard pipeline.
 
 **6. Naming throughout.** "kNN local Laplacian (not formal CSD)";
 "REST-like spherical-model re-reference (not validated against a
 canonical REST implementation)"; "median as robustness control, not a
-mainstream MI reference"; "NN-diff (not clinical bipolar)". The paper
-should mirror these qualifications.
+mainstream MI reference". The paper should mirror these qualifications.
+
+**7. `cz_ref` added in v0.12.** The v0.10 set covered global-symmetric
+references (native, CAR, median, REST) and a local spatial-derivative
+operator (Laplacian). It did *not* cover the global-asymmetric case:
+a single-electrode reference of the form `Y_i = X_i − X_{Cz}`, which
+is what real BCI systems use when the amplifier is hardware-tied to
+one electrode (Cz, mastoid, earlobe). `cz_ref` fills that gap with Cz
+specifically, chosen because Cz is present in four of five of the
+project's analysis montages (IV-2a, OpenBMI, Cho2017, Dreyer2023) and
+sits in a methodologically interesting location: directly over the
+foot/leg motor cortex midline, electrically near the C3/C4 channels
+that hand-MI decoders rely on. The operator is linear with rank C−1
+(the Cz channel itself becomes identically zero in the output) and a
+single null direction along the standard basis vector for Cz.
+
+The Schirrmeister2017 dataset uses Cz as its recording reference, so
+the published 44-channel motor subset deliberately excludes Cz from
+the analysis montage; in that dataset cz_ref is mathematically
+undefined (no Cz channel to subtract). `build_graph` populates
+`cz_idx=None` in that case and `apply_reference(..., "cz_ref", ...)`
+raises an informative `ValueError` mentioning the Schirrmeister case.
+Practitioners running multi-dataset experiments should pass
+`reference_modes=tuple(m for m in REFERENCE_MODES if m != "cz_ref")`
+when the dataset is Schirrmeister2017, or catch the error
+per-operator. The other four datasets accept the full 6-operator set.
+
+We chose Cz over FCz (the alternative midline frontocentral electrode)
+because FCz is not present in OpenBMI's 62-channel cap layout, while
+Cz is. Choosing FCz would have made the operator undefined on two
+datasets instead of one, weakening the cross-dataset claim.
+
+The empirical expectation is that cz_ref's diagonal accuracy on
+hand-MI datasets will be lower than CAR/median/REST, because
+subtracting Cz partially destroys the lateralized C3/C4 signal that
+the decoder needs. Per the framework, this is informative rather than
+defective: cz_ref is included precisely because it is structurally
+distinct from the symmetric-globals cluster and we want the matrix to
+cover that distinction. If cz_ref's diagonal is at chance on all four
+datasets, the operator should be reported as a "stress test" rather
+than a "practitioner choice"; if it's within 5 points of the symmetric
+globals, it integrates cleanly into the headline matrix. The Phase-1
+empirical run will resolve this.
+
+**8. `nn_diff` removed (v0.13).** With cz_ref added in v0.12 the
+operator set briefly stood at seven. v0.13 dropped `nn_diff` for two
+independent reasons:
+
+*Not a literature-recognised reference.* Every other operator in the
+set corresponds to a documented practitioner choice: `native` is
+whatever the dataset shipped with, `car` is the most common software
+re-reference in the MI literature, `median` is a robustness control,
+`rest` is a published technique (Yao 2001), `laplacian` is a standard
+spatial filter, and `cz_ref` is what BCI hardware systems with a
+single fixed reference electrode actually deliver. `nn_diff` had no
+such anchor — it was constructed for this codebase as an analogue to
+clinical bipolar montages (a fact the v0.10 rename from `bipolar`
+already signalled). For a paper whose contribution is "train-test
+reference mismatch is a real distribution-shift problem in
+practitioner workflows", every operator in the headline matrix has to
+be a choice practitioners actually make. `nn_diff` failed that bar.
+
+*Rank deficiency confounds jitter and SSL experiments.* On dense
+montages `nn_diff` had 5 null dimensions on IV-2a's 22-channel set
+(rank 17/22) due to mutual nearest-neighbour pairs in the
+`standard_1005` graph. For supervised classification this was
+tolerable — the destroyed dimensions weren't carrying class signal
+and the diagonal accuracy held up — but for full-jitter training a
+fraction of training samples would have come from a rank-deficient
+operator, and for SSL the encoder's job (learn a representation that
+transfers across reference operators) cannot be cleanly separated
+from "learn to handle systematically rank-deficient input from one
+operator". Dropping `nn_diff` removes the confound at no cost to the
+headline experiment and gives Laplacian a clean role as the sole
+local spatial-derivative operator in the matrix.
+
+The `_nn_diff` function and `nn_diff_idx` / `nn_diff_rank` /
+`nn_diff_nullity` fields on `DatasetGraph` are gone in v0.13. Any
+historical CSV with `train_ref="nn_diff"` rows can still be read into
+analysis code, but `apply_reference` and `ReferenceTransformer` will
+reject `mode="nn_diff"` with `ValueError: Unknown reference mode`.
 
 ---
 
@@ -134,17 +234,20 @@ EMS divides each channel by its own running standard deviation, so
 per-channel scales are not identical at the moment CAR sums them. The
 docstring is now consistent with this section's caveat (§5 above).
 
-**5. Operator-distance statistics tightened.** With 6 operators we have
-n=15 pairs in the upper triangle; the asymptotic Spearman/Pearson
-p-values used in v0.9/v0.10 were not reliable at this n. The function
-`operator_distance_correlation` now returns: a bootstrap 95% confidence
-interval over pairs (resampling pair indices with replacement); a
-permutation p-value computed by shuffling operator labels of the gap
-matrix while keeping the distance matrix fixed; and an averaged
-linear-operator estimate over multiple Gaussian probes (default 8) to
-reduce variance in the median operator's linear-tangent estimate. The
-asymptotic values are still returned for completeness; the bootstrap CI
-and permutation p are the values to report in the paper.
+**5. Operator-distance statistics tightened.** At v0.13 the operator
+set has 6 modes, giving n=15 pairs in the upper triangle (briefly 21
+at v0.12 with both `cz_ref` and `nn_diff`; back to 15 with `nn_diff`
+removed). The asymptotic Spearman/Pearson p-values used in v0.9/v0.10
+were not reliable at this n. The function `operator_distance_correlation`
+now returns: a bootstrap 95% confidence interval over pairs (resampling
+pair indices with replacement); a permutation p-value computed by
+shuffling operator labels of the gap matrix while keeping the distance
+matrix fixed; and an averaged linear-operator estimate over multiple
+Gaussian probes (default 8) to reduce variance in the median operator's
+linear-tangent estimate. The asymptotic values are still returned for
+completeness; the bootstrap CI and permutation p are the values to
+report in the paper. On Schirrmeister2017 with cz_ref dropped, n falls
+to 10 pairs and the small-sample caveat is correspondingly stronger.
 
 **6. Two new experiment runners.** `run_lofo_matrix` wraps
 `run_mismatch_jitter(condition='lofo', ...)` in a loop over each

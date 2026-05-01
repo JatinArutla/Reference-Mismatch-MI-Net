@@ -94,7 +94,9 @@ def test_gs_no_longer_in_reference_modes():
     from refshift.reference import REFERENCE_MODES
     assert "gs" not in REFERENCE_MODES
     assert "loo" not in REFERENCE_MODES
+    assert "nn_diff" not in REFERENCE_MODES  # removed in v0.13 (constructed operator)
     assert len(REFERENCE_MODES) == 6
+    assert "cz_ref" in REFERENCE_MODES
 
 
 # ---------------------------------------------------------------------------
@@ -117,63 +119,23 @@ def test_laplacian_hand_case():
     np.testing.assert_allclose(Y, expected, atol=1e-6)
 
 
-def test_nn_diff_hand_case():
-    """NN-diff: Y_i = X_i - X_{nn(i)}. Renamed from "bipolar" in v0.10
-    to honestly reflect that this is a dimension-preserving local-
-    difference operator, not a clinical bipolar montage with
-    predefined electrode pairs.
-    """
-    X = np.array([[1.0, 2.0],
-                  [3.0, 4.0],
-                  [5.0, 6.0]], dtype=np.float32)
-    nn_idx = np.array([1, 0, 1], dtype=np.int64)
-    from refshift.reference import _nn_diff  # noqa: PLC0415
-    Y = _nn_diff(X, nn_idx)
-    # Row 0: X[0] - X[1] = [-2, -2]
-    # Row 1: X[1] - X[0] = [+2, +2]
-    # Row 2: X[2] - X[1] = [+2, +2]
-    expected = np.array([[-2, -2], [2, 2], [2, 2]], dtype=np.float32)
-    np.testing.assert_allclose(Y, expected, atol=1e-6)
-
-
-def test_nn_diff_rank_diagnostic():
-    """build_graph reports nn_diff_rank/nullity for transparency. With
-    mutual nearest-neighbours (e.g. 0<->1), the operator destroys 2
-    dimensions instead of 1; rank goes down accordingly. This test
-    constructs a controlled mutual-NN case and checks the diagnostic.
-    """
-    pytest.importorskip("mne")
-    # IV-2a channel set: well-known to have many mutual-NN pairs
-    # (C3<->CP3, C4<->CP4, etc.). Rank should be < C.
-    iv2a_chs = [
-        "Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
-        "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
-        "CP3", "CP1", "CPz", "CP2", "CP4",
-        "P1", "Pz", "P2", "POz",
-    ]
-    g = build_graph(iv2a_chs, k=4)
-    assert g.nn_diff_rank > 0
-    assert g.nn_diff_rank <= len(iv2a_chs)
-    assert g.nn_diff_nullity == len(iv2a_chs) - g.nn_diff_rank
-    # We expect at least some mutual-NN pairs => nullity >= 1
-    # (the diagnostic exists *because* the rank is typically less than C-1).
-
-
 # ---------------------------------------------------------------------------
 # Graph construction (uses MNE; skip if unavailable)
 # ---------------------------------------------------------------------------
 
 def test_build_graph_iv2a_c3_nearest_is_cp3(iv2a_ch_names):
-    """Under standard_1005, C3's single nearest neighbor in the IV-2a
-    channel set should be CP3. This is an anatomical sanity check."""
+    """Under standard_1005, C3's single nearest neighbour in the IV-2a
+    channel set should be CP3. This is an anatomical sanity check on the
+    KD-tree distance computation that drives ``laplacian_idx``."""
     pytest.importorskip("mne")
     g = build_graph(iv2a_ch_names, k=4, montage="standard_1005")
 
     c3 = iv2a_ch_names.index("C3")
     cp3 = iv2a_ch_names.index("CP3")
-    assert g.nn_diff_idx[c3] == cp3
-
-    # k=4: CP3 should appear among C3's Laplacian neighbors.
+    # laplacian_idx is sorted by ascending distance, so position 0 is
+    # the single closest neighbour.
+    assert g.laplacian_idx[c3][0] == cp3
+    # k=4: CP3 must also appear among C3's Laplacian neighbours.
     assert cp3 in g.laplacian_idx[c3].tolist()
 
 
@@ -183,7 +145,6 @@ def test_build_graph_no_self_loops(iv2a_ch_names):
     C = len(iv2a_ch_names)
     for c in range(C):
         assert c not in g.laplacian_idx[c].tolist(), f"self-loop in Laplacian at {c}"
-        assert g.nn_diff_idx[c] != c, f"self-loop in NN-diff at {c}"
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +181,15 @@ def test_transformer_spatial_requires_graph():
 def test_transformer_roundtrip_all_modes(small_X, iv2a_ch_names):
     """Smoke test: every mode produces a float32 array of the same shape."""
     pytest.importorskip("mne")
-    # small_X has C=8, but iv2a fixture is C=22 — build graph for 8 random
-    # channels from standard_1005 instead. Include REST so the 'rest' mode
-    # has its transformation matrix available.
-    g = build_graph(iv2a_ch_names[:8], k=4, include_rest=True)
+    from refshift.reference import _GRAPH_MODES
+    # small_X has C=8. Pick an 8-channel subset that includes Cz so that
+    # cz_ref is exercised by the roundtrip; the rest of the operators
+    # don't care which 8 channels are chosen.
+    chs8 = ["Fz", "FC1", "FCz", "FC2", "C3", "Cz", "C4", "Pz"]
+    assert all(c in iv2a_ch_names for c in chs8)
+    g = build_graph(chs8, k=4, include_rest=True)
     for mode in REFERENCE_MODES:
-        needs_graph = mode in ("laplacian", "nn_diff", "rest")
+        needs_graph = mode in _GRAPH_MODES
         t = ReferenceTransformer(mode=mode, graph=g if needs_graph else None)
         out = t.fit_transform(small_X)
         assert out.shape == small_X.shape
@@ -317,3 +281,101 @@ def test_rest_2d_and_3d_shapes_equivalent(small_X, iv2a_ch_names):
     Y2 = apply_reference(single, "rest", graph=g)
     Y3 = apply_reference(small_X[:1], "rest", graph=g)[0]
     np.testing.assert_allclose(Y2, Y3, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# cz_ref (single-electrode reference using Cz)
+# ---------------------------------------------------------------------------
+
+def test_cz_idx_populated_when_cz_present():
+    """build_graph stores the index of 'Cz' in the channel order, or
+    None when Cz is absent."""
+    pytest.importorskip("mne")
+    chs = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
+    g = build_graph(chs, k=4, include_rest=False)
+    assert g.cz_idx == 2
+
+    # No Cz -> cz_idx = None (Schirrmeister-style case)
+    chs_no_cz = ["Fz", "FC3", "FC1", "FCz", "C3", "C4", "CP3", "Pz"]
+    assert "Cz" not in chs_no_cz
+    g2 = build_graph(chs_no_cz, k=4, include_rest=False)
+    assert g2.cz_idx is None
+
+
+def test_cz_ref_zeros_the_cz_channel(small_X):
+    """After cz_ref, the Cz row is identically zero."""
+    pytest.importorskip("mne")
+    chs = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
+    g = build_graph(chs, k=4, include_rest=False)
+    Y = apply_reference(small_X, "cz_ref", graph=g)
+    assert Y.shape == small_X.shape
+    cz = g.cz_idx
+    np.testing.assert_array_equal(Y[:, cz, :], 0.0)
+
+
+def test_cz_ref_linear_relationship():
+    """Y_i = X_i - X_{Cz} exactly. Verify against direct computation."""
+    pytest.importorskip("mne")
+    chs = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
+    g = build_graph(chs, k=4, include_rest=False)
+    rng = np.random.default_rng(42)
+    X = rng.standard_normal((3, len(chs), 64)).astype(np.float32)
+    Y = apply_reference(X, "cz_ref", graph=g)
+    cz = g.cz_idx
+    expected = X - X[:, cz:cz + 1, :]
+    np.testing.assert_allclose(Y, expected, atol=1e-6)
+
+
+def test_cz_ref_rank_is_c_minus_one():
+    """The cz_ref operator (I - 1_C e_{Cz}^T) has rank C-1."""
+    pytest.importorskip("mne")
+    chs = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
+    g = build_graph(chs, k=4, include_rest=False)
+    C = len(chs)
+    # Recover the operator matrix via a Gaussian probe
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((1, C, 200)).astype(np.float32)
+    Y = apply_reference(X, "cz_ref", graph=g)
+    A = Y[0] @ np.linalg.pinv(X[0])
+    assert np.linalg.matrix_rank(A) == C - 1
+
+
+def test_cz_ref_idempotent():
+    """cz_ref(cz_ref(X)) == cz_ref(X). Once Cz is zero, subtracting Cz again
+    is a no-op."""
+    pytest.importorskip("mne")
+    chs = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
+    g = build_graph(chs, k=4, include_rest=False)
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((2, len(chs), 32)).astype(np.float32)
+    Y = apply_reference(X, "cz_ref", graph=g)
+    Y2 = apply_reference(Y, "cz_ref", graph=g)
+    np.testing.assert_allclose(Y, Y2, atol=1e-6)
+
+
+def test_cz_ref_raises_when_cz_absent():
+    """If Cz isn't in the channel set, apply_reference and the transformer
+    both raise an informative ValueError that mentions Schirrmeister."""
+    pytest.importorskip("mne")
+    chs_no_cz = ["Fz", "FC3", "FC1", "FCz", "C3", "C4", "CP3", "Pz"]
+    g = build_graph(chs_no_cz, k=4, include_rest=False)
+
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((1, len(chs_no_cz), 16)).astype(np.float32)
+
+    with pytest.raises(ValueError, match="cz_idx=None"):
+        apply_reference(X, "cz_ref", graph=g)
+    with pytest.raises(ValueError, match="cz_idx=None"):
+        ReferenceTransformer(mode="cz_ref", graph=g).fit(X)
+
+
+def test_cz_ref_2d_and_3d_shapes_equivalent():
+    """cz_ref on [C, T] equals cz_ref on [1, C, T] squeezed."""
+    pytest.importorskip("mne")
+    chs = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
+    g = build_graph(chs, k=4, include_rest=False)
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((1, len(chs), 32)).astype(np.float32)
+    Y2 = apply_reference(X[0], "cz_ref", graph=g)
+    Y3 = apply_reference(X, "cz_ref", graph=g)[0]
+    np.testing.assert_allclose(Y2, Y3, atol=1e-6)

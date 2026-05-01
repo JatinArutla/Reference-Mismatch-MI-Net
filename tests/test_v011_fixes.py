@@ -306,7 +306,7 @@ def test_operator_distance_correlation_returns_ci_and_perm_p():
     # Synthetic 6x6 mean matrix (diagonal much higher than off-diagonal,
     # with mild noise so the gap is not constant — otherwise spearmanr
     # warns harmlessly on every bootstrap and permutation iteration).
-    refs = ["native", "car", "median", "laplacian", "nn_diff", "rest"]
+    refs = ["native", "car", "median", "laplacian", "rest", "cz_ref"]
     rng = np.random.default_rng(0)
     M = 0.4 + 0.05 * rng.standard_normal((6, 6))
     np.fill_diagonal(M, 0.7)
@@ -388,10 +388,10 @@ def test_setup_dl_run_includes_rest_only_when_requested():
 
     with patch("refshift.experiments._resolve_dataset",
                return_value=(fake_ds, fake_paradigm)):
-        # laplacian + nn_diff but no rest -> graph built without rest matrix
+        # laplacian + cz_ref but no rest -> graph built without rest matrix
         ctx = _setup_dl_run(
             "iv2a", subjects=None, seeds=[0],
-            reference_modes_for_graph=("laplacian", "nn_diff"),
+            reference_modes_for_graph=("laplacian", "cz_ref"),
             progress=False,
         )
         assert ctx.graph is not None

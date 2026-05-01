@@ -287,13 +287,13 @@ def load_dl_data(
     # pipeline (pre_ems_reference=None), reference operators are applied
     # to the windowed and standardized X — after EMS — by run_mismatch.
     if pre_ems_reference is not None:
-        from refshift.reference import apply_reference, build_graph
+        from refshift.reference import apply_reference, build_graph, _GRAPH_MODES
 
         def _apply_pre_ems_ref(raw):
             """Re-reference the continuous Raw in place. Modifies
             ``raw._data`` directly to keep mne metadata consistent."""
             ch_names = list(raw.info["ch_names"])
-            needs_graph = pre_ems_reference in ("laplacian", "nn_diff", "rest")
+            needs_graph = pre_ems_reference in _GRAPH_MODES
             graph = build_graph(
                 ch_names, include_rest=(pre_ems_reference == "rest"),
             ) if needs_graph else None

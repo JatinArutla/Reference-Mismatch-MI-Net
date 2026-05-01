@@ -114,8 +114,8 @@ def test_transform_uses_multiple_modes_per_batch():
     """With all allowed modes and a 64-trial batch, we should observe at
     least a few distinct modes' fingerprints in the output. We test this
     by checking that not all output samples have zero channel-mean —
-    which would imply every sample got CAR / median / Laplacian /
-    NN-diff / REST, but never native (extremely unlikely under uniform
+    which would imply every sample got CAR / median / Laplacian / REST,
+    but never native or cz_ref (extremely unlikely under uniform
     sampling).
     """
     from refshift.jitter import make_random_reference_transform
@@ -125,8 +125,9 @@ def test_transform_uses_multiple_modes_per_batch():
     X_t, _ = t(torch.from_numpy(X), torch.from_numpy(y))
     # Per-sample channel means
     means = np.abs(X_t.numpy().mean(axis=1)).max(axis=1)  # (B,)
-    # Some samples should retain a non-zero channel mean (native, Laplacian
-    # or NN-diff leave channel mean non-zero in general; CAR/median/REST do not).
+    # Some samples should retain a non-zero channel mean (native, Laplacian,
+    # or cz_ref leave channel mean non-zero in general; CAR/median/REST
+    # explicitly zero it).
     assert (means > 1e-3).any(), "No sample retained non-zero channel mean"
 
 

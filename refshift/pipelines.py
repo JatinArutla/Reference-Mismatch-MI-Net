@@ -40,7 +40,7 @@ def make_csp_lda_pipeline(
         ``CSP.yml`` pipeline. If a mode string, a ReferenceTransformer(mode)
         is inserted at the front of the pipeline.
     graph : DatasetGraph or None
-        Required when reference_mode is 'laplacian', 'nn_diff', or 'rest'.
+        Required when reference_mode is 'laplacian', 'rest', or 'cz_ref'.
     n_filters : int
         Number of CSP spatial filters. MOABB default is 6.
     """

@@ -225,7 +225,7 @@ def _estimate_linear_operator(
     For each op we compute Y = op(X) on a random Gaussian probe X, then
     solve A = Y @ pinv(X). This gives the best linear approximation in
     the least-squares sense. For genuinely linear ops (native, CAR, REST,
-    kNN-Laplacian, NN-diff) this recovers the operator exactly. For
+    kNN-Laplacian, cz_ref) this recovers the operator exactly. For
     median (non-linear), it returns the linear tangent, which equals CAR
     in expectation — the honest linearization. With ``n_probes > 1`` the
     estimate is averaged across independent Gaussian probes, which
@@ -248,9 +248,9 @@ class OperatorDistanceResult:
 
     spearman_rho, pearson_r are point estimates on the upper triangle.
     spearman_p, pearson_p are asymptotic p-values; with n=15 pairs (6
-    operators) these are unreliable, so we additionally compute a
-    permutation p-value (perm_p_spearman, perm_p_pearson) by shuffling
-    the operator labels of the gap matrix and recomputing the
+    operators) these are unreliable at small-sample, so we additionally
+    compute a permutation p-value (perm_p_spearman, perm_p_pearson) by
+    shuffling the operator labels of the gap matrix and recomputing the
     correlation many times. ci95_spearman / ci95_pearson are
     bootstrap-resampled 95% confidence intervals on the correlations
     over pairs.
@@ -291,7 +291,8 @@ def operator_distance_correlation(
       2. Compute pairwise Frobenius distances between operators.
       3. Compute transfer gaps from the mean matrix:
          ``gap_ij = diag_mean - 0.5*(M_ij + M_ji)``.
-      4. Correlate the upper triangle (n=15 pairs for 6 references).
+      4. Correlate the upper triangle (n=15 pairs for 6 references;
+         n=10 if the caller drops cz_ref, e.g. on Schirrmeister2017).
       5. Bootstrap CIs over the pairs (resampling pairs with replacement).
       6. Permutation test by shuffling operator labels of the gap matrix
          while keeping the distance matrix fixed.
