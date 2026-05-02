@@ -17,7 +17,7 @@ around braindecode's canonical MOABB loader.
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -83,7 +83,10 @@ _SCHIRRMEISTER_MOTOR_CHANNELS = (
 )
 
 
-def _resolve_dataset(dataset_id: str):
+def _resolve_dataset(
+    dataset_id: str,
+    classes: Optional[Sequence[str]] = None,
+):
     """Return (dataset, paradigm) for a short dataset_id.
 
     The dataset's ``subject_list`` is filtered to drop any IDs in
@@ -94,23 +97,79 @@ def _resolve_dataset(dataset_id: str):
     OpenBMI requires a configured ``Lee2019_MI`` to expose all 400
     trials/subject; the configuration is in ``refshift.compat`` so the
     DL path can share it.
+
+    Parameters
+    ----------
+    dataset_id : str
+        One of ``DATASET_IDS``.
+    classes : sequence of str or None
+        Class subset to load. Defaults to None (= dataset's full class set:
+        4 classes for iv2a/schirrmeister2017, 2 classes for the others).
+        When provided, must be a non-empty subset of the dataset's classes.
+        For iv2a and schirrmeister2017 this is wired into MOABB's
+        ``MotorImagery(events=...)`` argument so the paradigm only loads
+        trials with these labels. For LeftRightImagery datasets (openbmi,
+        cho2017, dreyer2023) the only valid non-default value is
+        ``("left_hand", "right_hand")``, which is a no-op (already
+        the paradigm's full set); any other class set raises ``ValueError``
+        because LeftRightImagery datasets don't contain other classes.
+
+    Notes
+    -----
+    Used for the binary-reduction ablation: passing
+    ``classes=("left_hand", "right_hand")`` on iv2a or schirrmeister2017
+    produces a binary version of the 4-class paradigm, useful for
+    isolating task-complexity effects on reference-mismatch gaps from
+    other dataset-specific factors.
     """
     dataset_id = dataset_id.lower()
+    classes_t = tuple(classes) if classes is not None else None
+
+    # Per-paradigm validation of the classes argument.
+    _IV2A_CLASSES = ("left_hand", "right_hand", "feet", "tongue")
+    _SCHIRR_CLASSES = ("left_hand", "right_hand", "feet", "rest")
+    _LR_CLASSES = ("left_hand", "right_hand")
+
+    def _validate_classes(allowed: Tuple[str, ...]) -> None:
+        if classes_t is None:
+            return
+        if len(classes_t) == 0:
+            raise ValueError("classes=() is empty; pass None for default.")
+        unknown = [c for c in classes_t if c not in allowed]
+        if unknown:
+            raise ValueError(
+                f"Unknown classes for {dataset_id}: {unknown}. "
+                f"Allowed: {allowed}"
+            )
+        if len(set(classes_t)) < 2:
+            raise ValueError(
+                f"classes={classes_t} has fewer than 2 distinct labels; "
+                f"need at least 2 for a classification task."
+            )
+
     if dataset_id == "iv2a":
         from moabb.datasets import BNCI2014_001
         from moabb.paradigms import MotorImagery
-        ds, paradigm = BNCI2014_001(), MotorImagery(n_classes=4)
+        _validate_classes(_IV2A_CLASSES)
+        if classes_t is None:
+            paradigm = MotorImagery(n_classes=4)
+        else:
+            paradigm = MotorImagery(events=list(classes_t))
+        ds = BNCI2014_001()
     elif dataset_id == "openbmi":
         from moabb.paradigms import LeftRightImagery
         from refshift.compat import make_openbmi_dataset
+        _validate_classes(_LR_CLASSES)
         ds, paradigm = make_openbmi_dataset(), LeftRightImagery()
     elif dataset_id == "cho2017":
         from moabb.datasets import Cho2017
         from moabb.paradigms import LeftRightImagery
+        _validate_classes(_LR_CLASSES)
         ds, paradigm = Cho2017(), LeftRightImagery()
     elif dataset_id == "dreyer2023":
         from moabb.datasets import Dreyer2023
         from moabb.paradigms import LeftRightImagery
+        _validate_classes(_LR_CLASSES)
         ds, paradigm = Dreyer2023(), LeftRightImagery()
     elif dataset_id == "schirrmeister2017":
         from moabb.datasets import Schirrmeister2017
@@ -131,12 +190,16 @@ def _resolve_dataset(dataset_id: str):
         # Nyquist and incurs no signal loss. Resampling halves the per-trial
         # sample count (2000 -> 1000), keeping Shallow's ``filter_time_length``
         # in the same physical-time regime as on IV-2a (~100 ms).
+        _validate_classes(_SCHIRR_CLASSES)
         ds = Schirrmeister2017()
-        paradigm = MotorImagery(
-            n_classes=4,
+        paradigm_kwargs = dict(
             channels=_SCHIRRMEISTER_MOTOR_CHANNELS,
             resample=250.0,
         )
+        if classes_t is None:
+            paradigm = MotorImagery(n_classes=4, **paradigm_kwargs)
+        else:
+            paradigm = MotorImagery(events=list(classes_t), **paradigm_kwargs)
     else:
         raise ValueError(
             f"Unknown dataset_id: {dataset_id!r}. Known: {DATASET_IDS}"
@@ -521,6 +584,7 @@ def run_mismatch(
     subjects: Optional[List[int]] = None,
     seeds: List[int] = (0,),
     reference_modes: tuple = REFERENCE_MODES,
+    classes: Optional[Sequence[str]] = None,
     split_strategy: str = "auto",
     n_filters: int = 6,
     laplacian_k: int = 4,
@@ -565,6 +629,18 @@ def run_mismatch(
         session-split datasets, seeds are near-redundant.
     reference_modes : tuple of str
         Subset of REFERENCE_MODES to evaluate. Order is preserved.
+    classes : sequence of str or None, default None
+        Class subset for the paradigm. ``None`` uses the dataset's full
+        class set (4 classes for iv2a/schirrmeister2017, 2 classes for
+        openbmi/cho2017/dreyer2023). Used for the binary-reduction
+        ablation: passing ``classes=("left_hand", "right_hand")`` on
+        iv2a or schirrmeister2017 produces a binary version of the
+        4-class paradigm, which isolates task-complexity effects from
+        other dataset-specific factors when comparing reference-mismatch
+        gaps across datasets. Currently supported for ``model='csp_lda'``
+        only; the DL path raises NotImplementedError because plumbing
+        the class subset through ``refshift.dl.load_dl_data`` is a
+        separate change.
     split_strategy : {'auto', 'session', 'stratify'}
         'auto' picks 'session' if the subject has >1 session, else 'stratify' 80/20.
     n_filters, laplacian_k, montage : Phase 1 knobs (CSP+LDA only / graph build).
@@ -596,6 +672,15 @@ def run_mismatch(
                 f"Known: 'csp_lda', {SUPPORTED_DL_MODELS}."
             )
         is_dl = True
+
+    if classes is not None and is_dl:
+        raise NotImplementedError(
+            f"classes={classes!r} is currently only supported for "
+            f"model='csp_lda', not for {model!r}. Threading the class "
+            f"subset through the DL data loader (refshift.dl.load_dl_data) "
+            f"is a separate change. Run the binary-reduction ablation "
+            f"with model='csp_lda' for now."
+        )
 
     modes = tuple(reference_modes)
     rows: List[dict] = []
@@ -663,7 +748,7 @@ def run_mismatch(
     # CSP+LDA path: paradigm.get_data is its own data loader and the loop
     # is simple enough to keep inline. The helpers above target the DL
     # path specifically.
-    dataset, paradigm = _resolve_dataset(dataset_id)
+    dataset, paradigm = _resolve_dataset(dataset_id, classes=classes)
     if subjects is None:
         subjects = list(dataset.subject_list)
     seeds = list(seeds)

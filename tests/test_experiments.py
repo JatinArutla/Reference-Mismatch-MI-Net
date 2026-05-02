@@ -180,3 +180,109 @@ def test_split_train_test_session_strategy_unchanged():
     assert Xtr.shape == (2, 2, 10)
     np.testing.assert_array_equal(ytr, [0, 1])  # session '0'
     np.testing.assert_array_equal(yte, [0, 1])  # session '1'
+
+
+# ---------------------------------------------------------------------------
+# classes argument: binary-reduction ablation support (v0.13.1)
+# ---------------------------------------------------------------------------
+
+def test_resolve_dataset_default_classes_unchanged_iv2a():
+    """When classes is None (default), iv2a uses MotorImagery(n_classes=4).
+    This is a regression guard: the binary-reduction PR must not
+    silently change the default 4-class behaviour."""
+    from refshift.experiments import _resolve_dataset
+    _, paradigm = _resolve_dataset("iv2a")
+    # MotorImagery records its events list in self.events. With n_classes=4
+    # and no explicit events list, events is None and n_classes drives the
+    # selection.
+    assert getattr(paradigm, "n_classes", None) == 4
+    # If MOABB ever adds an events attribute that's set under n_classes=4,
+    # this would catch it. For now we just assert n_classes.
+
+
+def test_resolve_dataset_classes_binary_iv2a():
+    """Passing classes=('left_hand', 'right_hand') to iv2a builds a
+    paradigm with explicit events instead of n_classes."""
+    pytest.importorskip("moabb")
+    from refshift.experiments import _resolve_dataset
+    _, paradigm = _resolve_dataset(
+        "iv2a", classes=("left_hand", "right_hand"),
+    )
+    # When events is explicitly set, MotorImagery uses it for filtering.
+    assert paradigm.events == ["left_hand", "right_hand"]
+
+
+def test_resolve_dataset_classes_binary_schirrmeister():
+    """Same for schirrmeister2017: classes=('left_hand','right_hand')
+    produces a 2-class paradigm while preserving channel and resample
+    settings."""
+    pytest.importorskip("moabb")
+    from refshift.experiments import _resolve_dataset, _SCHIRRMEISTER_MOTOR_CHANNELS
+    _, paradigm = _resolve_dataset(
+        "schirrmeister2017", classes=("left_hand", "right_hand"),
+    )
+    assert paradigm.events == ["left_hand", "right_hand"]
+    # Critical: channel selection and resample must survive the classes branch.
+    assert tuple(paradigm.channels) == tuple(_SCHIRRMEISTER_MOTOR_CHANNELS)
+    assert paradigm.resample == 250.0
+
+
+def test_resolve_dataset_classes_unknown_label_raises():
+    """Passing a label not in the dataset's class set raises ValueError
+    with a clear message."""
+    from refshift.experiments import _resolve_dataset
+    with pytest.raises(ValueError, match="Unknown classes"):
+        _resolve_dataset("iv2a", classes=("left_hand", "not_a_real_class"))
+
+
+def test_resolve_dataset_classes_singleton_raises():
+    """A single-class subset isn't a classification task; raise."""
+    from refshift.experiments import _resolve_dataset
+    with pytest.raises(ValueError, match="fewer than 2"):
+        _resolve_dataset("iv2a", classes=("left_hand",))
+
+
+def test_resolve_dataset_classes_empty_raises():
+    """An empty class subset is rejected with a different message
+    pointing at the right fix (pass None for default)."""
+    from refshift.experiments import _resolve_dataset
+    with pytest.raises(ValueError, match="empty"):
+        _resolve_dataset("iv2a", classes=())
+
+
+def test_resolve_dataset_classes_rejects_invalid_for_lr_paradigm():
+    """LeftRightImagery datasets only contain left_hand and right_hand;
+    asking for 'feet' on cho2017 must raise rather than silently produce
+    an empty paradigm."""
+    pytest.importorskip("moabb")
+    from refshift.experiments import _resolve_dataset
+    with pytest.raises(ValueError, match="Unknown classes"):
+        _resolve_dataset("cho2017", classes=("left_hand", "feet"))
+
+
+def test_resolve_dataset_classes_lr_default_pair_is_noop():
+    """Passing the LeftRightImagery datasets' own class set is a no-op,
+    not an error. This lets users write portable binary-reduction code
+    without dataset-specific branching."""
+    pytest.importorskip("moabb")
+    from refshift.experiments import _resolve_dataset
+    # Should not raise:
+    _, paradigm = _resolve_dataset(
+        "cho2017", classes=("left_hand", "right_hand"),
+    )
+    # LeftRightImagery's class set is fixed; we just verify the call worked.
+    assert paradigm is not None
+
+
+def test_run_mismatch_classes_rejected_for_dl_path():
+    """The DL path doesn't yet support class subsetting; calling it with
+    classes= must raise NotImplementedError (not a silent fallback to
+    full 4-class data) so users notice the gap."""
+    pytest.importorskip("moabb")
+    from refshift import run_mismatch
+    with pytest.raises(NotImplementedError, match="csp_lda"):
+        run_mismatch(
+            "iv2a", model="shallow",
+            classes=("left_hand", "right_hand"),
+            seeds=[0],
+        )
