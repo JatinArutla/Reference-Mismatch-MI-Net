@@ -154,7 +154,12 @@ def _resolve_dataset(
         if classes_t is None:
             paradigm = MotorImagery(n_classes=4)
         else:
-            paradigm = MotorImagery(events=list(classes_t))
+            # MOABB requires n_classes to match the events list length:
+            # ``used_events`` does ``len(out) < self.n_classes`` which
+            # crashes if n_classes is None. Pass both explicitly.
+            paradigm = MotorImagery(
+                events=list(classes_t), n_classes=len(classes_t),
+            )
         ds = BNCI2014_001()
     elif dataset_id == "openbmi":
         from moabb.paradigms import LeftRightImagery
@@ -199,7 +204,11 @@ def _resolve_dataset(
         if classes_t is None:
             paradigm = MotorImagery(n_classes=4, **paradigm_kwargs)
         else:
-            paradigm = MotorImagery(events=list(classes_t), **paradigm_kwargs)
+            paradigm = MotorImagery(
+                events=list(classes_t),
+                n_classes=len(classes_t),
+                **paradigm_kwargs,
+            )
     else:
         raise ValueError(
             f"Unknown dataset_id: {dataset_id!r}. Known: {DATASET_IDS}"

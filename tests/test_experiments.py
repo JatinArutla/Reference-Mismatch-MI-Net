@@ -202,26 +202,33 @@ def test_resolve_dataset_default_classes_unchanged_iv2a():
 
 def test_resolve_dataset_classes_binary_iv2a():
     """Passing classes=('left_hand', 'right_hand') to iv2a builds a
-    paradigm with explicit events instead of n_classes."""
+    paradigm with explicit events instead of n_classes=4.
+
+    Also verifies n_classes is set to match events length: MOABB's
+    ``MotorImagery.used_events`` compares ``len(out) < self.n_classes``
+    and crashes with TypeError if n_classes is None when events is set.
+    Always passing both is the workaround.
+    """
     pytest.importorskip("moabb")
     from refshift.experiments import _resolve_dataset
     _, paradigm = _resolve_dataset(
         "iv2a", classes=("left_hand", "right_hand"),
     )
-    # When events is explicitly set, MotorImagery uses it for filtering.
     assert paradigm.events == ["left_hand", "right_hand"]
+    assert paradigm.n_classes == 2  # MOABB workaround
 
 
 def test_resolve_dataset_classes_binary_schirrmeister():
     """Same for schirrmeister2017: classes=('left_hand','right_hand')
     produces a 2-class paradigm while preserving channel and resample
-    settings."""
+    settings, and n_classes matches len(events) (MOABB workaround)."""
     pytest.importorskip("moabb")
     from refshift.experiments import _resolve_dataset, _SCHIRRMEISTER_MOTOR_CHANNELS
     _, paradigm = _resolve_dataset(
         "schirrmeister2017", classes=("left_hand", "right_hand"),
     )
     assert paradigm.events == ["left_hand", "right_hand"]
+    assert paradigm.n_classes == 2  # MOABB workaround
     # Critical: channel selection and resample must survive the classes branch.
     assert tuple(paradigm.channels) == tuple(_SCHIRRMEISTER_MOTOR_CHANNELS)
     assert paradigm.resample == 250.0
