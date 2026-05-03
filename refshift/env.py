@@ -424,6 +424,7 @@ def _setup_schirrmeister_symlinks(mne_data_path: Path, verbose: bool) -> int:
 
 
 
+def _patch_moabb_dreyer_no_unzip(verbose: bool) -> None:
     """Replace ``Dreyer2023.download_by_subject`` with a variant that skips
     the unzip loop. The download loop (for BIDS metadata files listed in
     the manifest) is preserved. Idempotent — safe to call multiple times.
