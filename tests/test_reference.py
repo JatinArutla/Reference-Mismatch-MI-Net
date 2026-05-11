@@ -72,14 +72,11 @@ def test_median_residual_channel_median_is_zero(small_X):
     assert np.max(np.abs(resid)) < 1e-5
 
 
-def test_2d_and_3d_shapes_equivalent(small_X):
-    """Calling with [C, T] should give the same result as calling with
-    [1, C, T] and squeezing."""
-    single = small_X[0]                      # [C, T]
-    for mode in ("native", "car", "median"):
-        Y2 = apply_reference(single, mode)
-        Y3 = apply_reference(small_X[:1], mode)[0]
-        np.testing.assert_allclose(Y2, Y3, atol=1e-6)
+def test_2d_input_rejected(small_X):
+    """Ops only accept (N, C, T). 2D inputs raise (was supported in v0.13;
+    dropped because nothing in the experimental pipeline uses it)."""
+    with pytest.raises(ValueError, match="N, C, T"):
+        apply_reference(small_X[0], "car")
 
 
 def test_gs_no_longer_in_reference_modes():
@@ -106,16 +103,15 @@ def test_gs_no_longer_in_reference_modes():
 def test_laplacian_hand_case():
     """3 channels, k=2 => every channel's Laplacian reference is the mean
     of the other two."""
-    X = np.array([[1.0, 2.0],
-                  [3.0, 4.0],
-                  [5.0, 6.0]], dtype=np.float32)  # [C=3, T=2]
-    # Each row's 2 nearest neighbors are the other two rows (index set).
+    X = np.array([[[1.0, 2.0],
+                   [3.0, 4.0],
+                   [5.0, 6.0]]], dtype=np.float32)  # [N=1, C=3, T=2]
     lap_idx = np.array([[1, 2],
                         [0, 2],
                         [0, 1]], dtype=np.int64)
     from refshift.reference import _laplacian  # noqa: PLC0415
     Y = _laplacian(X, lap_idx)
-    expected = np.array([[-3, -3], [0, 0], [3, 3]], dtype=np.float32)
+    expected = np.array([[[-3, -3], [0, 0], [3, 3]]], dtype=np.float32)
     np.testing.assert_allclose(Y, expected, atol=1e-6)
 
 
@@ -169,13 +165,13 @@ def test_transformer_is_sklearn_compatible(small_X):
 
 
 def test_transformer_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="Unknown mode"):
-        ReferenceTransformer(mode="reref_wisdom").fit(np.zeros((1, 4, 8)))
+    with pytest.raises(ValueError, match="Unknown reference mode"):
+        ReferenceTransformer(mode="reref_wisdom").transform(np.zeros((1, 4, 8)))
 
 
 def test_transformer_spatial_requires_graph():
-    with pytest.raises(ValueError, match="requires graph"):
-        ReferenceTransformer(mode="laplacian").fit(np.zeros((1, 4, 8)))
+    with pytest.raises(ValueError, match="requires a DatasetGraph"):
+        ReferenceTransformer(mode="laplacian").transform(np.zeros((1, 4, 8)))
 
 
 def test_transformer_roundtrip_all_modes(small_X, iv2a_ch_names):
@@ -270,17 +266,8 @@ def test_rest_requires_include_rest_graph():
     iv2a = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
     g = build_graph(iv2a, k=4, include_rest=False)
     with pytest.raises(ValueError, match="include_rest=True"):
-        ReferenceTransformer(mode="rest", graph=g).fit(np.zeros((1, 8, 16)))
+        ReferenceTransformer(mode="rest", graph=g).transform(np.zeros((1, 8, 16)))
 
-
-def test_rest_2d_and_3d_shapes_equivalent(small_X, iv2a_ch_names):
-    """REST on [C, T] equals REST on [1, C, T] squeezed, same as other modes."""
-    pytest.importorskip("mne")
-    g = build_graph(iv2a_ch_names[:8], k=4, include_rest=True)
-    single = small_X[0]  # [C, T]
-    Y2 = apply_reference(single, "rest", graph=g)
-    Y3 = apply_reference(small_X[:1], "rest", graph=g)[0]
-    np.testing.assert_allclose(Y2, Y3, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -366,16 +353,4 @@ def test_cz_ref_raises_when_cz_absent():
     with pytest.raises(ValueError, match="cz_idx=None"):
         apply_reference(X, "cz_ref", graph=g)
     with pytest.raises(ValueError, match="cz_idx=None"):
-        ReferenceTransformer(mode="cz_ref", graph=g).fit(X)
-
-
-def test_cz_ref_2d_and_3d_shapes_equivalent():
-    """cz_ref on [C, T] equals cz_ref on [1, C, T] squeezed."""
-    pytest.importorskip("mne")
-    chs = ["Fz", "C3", "Cz", "C4", "CP3", "Pz", "POz", "FCz"]
-    g = build_graph(chs, k=4, include_rest=False)
-    rng = np.random.default_rng(0)
-    X = rng.standard_normal((1, len(chs), 32)).astype(np.float32)
-    Y2 = apply_reference(X[0], "cz_ref", graph=g)
-    Y3 = apply_reference(X, "cz_ref", graph=g)[0]
-    np.testing.assert_allclose(Y2, Y3, atol=1e-6)
+        ReferenceTransformer(mode="cz_ref", graph=g).transform(X)

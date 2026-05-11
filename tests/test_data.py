@@ -1,4 +1,4 @@
-"""Unit tests for the preprocessed-tensor disk cache in refshift.dl.
+"""Unit tests for the preprocessed-tensor disk cache in refshift.data.
 
 Synthetic-only — no MOABB / network. Skipped without Phase 2 extras.
 """
@@ -29,6 +29,9 @@ def _params(**overrides):
         trial_start_offset_s=0.0,
         trial_stop_offset_s=0.0,
         pre_ems_reference=None,
+        pre_ems_laplacian_k=4,
+        pre_ems_montage="standard_1005",
+        classes="left_hand,right_hand,feet,tongue",
     )
     base.update(overrides)
     return base
@@ -49,7 +52,7 @@ def _synthetic(seed: int = 0):
 # ---- _cache_path: stable hashing across param changes -----------------------
 
 def test_cache_path_deterministic():
-    from refshift.dl import _cache_path
+    from refshift.data import _cache_path
     with tempfile.TemporaryDirectory() as tmp:
         a = _cache_path(tmp, _params())
         b = _cache_path(tmp, _params())
@@ -63,7 +66,7 @@ def test_cache_path_differs_by_dataset_subject_filter_offsets():
     fix, where pre_ems_reference was set in params but missing from the
     cache key tuple.
     """
-    from refshift.dl import _cache_path
+    from refshift.data import _cache_path
     with tempfile.TemporaryDirectory() as tmp:
         ref = _cache_path(tmp, _params())
         for override in (
@@ -84,7 +87,7 @@ def test_cache_path_differs_by_dataset_subject_filter_offsets():
 
 def test_cache_path_directory_layout():
     """Files live under cache_dir/<dataset_id>/sub-<NNN>/<hash>.npz."""
-    from refshift.dl import _cache_path
+    from refshift.data import _cache_path
     with tempfile.TemporaryDirectory() as tmp:
         path = _cache_path(tmp, _params(dataset_id="openbmi", subject=53))
         assert path.startswith(os.path.join(tmp, "openbmi", "sub-053"))
@@ -104,7 +107,7 @@ def test_cache_round_trip_via_load_dl_data(monkeypatch):
     monkeypatched into braindecode.datasets.MOABBDataset that fails the test
     if invoked.
     """
-    from refshift import dl as dl_mod
+    from refshift import data as dl_mod
 
     with tempfile.TemporaryDirectory() as tmp:
         params = _params()
@@ -142,7 +145,7 @@ def test_cache_round_trip_via_load_dl_data(monkeypatch):
 def test_cache_disabled_calls_braindecode(monkeypatch):
     """When cache_dir=None, braindecode is invoked even when a cache
     happens to be sitting in the default location."""
-    from refshift import dl as dl_mod
+    from refshift import data as dl_mod
 
     called = {"flag": False}
 
@@ -161,7 +164,7 @@ def test_cache_disabled_calls_braindecode(monkeypatch):
 def test_corrupt_cache_falls_through_to_preprocess(monkeypatch):
     """If a cache file is corrupt (not a valid .npz), load_dl_data should
     fall through to the preprocess path rather than crash."""
-    from refshift import dl as dl_mod
+    from refshift import data as dl_mod
 
     with tempfile.TemporaryDirectory() as tmp:
         params = _params()
@@ -206,3 +209,43 @@ def test_run_mismatch_jitter_signature_includes_dl_cache_dir():
 
 
 # ---- Cache file shape: round trip preserves all fields ---------------------
+
+
+# ---------------------------------------------------------------------------
+# Cache-key invariants (regressions originally caught in v0.11)
+# ---------------------------------------------------------------------------
+
+def test_cache_key_includes_pre_ems_reference():
+    """Without pre_ems_reference in the cache key, the EMS-control ablation
+    would silently read stale cache entries from pre_ems_reference=None.
+    """
+    from refshift.data import _CACHE_KEY_PARAMS
+    assert "pre_ems_reference" in _CACHE_KEY_PARAMS
+
+
+def test_cache_key_includes_resample():
+    """resample must be part of the cache key so different rates get
+    different cache entries.
+    """
+    from refshift.data import _CACHE_KEY_PARAMS
+    assert "resample" in _CACHE_KEY_PARAMS
+
+
+def test_cache_key_no_duplicates():
+    from refshift.data import _CACHE_KEY_PARAMS
+    assert len(_CACHE_KEY_PARAMS) == len(set(_CACHE_KEY_PARAMS))
+
+
+def test_schirrmeister_dl_pick_channels_uses_ordered_true():
+    """The DL preprocess for Schirrmeister must use ordered=True so X's
+    channel-axis order matches the graph's ch_names (paradigm.channels
+    order).
+    """
+    import inspect
+    from refshift import data
+    src = inspect.getsource(data.load_dl_data)
+    schirr_idx = src.find('"schirrmeister2017"')
+    assert schirr_idx >= 0
+    schirr_block = src[schirr_idx:schirr_idx + 1500]
+    assert "ordered=True" in schirr_block
+    assert "ordered=False" not in schirr_block

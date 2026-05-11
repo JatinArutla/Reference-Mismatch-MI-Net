@@ -73,14 +73,21 @@ reference operators in `run_mismatch`, because EMS happens in
 array. EMS is per-channel and adaptive; it does not commute with
 channel-mixing reference operators. The standard pipeline therefore
 measures "reference applied to EMS-standardized signals" rather than
-"reference applied to raw filtered signals, then standardized." The
+"reference applied to filtered signals, then standardized." The
 function `run_pre_ems_diagonal` runs the corresponding control: for
 each reference r, preprocess with r applied *before* EMS, train and
-test on the same r, return a per-reference diagonal (length equal to
-`len(reference_modes)`). Compare to the diagonal of `run_mismatch` to
-verify EMS-after-reference is not materially distorting per-reference
-accuracies. Use only as an ablation; the headline matrix uses the
-standard pipeline.
+test on the same r, return a per-reference diagonal. Compare to the
+diagonal of `run_mismatch` to verify EMS-after-reference is not
+materially distorting per-reference accuracies. Use only as an
+ablation; the headline matrix uses the standard pipeline.
+
+In v0.14 the order within the preprocess chain was corrected: the
+pre-EMS reference is now applied to the bandpass-filtered raw rather
+than the broadband raw. For linear operators (CAR, REST, kNN-Laplacian,
+cz_ref) the result is mathematically identical regardless of where in
+the linear-filtering chain the reference sits, but median is non-linear
+so order-of-operations matters. Earlier diagonal numbers for median
+under this control should be regarded as off-spec.
 
 **6. Naming throughout.** "kNN local Laplacian (not formal CSD)";
 "REST-like spherical-model re-reference (not validated against a
@@ -210,11 +217,11 @@ for Cho2017 only is removed.
     call (because `REFERENCE_MODES` always includes graph-requiring
     spatial modes). Fixed.
 
-  - `dl.py`'s Schirrmeister branch used `pick_channels(ordered=False)`
-    while `_get_eeg_channel_names` returns `paradigm.channels` in
-    user-supplied order (because MOABB's `RawToEpochs` calls
-    `pick_channels(ordered=True)`). The graph and X-axis-1 channel
-    orders therefore disagreed; the runtime assertion
+  - The Schirrmeister branch in `dl.py` (now `data.py`) used
+    `pick_channels(ordered=False)` while `_get_eeg_channel_names` returns
+    `paradigm.channels` in user-supplied order (because MOABB's
+    `RawToEpochs` calls `pick_channels(ordered=True)`). The graph and
+    X-axis-1 channel orders therefore disagreed; the runtime assertion
     `list(ch_names_subj) == graph.ch_names` would have caught it and
     crashed. Now `ordered=True`.
 
@@ -226,8 +233,8 @@ for Cho2017 only is removed.
     are invalidated by the key change (this is intentional — the
     contents change too).
 
-**4. Documentation alignment.** The previous `dl.py` module docstring
-asserted that applying linear references to the EMS-standardized
+**4. Documentation alignment.** The previous `dl.py` (now `data.py`) module
+docstring asserted that applying linear references to the EMS-standardized
 windowed tensor was "numerically equivalent to applying them in
 raw-space." This was false; CAR(EMS(X)) and EMS(CAR(X)) differ because
 EMS divides each channel by its own running standard deviation, so
@@ -307,7 +314,7 @@ filesystem).
 Kaggle's read-only `/kaggle/input` mount, this raises a `PermissionError`
 on first access.
 
-**Workaround.** `refshift.env._setup_dreyer_symlinks` mirrors the dataset
+**Workaround.** `refshift.kaggle._setup_dreyer_symlinks` mirrors the dataset
 directory with per-file symlinks under `/kaggle/working/mne_data/...`,
 which is writable. A monkey-patch of MOABB's `download_by_subject` skips
 the unzip step that would otherwise re-download files we've symlinked.

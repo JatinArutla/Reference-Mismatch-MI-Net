@@ -168,7 +168,7 @@ def test_transform_seed_reproducibility():
 def test_make_dl_model_with_transforms_runs(arch):
     """make_dl_model with transforms argument: AugmentedDataLoader is wired
     in and a 2-epoch fit + predict completes on synthetic data."""
-    from refshift.dl import make_dl_model
+    from refshift.model import make_dl_model
     from refshift.jitter import make_random_reference_transform
 
     g = _make_graph()

@@ -4,13 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "refshift"
-version = "0.13.3"
+version = "0.14.2"
 description = "Reference-shift experiments for motor-imagery EEG decoding."
 requires-python = ">=3.10"
 dependencies = [
-    # Pinned for reproducibility of the 65.99% IV-2a CSP+LDA calibration
-    # (see scripts/calibrate_csp_lda.py). Loosen only after re-verifying
-    # the calibration target on a newer MOABB version.
+    # MOABB pinned for reproducibility of the 65.99% IV-2a CSP+LDA calibration
+    # (verified at this version; loosen only after re-verifying the target).
     "moabb==1.5.0",
     "mne>=1.5",
     "pyriemann>=0.5",
@@ -24,9 +23,8 @@ dependencies = [
 
 [project.optional-dependencies]
 # Phase 2 DL dependencies. Install with `pip install -e '.[dl]'`.
-# Targets the braindecode 1.x API (`n_chans`/`n_outputs`/`n_times` model
-# parameters). If Kaggle's default resolves an older braindecode, pin
-# explicitly with `pip install 'braindecode>=1.0'`.
+# braindecode 1.12 renamed EEGNetv4 -> EEGNet (with v4 alias); 1.14 removes
+# the alias. refshift.model handles both via try/except, so >=1.0 is fine.
 dl = [
     "braindecode>=1.0",
     "torch>=2.0",

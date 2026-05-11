@@ -152,12 +152,12 @@ def test_operator_distance_correlation_positive_and_significant(
 ):
     """With synthetic data built from a clean family structure, the
     operator-distance ↔ transfer-gap correlation should be positive and
-    point in the expected direction. We use a loose p-value bar (0.20)
-    rather than the conventional 0.05 because with 7 references there
-    are only n=21 upper-triangle pairs, which limits the statistical
-    power of the rank-correlation test on synthetic data with realistic
-    noise. The headline check is the *direction* of the correlation;
-    sign-flips or broken math would be caught by the ρ>0.4 assertion.
+    point in the expected direction. Loose p-value bar (0.20) rather than
+    0.05: with 6 references there are only n=15 upper-triangle pairs,
+    which limits the statistical power of the rank-correlation test on
+    synthetic data with realistic noise. The headline check is the
+    *direction* of the correlation; sign-flips or broken math would be
+    caught by the ρ>0.4 assertion.
     """
     pytest.importorskip("mne")
     result = operator_distance_correlation(
@@ -169,7 +169,7 @@ def test_operator_distance_correlation_positive_and_significant(
     )
     assert result.spearman_p < 0.20, (
         f"Expected directionally significant correlation (p<0.20 with "
-        f"n=21 pairs), got p={result.spearman_p:.3f}"
+        f"n=15 pairs), got p={result.spearman_p:.3f}"
     )
 
 
@@ -205,3 +205,40 @@ def test_operator_distance_identity_row_is_small(synthetic_mean_matrix, iv2a_ch_
     assert result.distances_frobenius[i, i] == pytest.approx(0.0, abs=1e-10)
     # native vs CAR: ||I - (I - J/C)||_F = ||J/C||_F = sqrt(C * C * 1/C^2) = 1
     assert result.distances_frobenius[i, j] == pytest.approx(1.0, abs=0.1)
+
+
+def test_operator_distance_correlation_returns_ci_and_perm_p():
+    """Result must include bootstrap CI and permutation p-values
+    (asymptotic stats are unreliable at n=15 pairs)."""
+    pytest.importorskip("mne")
+    import pandas as pd
+    from refshift.analysis import (
+        OperatorDistanceResult,
+        operator_distance_correlation,
+    )
+
+    refs = ["native", "car", "median", "laplacian", "rest", "cz_ref"]
+    rng = np.random.default_rng(0)
+    M = 0.4 + 0.05 * rng.standard_normal((6, 6))
+    np.fill_diagonal(M, 0.7)
+    df = pd.DataFrame(M, index=refs, columns=refs)
+    iv2a_chs = [
+        "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1", "Cz",
+        "C2", "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz",
+        "P2", "POz",
+    ]
+    res = operator_distance_correlation(
+        df, iv2a_chs,
+        n_probe_times=200, n_probes=2,
+        n_permutations=100, n_bootstrap=100, seed=0,
+    )
+    assert isinstance(res, OperatorDistanceResult)
+    assert hasattr(res, "ci95_spearman")
+    assert hasattr(res, "ci95_pearson")
+    assert hasattr(res, "perm_p_spearman")
+    assert hasattr(res, "perm_p_pearson")
+    lo_s, hi_s = res.ci95_spearman
+    if not (np.isnan(lo_s) or np.isnan(hi_s)):
+        assert lo_s <= hi_s
+    assert 0.0 < res.perm_p_spearman <= 1.0
+    assert 0.0 < res.perm_p_pearson <= 1.0

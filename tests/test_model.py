@@ -1,4 +1,4 @@
-"""Unit tests for refshift.dl.
+"""Unit tests for refshift.model.
 
 The whole file is skipped if braindecode / torch / skorch are not installed,
 so Phase 1 CI continues to pass without the ``[dl]`` extras. When the extras
@@ -18,7 +18,7 @@ pytest.importorskip("skorch")
 
 
 def test_moabb_code_mapping():
-    from refshift.dl import _moabb_code
+    from refshift.data import _moabb_code
     assert _moabb_code("iv2a") == "BNCI2014_001"
     assert _moabb_code("openbmi") == "Lee2019_MI"
     assert _moabb_code("cho2017") == "Cho2017"
@@ -27,13 +27,13 @@ def test_moabb_code_mapping():
 
 
 def test_moabb_code_unknown_raises():
-    from refshift.dl import _moabb_code
+    from refshift.data import _moabb_code
     with pytest.raises(ValueError):
         _moabb_code("unknown_dataset")
 
 
 def test_make_dl_model_unknown_raises():
-    from refshift.dl import make_dl_model
+    from refshift.model import make_dl_model
     with pytest.raises(ValueError):
         make_dl_model(
             model="not_a_real_model",
@@ -42,7 +42,7 @@ def test_make_dl_model_unknown_raises():
 
 
 def test_make_dl_model_shallow_constructs():
-    from refshift.dl import make_dl_model
+    from refshift.model import make_dl_model
     clf = make_dl_model(
         model="shallow",
         n_channels=22, n_classes=4, n_times=1000, sfreq=250.0,
@@ -52,7 +52,7 @@ def test_make_dl_model_shallow_constructs():
 
 
 def test_make_dl_model_eegnet_constructs():
-    from refshift.dl import make_dl_model
+    from refshift.model import make_dl_model
     clf = make_dl_model(
         model="eegnet",
         n_channels=22, n_classes=4, n_times=1000, sfreq=250.0,
@@ -64,7 +64,7 @@ def test_make_dl_model_eegnet_constructs():
 @pytest.mark.parametrize("arch", ["shallow", "eegnet"])
 def test_fit_predict_on_synthetic(arch):
     """End-to-end smoke: fit 2 epochs on 16 synthetic trials, predict shape ok."""
-    from refshift.dl import make_dl_model
+    from refshift.model import make_dl_model
 
     rng = np.random.default_rng(0)
     N, C, T = 16, 22, 1000
@@ -89,7 +89,7 @@ def test_fit_predict_on_synthetic(arch):
 
 def test_seed_reproducibility_shallow():
     """Two models with same seed should produce identical predictions."""
-    from refshift.dl import make_dl_model
+    from refshift.model import make_dl_model
 
     rng = np.random.default_rng(0)
     N, C, T = 16, 22, 500
@@ -110,3 +110,19 @@ def test_seed_reproducibility_shallow():
     p2 = _fit_predict()
     # CPU-only with fixed seed should be reproducible to high precision.
     np.testing.assert_allclose(p1, p2, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Default LR sanity (regression originally caught in v0.11)
+# ---------------------------------------------------------------------------
+
+def test_eegnet_default_lr_is_uniform():
+    """EEGNet default LR is 5e-4 (Lawhern 2018 small-data MI), not 1e-3."""
+    import inspect
+    from refshift import model
+    src = inspect.getsource(model.make_dl_model)
+    eeg_idx = src.find("else:  # eegnet")
+    assert eeg_idx >= 0
+    eeg_block = src[eeg_idx:eeg_idx + 800]
+    assert "5e-4" in eeg_block
+    assert "lr = 1e-3" not in eeg_block

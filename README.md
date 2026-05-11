@@ -55,25 +55,39 @@ would confound the per-sample jitter and SSL experiments.
 ```
 Reference-Mismatch-MI-Net/
 ├── refshift/
-│   ├── __init__.py       public API surface
+│   ├── __init__.py       public API surface (re-exports below)
 │   ├── reference.py      6 operators, neighbour graph, REST matrix, sklearn transformer
-│   ├── pipelines.py      make_csp_lda_pipeline (matches MOABB CSP.yml verbatim)
-│   ├── experiments.py    calibrate_csp_lda, run_mismatch, run_mismatch_jitter,
-│                         run_lofo_matrix, run_pre_ems_diagonal, run_bandpass_mismatch
-│   ├── dl.py             load_dl_data, make_dl_model (braindecode + skorch)
+│   ├── data.py           load_dl_data + on-disk preprocessed-tensor cache
+│   ├── model.py          make_csp_lda_pipeline + make_dl_model (braindecode + skorch)
 │   ├── jitter.py         RandomReferenceTransform for per-sample reference jitter
 │   ├── analysis.py       std matrix, clustering, op-distance correlation
-│                         (with bootstrap CI + permutation p), Wilcoxon
+│   │                     (bootstrap CI + permutation p), paired Wilcoxon
 │   ├── plotting.py       plot_mismatch_matrix
-│   ├── env.py            Kaggle setup + per-dataset cache symlinks
-│   └── compat.py         MOABB / braindecode workarounds (one place, documented)
-├── tests/                synthetic-only unit tests, none requires MOABB downloads
-├── KNOWN_LIMITATIONS.md  methodological caveats and upstream-bug workarounds
+│   ├── kaggle.py         Kaggle setup + per-dataset cache symlinks
+│   ├── compat.py         MOABB / braindecode workarounds (one place, documented)
+│   └── experiments/      runner per scientific question
+│       ├── calibration.py     calibrate_csp_lda (MOABB WithinSession)
+│       ├── mismatch.py        run_mismatch (6x6 train-test reference matrix)
+│       ├── jitter.py          run_mismatch_jitter, run_lofo_matrix
+│       ├── ems_control.py     run_pre_ems_diagonal
+│       ├── bandpass.py        run_bandpass_mismatch
+│       └── _datasets.py, _split.py, _dl_runner.py    shared scaffolding
+├── scripts/
+│   └── audit_cz_channel.py    pre-flight check that Cz is a separately-recorded
+│                              channel, not a derived virtual zero
+├── tests/                     synthetic-only unit tests, no MOABB downloads
+├── KNOWN_LIMITATIONS.md       methodological caveats and upstream-bug workarounds
+├── NOTES.md                   running design-decision log (filled by author)
 ├── pyproject.toml
 ├── requirements.txt
 ├── LICENSE
 └── README.md
 ```
+
+The package was a flat layout through v0.13 (a single 1400-line `experiments.py`,
+a 600-line `dl.py`, and a `pipelines.py` with one factory). v0.14 reorganised
+it into the structure above so each file maps to one scientific question
+or one technical concern.
 
 ## Install
 
@@ -154,6 +168,10 @@ of bare. If this fails, stop and debug before running the mismatch matrix.
 from refshift import run_mismatch, mismatch_matrix, plot_mismatch_matrix
 import matplotlib.pyplot as plt
 
+# `reference_modes=None` (the default) auto-resolves the reference set
+# per dataset: cz_ref is excluded automatically for Schirrmeister2017
+# (which uses Cz as recording reference, so there's no Cz channel).
+# Override with reference_modes=(...) for ablations.
 for ds in ["iv2a", "openbmi", "cho2017", "dreyer2023", "schirrmeister2017"]:
     df = run_mismatch(ds, model="csp_lda", seeds=[0])
     df.to_csv(f"{RESULTS}/{ds}_csp_lda.csv", index=False)
