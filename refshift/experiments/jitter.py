@@ -21,7 +21,7 @@ Pass an explicit reference_modes tuple to override.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import pandas as pd
 from sklearn.metrics import accuracy_score, cohen_kappa_score
@@ -34,6 +34,7 @@ from refshift.experiments._dl_runner import (
 from refshift.reference import (
     REFERENCE_MODES,
     apply_reference,
+    canonical_mode_tuple,
     reference_modes_for_dataset,
     validate_reference_modes,
 )
@@ -47,8 +48,8 @@ def run_mismatch_jitter(
     holdout_ref: str = "cz_ref",
     subjects: Optional[List[int]] = None,
     seeds: List[int] = (0,),
-    reference_modes: Optional[tuple] = None,
-    test_reference_modes: Optional[tuple] = None,
+    reference_modes: Optional[Sequence[str]] = None,
+    test_reference_modes: Optional[Sequence[str]] = None,
     classes: Optional[tuple] = None,
     split_strategy: str = "auto",
     laplacian_k: int = 4,
@@ -73,6 +74,9 @@ def run_mismatch_jitter(
         dataset, subject, seed, condition, holdout_ref, train_modes,
         test_ref, accuracy, kappa, n_train, n_test.
     No train_ref column — each training sample sees a different reference.
+
+    reference_modes / test_reference_modes accept any iterable (set, tuple,
+    list, frozenset); both are canonicalised to REFERENCE_MODES order.
     """
     from refshift.jitter import make_random_reference_transform
     from refshift.model import SUPPORTED_DL_MODELS, make_dl_model
@@ -91,7 +95,7 @@ def run_mismatch_jitter(
     if reference_modes is None:
         universe = reference_modes_for_dataset(dataset_id)
     else:
-        universe = tuple(reference_modes)
+        universe = canonical_mode_tuple(reference_modes)
     if cond == "lofo" and holdout_ref not in universe:
         raise ValueError(
             f"holdout_ref={holdout_ref!r} not in reference_modes universe={universe}. "
@@ -100,7 +104,10 @@ def run_mismatch_jitter(
 
     # Test universe defaults to the same; LOFO keeps the holdout in test_modes
     # by design (that's the whole point of scoring transfer to an unseen ref).
-    test_modes = tuple(test_reference_modes) if test_reference_modes is not None else universe
+    test_modes = (
+        canonical_mode_tuple(test_reference_modes)
+        if test_reference_modes is not None else universe
+    )
 
     if cond == "full":
         train_modes = universe
@@ -188,8 +195,8 @@ def run_lofo_matrix(
     dataset_id: str,
     *,
     model: str,
-    holdout_modes: Optional[tuple] = None,
-    reference_modes: Optional[tuple] = None,
+    holdout_modes: Optional[Sequence[str]] = None,
+    reference_modes: Optional[Sequence[str]] = None,
     seeds: List[int] = (0,),
     subjects: Optional[List[int]] = None,
     progress: bool = True,
@@ -202,12 +209,17 @@ def run_lofo_matrix(
     holdout sweep. Explicit holdout_modes overrides; in that case the
     universe still defaults to reference_modes_for_dataset unless
     reference_modes= is also passed.
+
+    holdout_modes and reference_modes accept any iterable (set, tuple, list).
     """
     universe = (
         reference_modes_for_dataset(dataset_id)
-        if reference_modes is None else tuple(reference_modes)
+        if reference_modes is None else canonical_mode_tuple(reference_modes)
     )
-    holdouts = tuple(holdout_modes) if holdout_modes is not None else universe
+    holdouts = (
+        canonical_mode_tuple(holdout_modes)
+        if holdout_modes is not None else universe
+    )
     frames: List[pd.DataFrame] = []
     for h in holdouts:
         if h not in universe:

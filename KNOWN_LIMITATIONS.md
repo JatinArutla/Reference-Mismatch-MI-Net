@@ -10,18 +10,21 @@ in your methods section.
 
 ---
 
-## Reference-operator set (v0.10 redesign, v0.12 expansion, v0.13 cleanup)
+## Reference-operator set (v0.10 redesign, v0.12 expansion, v0.13 cleanup, v0.15 spatial-derivative expansion)
 
-The current operator set is six modes:
+The current operator set is eight modes:
 
 ```python
-REFERENCE_MODES = ("native", "car", "median", "laplacian", "rest", "cz_ref")
+REFERENCE_MODES = (
+    "native", "car", "median", "rest", "cz_ref",
+    "lap_small", "lap_large", "csd",
+)
 ```
 
 Three families: global / symmetric (native, car, median, rest), global /
-asymmetric (cz_ref), local spatial-derivative (laplacian).
+asymmetric (cz_ref), local spatial-derivative (lap_small, lap_large, csd).
 
-The set has been through three rounds of peer review and three named
+The set has been through three rounds of peer review and four named
 revisions. The current shape reflects the cumulative history below;
 items marked **HISTORICAL** describe operators that were tried and
 removed and exist here only as a record so a future reader doesn't
@@ -176,7 +179,139 @@ reject `mode="nn_diff"` with `ValueError: Unknown reference mode`.
 
 ---
 
-## v0.11 changes (current)
+## v0.15 changes (current)
+
+The operator set was expanded from six to eight and the single
+`laplacian` spatial operator was renamed and split into a small-scale
+and a large-scale variant, with a formal Perrin spherical-spline
+surface Laplacian (CSD) added as a third spatial-derivative member.
+
+**1. `laplacian` renamed to `lap_small`.** The original `laplacian`
+operator was a Hjorth-style local Laplacian: for each channel, subtract
+the mean of its `k=4` nearest spatial neighbours under the
+`standard_1005` montage. The operator math is unchanged; the rename to
+`lap_small` reflects the addition of `lap_large` (below) and disambiguates
+which spatial-derivative variant a result refers to. The legacy name
+`"laplacian"` is still accepted as an alias by `apply_reference`,
+`ReferenceTransformer`, `make_random_reference_transform`, the runner
+`reference_modes=` argument, and the matrix-row labels consumed by
+`operator_distance_correlation`. Old CSVs with `train_ref="laplacian"`
+load and analyse without edits; new code should use `"lap_small"`. The
+`DatasetGraph` field `laplacian_idx` is kept as a property aliasing
+`lap_small_idx` so any external code that touched the field still works.
+
+**2. `lap_large` added (McFarland 1997 next-ring large Laplacian).**
+For each channel, the neighbour set is the ring of channels at ranks
+[k_large_skip..k_large_skip+k_large_use) in 3-D Euclidean electrode
+distance, with `k_large_skip=4, k_large_use=4` by default. With these
+defaults, `lap_small` uses ranks 0..3 and `lap_large` uses ranks 4..7,
+giving **disjoint neighbour sets between the two operators for every
+channel by construction**. This is the McFarland 1997 next-ring large
+Laplacian (J. Neurosci. Methods 73(2): 169–174), not the k=8-NN variant
+some later papers use under the same name — we picked the next-ring
+variant because the resulting fine-vs-coarse scale separation is more
+useful for the operator-shift analysis. On the Schirrmeister 44-channel
+motor subset the dense h-suffix channels (FFC, FCC, CCP, CPP rows) give
+a natural fine-vs-coarse scale separation between the two Laplacians:
+worth highlighting in the paper as evidence that the two operators are
+not measuring the same thing.
+
+**3. `csd` added (Perrin spherical-spline surface Laplacian).** The
+formal CSD operator from Perrin et al. 1989 (Electroencephalogr. Clin.
+Neurophysiol. 72(2): 184–187), implemented as a fixed C×C linear
+operator. We recover the matrix by feeding the identity basis (C
+single-sample "epochs" each with one channel set to 1, others to 0)
+through `mne.preprocessing.compute_current_source_density` and reading
+the output: column j of the operator is the output for basis vector e_j.
+This matrix-cached form is mathematically identical to applying
+`compute_current_source_density` per-epoch (verified empirically:
+relative max diff ~1e-16 on float64 random data, machine precision),
+and is far faster than re-invoking MNE for every reference application.
+Defaults match MNE 1.8+: `lambda2=1e-5` (regularization),
+`stiffness=4` (spline order m), `n_legendre_terms=50`, `sphere="auto"`
+(fit to digitization).
+
+**Amplitude scale.** CSD output has very different units (V/m^2) and
+amplitude scale from the other operators. On Gaussian-random unit-variance
+input, CSD output magnitude can be ~10^3-10^4 times the input. For CSP+LDA
+this is benign (OAS covariance is scale-invariant); for the DL models
+ShallowFBCSPNet and EEGNet, the input BatchNorm absorbs scale during
+training, but cross-reference transfer (train CAR, test CSD or vice versa)
+will be visibly affected by the scale difference. **This is the intended
+finding**: CSD is genuinely a different operator and its cross-reference
+transfer should be visibly bad; reporting that is the point.
+
+**4. `build_graph` signature extended.** New keyword arguments
+`k_small`, `k_large_skip`, `k_large_use`, `include_csd`, `csd_sfreq`,
+`csd_lambda2`, `csd_stiffness`, `csd_n_legendre_terms`. The legacy
+positional/keyword `k=4` is still accepted and resolves to `k_small=4`.
+New `DatasetGraph` fields: `lap_small_idx`, `lap_large_idx`, `k_small`,
+`k_large_skip`, `k_large_use`, `csd_matrix`, `csd_cond`. Legacy
+field aliases: `laplacian_idx → lap_small_idx`, `k → k_small`.
+
+**5. `cz_ref` kept in the headline matrix.** A reviewer suggested
+dropping `cz_ref` because the operator zeroes the Cz row, which is
+capacity waste for any decoder that uses Cz. We kept it because the
+zeroing is the headline finding: `cz_ref` is the single-electrode
+clinical reference, it is what some labs publish under, and the
+mismatch matrix's job is to show how badly transfer fails between
+operators that all see different views of the same signal. The
+`cz_ref` column in the matrix is informative *because* it shows the
+capacity loss, not in spite of it. Users who want a sanity-check
+control where Cz is dropped from every operator's input set can run an
+appendix experiment with a 21-channel IV-2a subset; the headline
+matrix is unaffected.
+
+**6. `reference_modes` accepts any iterable.** `run_mismatch`,
+`run_mismatch_jitter`, `run_lofo_matrix`, `run_pre_ems_diagonal` all
+accept any iterable (set, tuple, list, frozenset) for
+`reference_modes` and resolve it to a canonical-ordered tuple via the
+new helper `refshift.reference.canonical_mode_tuple`. This lets
+notebooks set a `REFERENCES = {"native", "car", "csd"}` once at the
+top and pass it to every runner; output column order is always
+canonical (`REFERENCE_MODES` order) regardless of input iteration
+order.
+
+**7. `operator_distance_correlation` uses exact matrices.** All seven
+linear operators (native, CAR, REST, CSD, cz_ref, lap_small, lap_large)
+have closed-form C×C representations, so `_exact_operator_matrix`
+returns them directly instead of using a Gaussian-probe linear
+regression. The only operator that still uses the probe-based
+linear-tangent estimate is `median` (the one non-linear operator). This
+removes a small variance source from the operator-distance correlation
+analysis at no cost. The legacy `_estimate_linear_operator` function
+is kept for the median fallback and for any external code that called
+it directly.
+
+**8. Verification status.** The CSD matrix recovery was verified
+end-to-end: applying the cached C×C matrix to a (3, 22, 16) random batch
+gave outputs identical (to within float32 round-trip noise, ~1e-3
+relative) to applying `mne.preprocessing.compute_current_source_density`
+per-epoch on the same data. The `lap_large` neighbour audit was run on
+all five datasets at `k_skip=4, k_use=4`: no anatomical anomalies, fully
+disjoint from `lap_small` for every channel. REST's algebraic invariants
+(`T @ 1_C = 0`, rank `C-1`, asymmetric, trace ≈ `C`) were re-verified to
+ensure the v0.14 → v0.15 refactor did not regress them.
+
+**Caveats remaining for the paper's methods section.**
+
+- REST is implemented against MNE's spherical head model with
+  `r0="auto"`. We have not cross-validated the per-element values
+  against the canonical Dong et al. REST MATLAB toolbox. The algebraic
+  invariants (annihilates 1_C, rank C-1, trace ≈ C) match Yao 2001's
+  derivation but the magnitude of individual matrix elements may differ
+  by a model-dependent constant.
+- CSD's `sphere="auto"` setting fits the sphere to the digitization
+  during `compute_current_source_density`. The fitted sphere parameters
+  are not part of the cache key, but `set_montage(standard_1005)` is
+  deterministic, so the fitted sphere is also deterministic across runs.
+- All experiments still run with `pick_channels(ordered=True)` on the
+  Schirrmeister motor subset (the v0.11 fix). Without `ordered=True`,
+  the graph would not align with the channel axis of the X array.
+
+---
+
+## v0.11 changes
 
 These changes consolidate the codebase against issues that surfaced
 during a deep code review prior to the multi-decoder, multi-dataset

@@ -11,6 +11,120 @@ Append, do not edit. New entries on top.
 
 ---
 
+## v0.15.0 — operator-set expansion (spatial-derivative family) and reference-mismatch framing lock
+
+### Framing locked: "reference mismatch", not "spatial operator shift"
+
+The TMLR/NeurIPS-workshop paper writes about **reference mismatch**:
+trained under one reference, tested under another. Earlier drafts
+flirted with "spatial operator shift" because three of the eight
+operators (lap_small, lap_large, csd) are spatial-derivative not
+reference-replacement. Dropped. "Reference" is the term every EEG
+practitioner uses for any operator that recombines channel values, and
+the paper is about cross-operator transfer failures, full stop. The
+broader term made readers ask "why is this not framed as covariate
+shift" — a 200-page rabbit hole I don't need to enter for a workshop
+paper.
+
+### Operator set: 6 → 8
+
+Old set: `native, car, median, laplacian, rest, cz_ref` (six modes).
+
+New set: `native, car, median, rest, cz_ref, lap_small, lap_large, csd`
+(eight modes).
+
+The `laplacian` operator is renamed to `lap_small` (the math is
+unchanged; the rename clarifies that `lap_small` is one of three
+spatial-derivative variants). The legacy name is kept as an alias —
+old CSVs and notebooks work without edits.
+
+Two new spatial-derivative operators:
+
+- **`lap_large`** (McFarland 1997 next-ring large Laplacian): for each
+  channel, subtract the mean of the ring of neighbours at distance ranks
+  4..7 (skipping the closest 4, which `lap_small` uses). With these
+  defaults the two Laplacians have disjoint neighbour sets for every
+  channel by construction, giving a clean fine-vs-coarse scale separation.
+  I picked the next-ring variant over the k=8-NN variant because the
+  scale separation against lap_small is the point — k=8-NN would just
+  be a noisier lap_small.
+- **`csd`** (Perrin spherical-spline surface Laplacian): the formal CSD
+  from `mne.preprocessing.compute_current_source_density`. We recover the
+  fixed C×C operator by pushing the identity basis through MNE and reading
+  the output, then cache the matrix. Verified empirically: matrix
+  application is identical to per-epoch MNE application to within 1e-16
+  in float64 (machine precision). MNE defaults: `lambda2=1e-5`,
+  `stiffness=4`, `n_legendre_terms=50`, `sphere="auto"`.
+
+### cz_ref kept, despite pushback
+
+A reviewer suggested dropping `cz_ref` because zeroing the Cz row is
+capacity waste for any decoder that uses Cz. Rejected. The capacity
+loss IS the headline. `cz_ref` is what some labs publish under — single-
+electrode clinical reference is standard practice — and the mismatch
+matrix's job is to show how badly transfer fails between operators that
+all see different views of the same signal. Hiding `cz_ref` would
+suppress the cleanest single-electrode failure mode the matrix has.
+
+Sanity-check fallback (not in the headline matrix, optional appendix):
+re-run with a 21-channel IV-2a subset that drops Cz from the input
+entirely, so all operators see the same channel count. Defer until the
+paper is otherwise locked.
+
+### lap_large parameter choice (k_skip=4, k_use=4)
+
+Considered:
+- k_skip=4, k_use=4 (disjoint from lap_small by construction).  CHOSEN.
+- k_skip=0, k_use=8 (the "k=8-NN large Laplacian" some papers use).
+  Rejected: not disjoint from lap_small at k_small=4; the two operators
+  share 4 neighbours per channel. The whole point of lap_large is to be
+  a different spatial-frequency operator from lap_small, not a noisier
+  version of it.
+- k_skip=8, k_use=4 (skip further). Rejected: on IV-2a's 22-channel set
+  the next ring beyond rank 8 already includes far-side channels;
+  anatomically the operator stops being interpretable as a "ring" once
+  you're picking POz's nearest neighbour out of a parietal-frontal mix.
+
+The McFarland 1997 paper uses a skip-NN scheme on a 64-channel dense
+montage; our k_skip=4, k_use=4 is the closest analogue at IV-2a's 22
+channels.
+
+### `references` notebook parameter (`reference_modes=` accepts iterables)
+
+Every runner already accepted `reference_modes=` as a tuple. v0.15 makes
+it accept any iterable (set, tuple, list, frozenset) and adds the helper
+`canonical_mode_tuple(refs)` that resolves aliases and reorders to
+`REFERENCE_MODES` order. Usage:
+
+```python
+REFERENCES = {"native", "car", "csd"}
+df = run_mismatch("iv2a", model="csp_lda", reference_modes=REFERENCES, seeds=[0, 1, 2])
+```
+
+Output column order is deterministic regardless of set iteration order.
+This was a small change but it removes the most common notebook footgun:
+"why is my matrix in a different order this run."
+
+### Operator-distance correlation now uses exact matrices
+
+The seven linear operators (native, CAR, REST, CSD, cz_ref, lap_small,
+lap_large) have closed-form C×C matrices. `_exact_operator_matrix`
+returns them directly. Only `median` falls back to the probe-based
+linear-tangent estimate. This removes the small variance source from
+Gaussian-probe linear regression on operators where it was unnecessary.
+
+### What did NOT change in v0.15
+
+- The five datasets (IV-2a, OpenBMI, Cho2017, Dreyer2023, Schirrmeister2017).
+- The two DL architectures (ShallowFBCSPNet, EEGNet) + CSP+LDA.
+- The three interventions (per-sample jitter, LOFO, EMS-control).
+- REST implementation. The algebraic invariants (`T @ 1_C = 0`, rank
+  `C-1`) still hold. Cross-validation against the Dong et al. MATLAB
+  toolbox remains unfinished and is a documented caveat.
+- IV-2a CSP+LDA calibration target (65.99% ± 2%).
+
+---
+
 ## v0.14.2 — 2-class DL support, package-level report helper
 
 ### Threaded `classes` through all DL runners

@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from refshift.analysis import (
+    baseline_diagonal_view,
     cluster_references,
     mismatch_std_matrix,
     operator_distance_correlation,
@@ -20,24 +21,42 @@ from refshift.reference import REFERENCE_MODES
 
 @pytest.fixture
 def synthetic_df():
-    """Long-form mismatch result with structure: diagonal ~0.60,
-    global-mean cluster off-diag ~0.55, everything else off-diag ~0.30.
-    With nn_diff removed in v0.13, the headline structure is one
-    global-mean cluster {native, car, median, rest} + two isolates
-    {laplacian, cz_ref}. 5 subjects, 1 seed, REFERENCE_MODES.
+    """Long-form mismatch result with structure designed to match what we
+    expect from v0.15's 8-mode set:
+
+      - Diagonal ~0.60.
+      - Within global-mean family ({native, car, median, rest}): off-diag ~0.55.
+      - Within spatial-derivative family ({lap_small, lap_large}): off-diag ~0.45.
+      - Spatial-derivative vs global-mean: off-diag ~0.30.
+      - cz_ref vs anything: off-diag ~0.30.
+      - CSD vs anything: off-diag ~0.18 (CSD's amplitude scale is far
+        bigger than any other operator; BatchNorm trained on CAR-scale
+        data fails badly on CSD-scale data, and vice versa).
+
+    With this structure k=2 clustering should separate global-mean from
+    the spatial-derivative outliers, and the operator-distance / transfer-gap
+    correlation should be positive (large operator distance -> large gap).
     """
     rng = np.random.default_rng(0)
     refs = list(REFERENCE_MODES)
     global_mean = {"native", "car", "median", "rest"}
+    spatial = {"lap_small", "lap_large"}
     rows = []
     for subj in range(1, 6):
         for train_ref in refs:
             for test_ref in refs:
                 if train_ref == test_ref:
                     base = 0.60
+                elif "csd" in (train_ref, test_ref):
+                    # CSD's amplitude-scale outlier behaviour: bad transfer
+                    # to/from anything else.
+                    base = 0.18
                 elif train_ref in global_mean and test_ref in global_mean:
                     base = 0.55
+                elif train_ref in spatial and test_ref in spatial:
+                    base = 0.45
                 else:
+                    # cross-family (spatial <-> global, cz_ref <-> anything)
                     base = 0.30
                 acc = base + 0.02 * rng.standard_normal()
                 rows.append({
@@ -100,21 +119,39 @@ def test_std_matrix_drops_missing_modes(synthetic_df):
 # 2. clustering
 # ---------------------------------------------------------------------------
 
-def test_cluster_references_recovers_one_cluster_plus_two_isolates(synthetic_mean_matrix):
-    """With synthetic data that has {global-mean family} + laplacian
-    + cz_ref as three behavioural groups, k=3 clustering should
-    recover them.
+def test_cluster_references_isolates_csd_at_k2(synthetic_mean_matrix):
+    """With v0.15 synthetic data where CSD is a large-amplitude outlier
+    (transfer gap to anything else ~0.42 vs ~0.30 for any other pair),
+    k=2 clustering should isolate csd from everything else.
     """
     result = cluster_references(synthetic_mean_matrix)
-    assert 3 in result.clusters
-    clusters_k3 = result.clusters[3]
-    as_sets = [set(c) for c in clusters_k3]
-    global_mean = {"native", "car", "median", "rest"}
-    assert global_mean in as_sets, (
-        f"Expected {global_mean} as one cluster, got {clusters_k3}"
+    assert 2 in result.clusters
+    clusters_k2 = result.clusters[2]
+    as_sets = [set(c) for c in clusters_k2]
+    # csd should be its own cluster at k=2.
+    assert {"csd"} in as_sets, (
+        f"Expected csd as a singleton cluster at k=2, got {clusters_k2}"
     )
-    assert {"laplacian"} in as_sets, f"laplacian should be its own cluster, got {clusters_k3}"
-    assert {"cz_ref"} in as_sets, f"cz_ref should be its own cluster, got {clusters_k3}"
+    # The other cluster should contain the remaining 7 modes.
+    others = set(REFERENCE_MODES) - {"csd"}
+    assert others in as_sets, (
+        f"Expected {others} as the non-csd cluster at k=2, got {clusters_k2}"
+    )
+
+
+def test_cluster_references_global_mean_clusters_together(synthetic_mean_matrix):
+    """Across k values, the four global-mean refs (native, car, median, rest)
+    should fall into a single cluster (they have the smallest pairwise
+    transfer-gap distance, ~0.05, in the synthetic data)."""
+    result = cluster_references(synthetic_mean_matrix)
+    global_mean = {"native", "car", "median", "rest"}
+    # At k=4, global_mean should be one of the four clusters.
+    clusters_k4 = result.clusters[4]
+    as_sets = [set(c) for c in clusters_k4]
+    found = any(global_mean.issubset(c) for c in as_sets)
+    assert found, (
+        f"global_mean refs split across clusters at k=4: {clusters_k4}"
+    )
 
 
 def test_cluster_references_distance_properties(synthetic_mean_matrix):
@@ -152,10 +189,9 @@ def test_operator_distance_correlation_positive_and_significant(
 ):
     """With synthetic data built from a clean family structure, the
     operator-distance ↔ transfer-gap correlation should be positive and
-    point in the expected direction. Loose p-value bar (0.20) rather than
-    0.05: with 6 references there are only n=15 upper-triangle pairs,
-    which limits the statistical power of the rank-correlation test on
-    synthetic data with realistic noise. The headline check is the
+    point in the expected direction. Loose p-value bar (0.10) rather than
+    0.05: with 8 references there are n=28 upper-triangle pairs (or 21
+    when cz_ref is dropped on Schirrmeister). The headline check is the
     *direction* of the correlation; sign-flips or broken math would be
     caught by the ρ>0.4 assertion.
     """
@@ -167,9 +203,9 @@ def test_operator_distance_correlation_positive_and_significant(
         f"Expected positive operator-distance/transfer-gap correlation, "
         f"got ρ={result.spearman_rho:.3f}"
     )
-    assert result.spearman_p < 0.20, (
-        f"Expected directionally significant correlation (p<0.20 with "
-        f"n=15 pairs), got p={result.spearman_p:.3f}"
+    assert result.spearman_p < 0.10, (
+        f"Expected directionally significant correlation (p<0.10 with "
+        f"n=28 pairs), got p={result.spearman_p:.3f}"
     )
 
 
@@ -217,7 +253,7 @@ def test_operator_distance_correlation_returns_ci_and_perm_p():
         operator_distance_correlation,
     )
 
-    refs = ["native", "car", "median", "laplacian", "rest", "cz_ref"]
+    refs = ["native", "car", "median", "lap_small", "rest", "cz_ref"]
     rng = np.random.default_rng(0)
     M = 0.4 + 0.05 * rng.standard_normal((6, 6))
     np.fill_diagonal(M, 0.7)
@@ -242,3 +278,45 @@ def test_operator_distance_correlation_returns_ci_and_perm_p():
         assert lo_s <= hi_s
     assert 0.0 < res.perm_p_spearman <= 1.0
     assert 0.0 < res.perm_p_pearson <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# v0.15 backward compatibility: legacy 'laplacian' in CSVs
+# ---------------------------------------------------------------------------
+
+def test_mismatch_std_matrix_resolves_laplacian_alias():
+    """v0.14 CSVs with 'laplacian' rows should analyse correctly under v0.15,
+    with 'laplacian' resolved to 'lap_small' before pivoting."""
+    import pandas as pd
+    rng = np.random.default_rng(0)
+    old_modes = ["native", "car", "median", "laplacian", "rest", "cz_ref"]
+    rows = []
+    for tr in old_modes:
+        for te in old_modes:
+            for subj in range(1, 4):
+                rows.append({
+                    "subject": subj, "seed": 0,
+                    "train_ref": tr, "test_ref": te,
+                    "accuracy": 0.6 if tr == te else 0.4 + 0.05 * rng.standard_normal(),
+                })
+    df = pd.DataFrame(rows)
+    S = mismatch_std_matrix(df)
+    # 6 modes after alias resolution; 'lap_small' present, 'laplacian' absent.
+    assert S.shape == (6, 6)
+    assert "lap_small" in S.index
+    assert "laplacian" not in S.index
+    # Original df is not mutated.
+    assert "laplacian" in df["train_ref"].unique()
+
+
+def test_baseline_diagonal_view_resolves_laplacian_alias():
+    """Same legacy-CSV handling for the baseline view helper."""
+    import pandas as pd
+    df = pd.DataFrame([
+        {"subject": 1, "seed": 0, "train_ref": "laplacian", "test_ref": "laplacian", "accuracy": 0.7},
+        {"subject": 1, "seed": 0, "train_ref": "laplacian", "test_ref": "car", "accuracy": 0.5},
+        {"subject": 1, "seed": 0, "train_ref": "car", "test_ref": "car", "accuracy": 0.65},
+    ])
+    diag = baseline_diagonal_view(df)
+    # Diagonal cells only; both should become 'lap_small' / 'car'.
+    assert set(diag["test_ref"].unique()) == {"lap_small", "car"}

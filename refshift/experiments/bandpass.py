@@ -63,6 +63,8 @@ def run_bandpass_mismatch(
         raise ValueError(
             f"run_bandpass_mismatch is DL-only. Got {model!r}; supported: {SUPPORTED_DL_MODELS}"
         )
+    from refshift.reference import _resolve_alias
+    reference_mode = _resolve_alias(reference_mode)
     if reference_mode not in REFERENCE_MODES:
         raise ValueError(f"reference_mode={reference_mode!r} not in REFERENCE_MODES")
 

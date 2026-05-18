@@ -212,23 +212,32 @@ def load_dl_data(
 
     # Pre-EMS reference: applied to the filtered raw, before EMS. Order matters
     # for the median operator (non-linear). For linear operators (CAR, REST,
-    # Laplacian, cz_ref) the result is identical regardless of where in the
-    # linear-filtering chain the reference sits.
+    # Laplacian, CSD, cz_ref) the result is identical regardless of where in
+    # the linear-filtering chain the reference sits.
     if pre_ems_reference is not None:
-        from refshift.reference import apply_reference, build_graph, _GRAPH_MODES
+        from refshift.reference import (
+            _GRAPH_MODES,
+            _resolve_alias,
+            apply_reference,
+            build_graph,
+        )
+
+        # Resolve legacy 'laplacian' alias if present in pre_ems_reference.
+        canonical_pre_ems = _resolve_alias(pre_ems_reference)
 
         def _apply_pre_ems_ref(raw):
             ch_names = list(raw.info["ch_names"])
-            needs_graph = pre_ems_reference in _GRAPH_MODES
+            needs_graph = canonical_pre_ems in _GRAPH_MODES
             graph = build_graph(
                 ch_names,
                 k=int(pre_ems_laplacian_k),
                 montage=str(pre_ems_montage),
-                include_rest=(pre_ems_reference == "rest"),
+                include_rest=(canonical_pre_ems == "rest"),
+                include_csd=(canonical_pre_ems == "csd"),
             ) if needs_graph else None
             data = raw.get_data()  # (C, T_total)
             # apply_reference takes (N, C, T); add and remove the singleton.
-            new_data = apply_reference(data[None, :, :], pre_ems_reference, graph=graph)[0]
+            new_data = apply_reference(data[None, :, :], canonical_pre_ems, graph=graph)[0]
             raw._data[:] = new_data.astype(raw._data.dtype, copy=False)
 
         preprocessors.append(Preprocessor(_apply_pre_ems_ref, apply_on_array=False))

@@ -23,9 +23,29 @@ import pandas as pd
 from refshift.reference import (
     REFERENCE_MODES,
     DatasetGraph,
+    _resolve_alias,
     apply_reference,
     build_graph,
 )
+
+
+def _resolve_aliases_in_df(
+    df: pd.DataFrame, columns: Tuple[str, ...] = ("train_ref", "test_ref"),
+) -> pd.DataFrame:
+    """Replace legacy mode names (e.g. 'laplacian') with canonical ones in the
+    given columns. Returns a copy with the resolution applied; original
+    DataFrame is not mutated.
+
+    v0.14 CSVs use 'laplacian'; v0.15 uses 'lap_small'. Without this
+    normalisation, analysis helpers that reindex against REFERENCE_MODES
+    would silently drop 'laplacian' rows, producing an undersized output
+    matrix with no warning. This helper guarantees old CSVs survive.
+    """
+    out = df.copy()
+    for col in columns:
+        if col in out.columns:
+            out[col] = out[col].map(lambda m: _resolve_alias(m) if isinstance(m, str) else m)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +58,12 @@ def mismatch_std_matrix(
     metric: str = "accuracy",
     reference_order: Tuple[str, ...] = REFERENCE_MODES,
 ) -> pd.DataFrame:
-    """Per-cell std over (subject, seed). Counterpart to mismatch_matrix(..., 'mean')."""
+    """Per-cell std over (subject, seed). Counterpart to mismatch_matrix(..., 'mean').
+
+    Accepts v0.14 CSVs with legacy 'laplacian' rows: they are silently
+    resolved to 'lap_small' before pivoting.
+    """
+    df = _resolve_aliases_in_df(df)
     agg = df.groupby(["train_ref", "test_ref"])[metric].std()
     present_train = [m for m in reference_order if m in agg.index.get_level_values("train_ref").unique()]
     present_test = [m for m in reference_order if m in agg.index.get_level_values("test_ref").unique()]
@@ -134,6 +159,78 @@ def plot_dendrogram(
 # 3. Operator-distance vs transfer-gap correlation
 # ---------------------------------------------------------------------------
 
+def _exact_operator_matrix(
+    mode: str, graph: DatasetGraph, n_channels: int,
+) -> Optional[np.ndarray]:
+    """Return the exact C×C operator matrix for genuinely linear operators.
+
+    For every operator in REFERENCE_MODES except 'median', the operator is
+    exactly linear and a closed-form matrix is available. Using it directly
+    (instead of a Gaussian probe approximation) removes a small variance
+    source from the operator-distance correlation analysis at no cost.
+
+    Returns None for 'median' (non-linear; the caller should fall back to
+    the probe-based linear-tangent estimate).
+    """
+    from refshift.reference import _resolve_alias
+    mode = _resolve_alias(mode)
+    C = n_channels
+    if mode == "native":
+        return np.eye(C, dtype=np.float64)
+    if mode == "car":
+        return np.eye(C) - np.ones((C, C)) / C
+    if mode == "median":
+        # Non-linear; let the probe handle it.
+        return None
+    if mode == "rest":
+        if graph is None or graph.rest_matrix is None:
+            raise ValueError(
+                "_exact_operator_matrix('rest') requires graph with rest_matrix"
+            )
+        return graph.rest_matrix.astype(np.float64)
+    if mode == "csd":
+        if graph is None or graph.csd_matrix is None:
+            raise ValueError(
+                "_exact_operator_matrix('csd') requires graph with csd_matrix"
+            )
+        return graph.csd_matrix.astype(np.float64)
+    if mode == "cz_ref":
+        if graph is None or graph.cz_idx is None:
+            raise ValueError(
+                "_exact_operator_matrix('cz_ref') requires graph with cz_idx"
+            )
+        A = np.eye(C, dtype=np.float64)
+        A[:, graph.cz_idx] -= 1.0
+        return A
+    if mode == "lap_small":
+        if graph is None:
+            raise ValueError(
+                "_exact_operator_matrix('lap_small') requires a DatasetGraph"
+            )
+        return _idx_to_laplacian_matrix(graph.lap_small_idx, C)
+    if mode == "lap_large":
+        if graph is None:
+            raise ValueError(
+                "_exact_operator_matrix('lap_large') requires a DatasetGraph"
+            )
+        return _idx_to_laplacian_matrix(graph.lap_large_idx, C)
+    raise ValueError(f"Unknown reference mode for exact matrix: {mode!r}")
+
+
+def _idx_to_laplacian_matrix(idx: np.ndarray, C: int) -> np.ndarray:
+    """Build a C×C local-Laplacian matrix from neighbour indices.
+
+    A[i, i] = 1; A[i, idx[i, j]] = -1/k. Each row sums to zero (rank C-1).
+    """
+    k = idx.shape[1]
+    A = np.zeros((C, C), dtype=np.float64)
+    for i in range(C):
+        A[i, i] = 1.0
+        for j in idx[i]:
+            A[i, int(j)] -= 1.0 / k
+    return A
+
+
 def _estimate_linear_operator(
     mode: str,
     graph: DatasetGraph,
@@ -144,10 +241,14 @@ def _estimate_linear_operator(
 ) -> np.ndarray:
     """Best linear approximation of the operator: A = Y @ pinv(X) on Gaussian X.
 
-    Exact for genuinely linear ops (native, CAR, REST, kNN-Laplacian, cz_ref).
     For median (non-linear), returns the linear tangent — empirically close
     to CAR's I - J/C since median of zero-mean Gaussian is approximately zero.
     n_probes>1 averages independent probes; matters mostly for median.
+
+    For genuinely linear operators (everything else in REFERENCE_MODES),
+    prefer ``_exact_operator_matrix`` which returns the closed-form matrix
+    without any probe noise. This function is kept for the median fallback
+    and for any operator where the exact form isn't available.
     """
     C = len(graph.ch_names)
     rng = np.random.default_rng(seed)
@@ -190,29 +291,45 @@ def operator_distance_correlation(
 ) -> OperatorDistanceResult:
     """Test whether Frobenius operator distance predicts transfer gap.
 
-    Estimate each operator's linear matrix on a random Gaussian probe; compute
-    pairwise Frobenius distances; correlate with gap_ij = diag_mean - 0.5*(M_ij + M_ji)
-    on the upper triangle. Bootstrap CIs over pairs and permutation p-value
-    over operator-label shuffles, because n=15 pairs (or 10 if cz_ref dropped)
-    makes asymptotic Spearman/Pearson p-values unreliable.
+    For every linear operator (native, CAR, REST, CSD, cz_ref, lap_small,
+    lap_large) the exact C×C matrix is used. For median (non-linear), an
+    n_probes-averaged Gaussian-probe linear tangent is used. Pairwise
+    Frobenius distances are then correlated with
+        gap_ij = diag_mean - 0.5*(M_ij + M_ji)
+    on the upper triangle. Bootstrap CIs over pairs and permutation p-values
+    over operator-label shuffles are reported because n=21 pairs at 7
+    operators (or 28 at 8) makes asymptotic Spearman/Pearson p-values
+    unreliable.
 
     Not a Ben-David H-divergence bound: Frobenius distance is data-free; the
     correlation with empirical transfer gap is a structural finding, not tight.
     """
     from scipy.stats import pearsonr, spearmanr
 
-    refs = list(mean_matrix.index)
-    if list(mean_matrix.columns) != refs:
+    from refshift.reference import _resolve_alias
+
+    refs = [_resolve_alias(r) for r in mean_matrix.index]
+    if [_resolve_alias(c) for c in mean_matrix.columns] != refs:
         raise ValueError("mean_matrix must be square with matching row/col order")
 
     need_rest = "rest" in refs
-    graph = build_graph(ch_names, k=k_laplacian, montage=montage, include_rest=need_rest)
+    need_csd = "csd" in refs
+    graph = build_graph(
+        ch_names, k=k_laplacian, montage=montage,
+        include_rest=need_rest, include_csd=need_csd,
+    )
 
+    C = len(ch_names)
     ops: Dict[str, np.ndarray] = {}
     for r in refs:
-        ops[r] = _estimate_linear_operator(
-            r, graph, n_times=n_probe_times, seed=seed, n_probes=n_probes,
-        )
+        exact = _exact_operator_matrix(r, graph, C)
+        if exact is not None:
+            ops[r] = exact
+        else:
+            # Currently only 'median' falls through; probe-estimated.
+            ops[r] = _estimate_linear_operator(
+                r, graph, n_times=n_probe_times, seed=seed, n_probes=n_probes,
+            )
 
     n = len(refs)
     D_op = np.zeros((n, n))
@@ -348,12 +465,13 @@ def baseline_diagonal_view(baseline_df: pd.DataFrame) -> pd.DataFrame:
 
     Returns columns subject, seed, test_ref, accuracy. Compare a jitter
     DataFrame against this for the "is jitter different from clean training"
-    test.
+    test. Legacy 'laplacian' rows from v0.14 CSVs are resolved to 'lap_small'.
     """
     required = {"subject", "seed", "train_ref", "test_ref", "accuracy"}
     missing = required - set(baseline_df.columns)
     if missing:
         raise ValueError(f"baseline_df missing columns: {sorted(missing)}")
+    baseline_df = _resolve_aliases_in_df(baseline_df)
     diag = baseline_df[baseline_df["train_ref"] == baseline_df["test_ref"]]
     return diag[["subject", "seed", "test_ref", "accuracy"]].reset_index(drop=True)
 
@@ -364,12 +482,14 @@ def baseline_col_off_diag_view(baseline_df: pd.DataFrame) -> pd.DataFrame:
     Compare a LOFO DataFrame against this: both sides are "model never saw
     test_ref at training" — but the baseline saw exactly one alternative
     reference, while LOFO saw 5. The Wilcoxon then tests whether
-    multi-reference training helps unseen-reference transfer.
+    multi-reference training helps unseen-reference transfer. Legacy
+    'laplacian' rows from v0.14 CSVs are resolved to 'lap_small'.
     """
     required = {"subject", "seed", "train_ref", "test_ref", "accuracy"}
     missing = required - set(baseline_df.columns)
     if missing:
         raise ValueError(f"baseline_df missing columns: {sorted(missing)}")
+    baseline_df = _resolve_aliases_in_df(baseline_df)
     off = baseline_df[baseline_df["train_ref"] != baseline_df["test_ref"]]
     return (
         off.groupby(["subject", "seed", "test_ref"], as_index=False)["accuracy"]

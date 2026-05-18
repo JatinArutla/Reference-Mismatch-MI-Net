@@ -3,22 +3,39 @@
 A classifier trained under one EEG reference operator and tested under another
 suffers a structured, predictable accuracy collapse. This package measures
 that across five MOABB MI datasets, two DL architectures + classical CSP+LDA,
-six reference and spatial operators, and three interventions: per-sample
+eight reference and spatial operators, and three interventions: per-sample
 reference jitter, leave-one-reference-out training, and an EMS-control
 ablation.
+
+Reference operators (v0.15):
+    Global symmetric:     native, car, median, rest (Yao 2001 spherical-model)
+    Global asymmetric:    cz_ref           (X_i - X_Cz)
+    Local spatial-deriv:  lap_small        (Hjorth k=4 NN Laplacian)
+                          lap_large        (McFarland next-ring skip-NN Laplacian)
+                          csd              (Perrin spherical-spline surface Laplacian)
 
 Notebook API:
     setup_kaggle_env()         environment + MOABB dataset symlinks
     calibrate_csp_lda(...)     MOABB CSP+LDA calibration
-    run_mismatch(...)          6x6 mismatch matrix (CSP+LDA or DL)
+    run_mismatch(...)          NxN mismatch matrix (CSP+LDA or DL)
     run_mismatch_jitter(...)   DL with per-sample jitter (full or LOFO)
     run_lofo_matrix(...)       sweep LOFO over every reference
     run_pre_ems_diagonal(...)  EMS-control ablation
     run_bandpass_mismatch(...) bandpass-mismatch control
-    mismatch_matrix(df, ...)   long-form -> 6x6 pivot
+    mismatch_matrix(df, ...)   long-form -> NxN pivot
+
+Restrict the operator set per run by passing any iterable as reference_modes:
+
+    REFERENCES = {"native", "car", "csd"}
+    df = run_mismatch("iv2a", model="csp_lda", reference_modes=REFERENCES)
+
+Output column order is always canonical (REFERENCE_MODES) regardless of
+input iteration order. The legacy name 'laplacian' is accepted as an alias
+for 'lap_small' (operator unchanged; renamed in v0.15).
 
 Primitives:
-    REFERENCE_MODES, ReferenceTransformer, build_graph, apply_reference
+    REFERENCE_MODES, ReferenceTransformer, build_graph, apply_reference,
+    canonical_mode_tuple
     make_csp_lda_pipeline, make_dl_model
 """
 
@@ -49,6 +66,7 @@ from refshift.reference import (
     ReferenceTransformer,
     apply_reference,
     build_graph,
+    canonical_mode_tuple,
     reference_modes_for_dataset,
     validate_reference_modes,
 )
@@ -84,6 +102,7 @@ __all__ = [
     "ReferenceTransformer",
     "build_graph",
     "apply_reference",
+    "canonical_mode_tuple",
     "reference_modes_for_dataset",
     "validate_reference_modes",
     "make_csp_lda_pipeline",
@@ -91,4 +110,4 @@ __all__ = [
     "SUPPORTED_DL_MODELS",
 ]
 
-__version__ = "0.14.2"
+__version__ = "0.15.0"

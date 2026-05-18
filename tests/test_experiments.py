@@ -460,7 +460,8 @@ def test_setup_dl_run_skips_graph_when_no_spatial_modes():
 
 
 def test_setup_dl_run_includes_rest_only_when_requested():
-    """include_rest in build_graph is True iff 'rest' is in the declared modes."""
+    """include_rest / include_csd in build_graph is True iff 'rest' / 'csd'
+    is in the declared modes. Legacy 'laplacian' resolves to lap_small."""
     from unittest.mock import MagicMock, patch
     from refshift.experiments._dl_runner import setup_dl_run
 
@@ -478,6 +479,7 @@ def test_setup_dl_run_includes_rest_only_when_requested():
         "refshift.experiments._dl_runner.resolve_dataset",
         return_value=(fake_ds, fake_paradigm),
     ):
+        # Legacy alias 'laplacian' still works; cz_ref triggers graph build.
         ctx = setup_dl_run(
             "iv2a", subjects=None, seeds=[0],
             reference_modes_for_graph=("laplacian", "cz_ref"),
@@ -485,6 +487,7 @@ def test_setup_dl_run_includes_rest_only_when_requested():
         )
         assert ctx.graph is not None
         assert ctx.graph.rest_matrix is None
+        assert ctx.graph.csd_matrix is None
 
         ctx2 = setup_dl_run(
             "iv2a", subjects=None, seeds=[0],
@@ -493,6 +496,17 @@ def test_setup_dl_run_includes_rest_only_when_requested():
         )
         assert ctx2.graph is not None
         assert ctx2.graph.rest_matrix is not None
+        assert ctx2.graph.csd_matrix is None
+
+        # csd in declared modes -> include_csd=True
+        ctx3 = setup_dl_run(
+            "iv2a", subjects=None, seeds=[0],
+            reference_modes_for_graph=("car", "csd"),
+            progress=False,
+        )
+        assert ctx3.graph is not None
+        assert ctx3.graph.csd_matrix is not None
+        assert ctx3.graph.rest_matrix is None
 
 
 def test_iter_per_subject_dl_jobs_loads_once_per_subject(monkeypatch):

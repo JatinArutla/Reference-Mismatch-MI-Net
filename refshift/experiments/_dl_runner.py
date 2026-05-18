@@ -43,21 +43,27 @@ def setup_dl_run(
 
     The graph is built iff any of the declared modes is in _GRAPH_MODES.
     REST is included only when 'rest' is among them (the spherical-model
-    forward solution is the slow part).
+    forward solution is the slow part). CSD is included only when 'csd' is
+    among them.
     """
+    from refshift.reference import _resolve_alias
+
     dataset, paradigm = resolve_dataset(dataset_id)
     if subjects is None:
         subjects = list(dataset.subject_list)
 
-    needs_graph = any(m in _GRAPH_MODES for m in reference_modes_for_graph)
-    needs_rest = "rest" in reference_modes_for_graph
+    resolved_modes = tuple(_resolve_alias(m) for m in reference_modes_for_graph)
+    needs_graph = any(m in _GRAPH_MODES for m in resolved_modes)
+    needs_rest = "rest" in resolved_modes
+    needs_csd = "csd" in resolved_modes
     graph = None
     if needs_graph:
         ch_names = get_eeg_channel_names(
             dataset, subject=subjects[0], paradigm=paradigm,
         )
         graph = build_graph(
-            ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
+            ch_names, k=laplacian_k, montage=montage,
+            include_rest=needs_rest, include_csd=needs_csd,
         )
         if progress:
             cz_msg = (
@@ -68,7 +74,14 @@ def setup_dl_run(
                 f", REST cond={graph.rest_cond:.2e}"
                 if graph.rest_cond is not None else ""
             )
-            print(f"[{dataset.code}] graph: C={len(graph.ch_names)}{cz_msg}{rest_msg}")
+            csd_msg = (
+                f", CSD cond={graph.csd_cond:.2e}"
+                if graph.csd_cond is not None else ""
+            )
+            print(
+                f"[{dataset.code}] graph: C={len(graph.ch_names)}"
+                f"{cz_msg}{rest_msg}{csd_msg}"
+            )
 
     return DLRunContext(
         dataset_id=dataset_id,

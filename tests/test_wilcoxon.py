@@ -18,7 +18,7 @@ from refshift.analysis import (
 
 # ----- Fixtures --------------------------------------------------------------
 
-REFS = ["native", "car", "median", "laplacian", "rest", "cz_ref"]
+REFS = ["native", "car", "median", "rest", "cz_ref", "lap_small", "lap_large", "csd"]
 
 
 def _make_baseline_df(seed: int = 0, n_subjects: int = 9, n_seeds: int = 3,
@@ -108,7 +108,7 @@ def test_holm_bonferroni_unsorted_input():
 def test_baseline_diagonal_view_extracts_only_diagonal():
     df = _make_baseline_df()
     diag = baseline_diagonal_view(df)
-    expected_n = 9 * 3 * 6  # subjects x seeds x refs
+    expected_n = 9 * 3 * 8  # subjects x seeds x refs
     assert len(diag) == expected_n
     assert set(diag.columns) == {"subject", "seed", "test_ref", "accuracy"}
     # Sanity: synthetic diag mean ~0.65 with noise_sd 0.05
@@ -126,7 +126,7 @@ def test_baseline_diagonal_view_missing_cols_raises():
 def test_baseline_col_off_diag_view_one_row_per_triple():
     df = _make_baseline_df()
     off = baseline_col_off_diag_view(df)
-    expected_n = 9 * 3 * 6
+    expected_n = 9 * 3 * 8
     assert len(off) == expected_n
     # Synthetic off mean ~0.43
     assert 0.38 < off["accuracy"].mean() < 0.48
@@ -159,8 +159,8 @@ def test_wilcoxon_no_difference_high_pvalue():
     df_a = _make_jitter_df(seed=42)
     df_b = df_a.copy()
     out = paired_wilcoxon_per_test_ref(df_a, df_b, label_a="A", label_b="B")
-    # All test_refs + "pooled" = 7 rows
-    assert len(out) == 7
+    # All test_refs + "pooled" = 9 rows (8 modes + pooled)
+    assert len(out) == 9
     # All deltas are exactly zero -> our explicit guard returns p=1.0
     assert (out["p_value"] == 1.0).all()
     assert (out["mean_delta"] == 0.0).all()
@@ -201,7 +201,7 @@ def test_wilcoxon_pooled_row_present():
     out = paired_wilcoxon_per_test_ref(df_a, df_b)
     assert "pooled" in out["test_ref"].values
     pooled = out[out["test_ref"] == "pooled"].iloc[0]
-    assert pooled["n_pairs"] == 9 * 3 * 6  # all triples
+    assert pooled["n_pairs"] == 9 * 3 * 8  # all triples
 
 
 def test_wilcoxon_holm_correction_monotone():
@@ -262,8 +262,8 @@ def test_full_pipeline_baseline_diagonal_vs_jitter():
     out = paired_wilcoxon_per_test_ref(
         jitter, diag, label_a="jitter", label_b="baseline_diag",
     )
-    # Should have 7 rows (6 refs + pooled)
-    assert len(out) == 7
+    # Should have 9 rows (8 refs + pooled)
+    assert len(out) == 9
     # Both means should be in the 0.6-0.7 range (synthetic)
     per_ref = out[out["test_ref"] != "pooled"]
     assert (per_ref["mean_jitter"].between(0.55, 0.75)).all()

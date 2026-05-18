@@ -15,7 +15,10 @@ import pandas as pd
 import pytest
 
 
-REFERENCE_MODES = ("native", "car", "median", "laplacian", "rest", "cz_ref")
+REFERENCE_MODES = (
+    "native", "car", "median", "rest", "cz_ref",
+    "lap_small", "lap_large", "csd",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +129,7 @@ def test_report_mismatch_returns_square_matrix(capsys):
             results_dir=tmp, figs_dir=tmp, dataset="iv2a",
         )
     M = out["matrix"]
-    assert M.shape == (6, 6)
+    assert M.shape == (8, 8)
     assert "diagonal_mean" in out["summary"]
     assert "gap" in out["summary"]
     # Diagonal should be higher than off-diagonal by construction
@@ -150,17 +153,17 @@ def test_report_mismatch_writes_csv_and_png():
 
 
 def test_report_mismatch_respects_modes_subset():
-    """Schirrmeister-style: 5 modes (no cz_ref)."""
+    """Schirrmeister-style: 7 modes (no cz_ref) under v0.15's 8-mode set."""
     from refshift.report import report_experiment
-    modes_5 = tuple(m for m in REFERENCE_MODES if m != "cz_ref")
-    df = _mismatch_frame(modes=modes_5)
+    modes_no_cz = tuple(m for m in REFERENCE_MODES if m != "cz_ref")
+    df = _mismatch_frame(modes=modes_no_cz)
     with tempfile.TemporaryDirectory() as tmp:
         out = report_experiment(
             df, kind="mismatch", name="test_schirr",
             results_dir=tmp, figs_dir=tmp,
             dataset="schirrmeister2017", print_matrix=False,
         )
-    assert out["matrix"].shape == (5, 5)
+    assert out["matrix"].shape == (7, 7)
     assert "cz_ref" not in out["matrix"].index
 
 
@@ -173,7 +176,7 @@ def test_report_jitter_full_shape_and_stats():
             results_dir=tmp, figs_dir=tmp, dataset="iv2a",
             print_matrix=False,
         )
-    assert out["matrix"].shape == (1, 6)
+    assert out["matrix"].shape == (1, 8)
     assert "mean" in out["summary"]
     assert "std" in out["summary"]
 
@@ -188,7 +191,7 @@ def test_report_lofo_shape_and_recovery_gap():
             print_matrix=False,
         )
     M = out["matrix"]
-    assert M.shape == (6, 6)
+    assert M.shape == (8, 8)
     # By construction, held-out cells (diagonal of holdout vs test) are lower
     assert out["summary"]["recovery_gap"] > 0
     assert "held_out_mean" in out["summary"]
@@ -204,7 +207,7 @@ def test_report_ems_shape():
             results_dir=tmp, figs_dir=tmp, dataset="iv2a",
             print_matrix=False,
         )
-    assert out["matrix"].shape == (6, 1)
+    assert out["matrix"].shape == (8, 1)
     assert "mean" in out["summary"]
 
 
@@ -250,10 +253,10 @@ def test_report_skip_csv_and_heatmap():
 
 
 def test_report_jitter_handles_dataset_specific_modes():
-    """Schirrmeister jitter has 5 test_refs (no cz_ref)."""
+    """Schirrmeister jitter has 7 test_refs (no cz_ref) under v0.15."""
     from refshift.report import report_experiment
-    modes_5 = tuple(m for m in REFERENCE_MODES if m != "cz_ref")
-    df = _jitter_full_frame(modes=modes_5)
+    modes_no_cz = tuple(m for m in REFERENCE_MODES if m != "cz_ref")
+    df = _jitter_full_frame(modes=modes_no_cz)
     with tempfile.TemporaryDirectory() as tmp:
         out = report_experiment(
             df, kind="jitter_full", name="schirr_jitter",
@@ -261,5 +264,5 @@ def test_report_jitter_handles_dataset_specific_modes():
             dataset="schirrmeister2017", print_matrix=False,
         )
     M = out["matrix"]
-    assert M.shape == (1, 5)
+    assert M.shape == (1, 7)
     assert "cz_ref" not in M.columns

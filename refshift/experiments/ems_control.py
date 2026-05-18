@@ -34,6 +34,7 @@ from refshift.reference import (
     REFERENCE_MODES,
     _GRAPH_MODES,
     build_graph,
+    canonical_mode_tuple,
     reference_modes_for_dataset,
     validate_reference_modes,
 )
@@ -86,7 +87,7 @@ def run_pre_ems_diagonal(
     if reference_modes is None:
         modes = reference_modes_for_dataset(dataset_id)
     else:
-        modes = tuple(reference_modes)
+        modes = canonical_mode_tuple(reference_modes)
 
     dataset, paradigm = resolve_dataset(dataset_id)
     if subjects is None:
@@ -105,6 +106,7 @@ def run_pre_ems_diagonal(
         probe_graph = build_graph(
             ch_names, k=laplacian_k, montage=montage,
             include_rest=("rest" in modes),
+            include_csd=("csd" in modes),
         )
     validate_reference_modes(modes, probe_graph, dataset_id=dataset_id)
 

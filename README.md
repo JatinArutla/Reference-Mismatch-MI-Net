@@ -8,7 +8,7 @@ top of [MOABB](https://github.com/NeuroTechX/moabb) and
 spatial-derivative) operator and tested under another suffers a structured,
 predictable accuracy collapse. We measure this across five MOABB
 motor-imagery datasets, two deep architectures (ShallowFBCSPNet, EEGNet)
-plus the classical CSP+LDA pipeline, six reference and spatial operators,
+plus the classical CSP+LDA pipeline, eight reference and spatial operators,
 and three interventions: per-sample reference jitter, leave-one-reference-out
 training, and an EMS-control ablation that pins down the order in which
 exponential moving standardization composes with reference operators.
@@ -19,10 +19,24 @@ exponential moving standardization composes with reference operators.
 |---|---|---|
 | Global / symmetric | `native` | identity (whatever the dataset was recorded with) |
 |  | `car` | X − mean across channels |
-|  | `median` | X − median across channels (robustness control) |
+|  | `median` | X − median across channels (non-linear robustness control) |
 |  | `rest` | REST-like spherical-model re-reference (Yao 2001 approximation) |
 | Global / asymmetric | `cz_ref` | X − X[Cz] (single-electrode reference; sets Cz channel to zero) |
-| Local spatial-derivative | `laplacian` | X − mean of k=4 nearest neighbours (kNN local Laplacian; not formal CSD) |
+| Local spatial-derivative | `lap_small` | X − mean of k=4 nearest neighbours (Hjorth local Laplacian) |
+|  | `lap_large` | X − mean of the ring of neighbours at ranks 4..7 (McFarland 1997 next-ring large Laplacian) |
+|  | `csd` | Perrin spherical-spline surface Laplacian (`mne.preprocessing.compute_current_source_density`) |
+
+`lap_small`'s default neighbour set is ranks 0..3 in 3-D electrode distance;
+`lap_large` uses ranks 4..7. With these defaults the two operators have
+disjoint neighbour sets for every channel by construction. `csd` is the
+formal current-source-density operator from Perrin et al. 1989; refshift
+recovers it as a fixed C×C matrix by pushing the identity basis through
+`mne.preprocessing.compute_current_source_density` and reading the output
+(per-epoch application of MNE gives identical results to within machine
+precision in float64; the matrix form is much faster).
+
+`laplacian` is accepted as a legacy alias for `lap_small` (the operator
+was renamed in v0.15; old CSVs and notebooks keep working without edits).
 
 Nearest-neighbour graphs are computed from MNE's `standard_1005` montage.
 REST is built from the same montage via a three-layer spherical head model
@@ -50,13 +64,32 @@ was constructed for this codebase as an analogue to clinical bipolar
 montages — and its dimension-reducing rank deficiency on dense montages
 would confound the per-sample jitter and SSL experiments.
 
+### Restricting the operator set per run
+
+Every runner (`run_mismatch`, `run_mismatch_jitter`, `run_lofo_matrix`,
+`run_pre_ems_diagonal`) accepts a `reference_modes` keyword that takes any
+iterable — set, tuple, list, frozenset. Define `REFERENCES` once at the
+top of your notebook and pass it everywhere; the runners canonicalise the
+order so the output matrix is always in `REFERENCE_MODES` sequence
+regardless of input iteration order:
+
+```python
+REFERENCES = {"native", "car", "csd"}
+
+df = run_mismatch(
+    "iv2a", model="csp_lda",
+    reference_modes=REFERENCES,
+    seeds=[0, 1, 2],
+)
+```
+
 ## Package layout
 
 ```
 Reference-Mismatch-MI-Net/
 ├── refshift/
 │   ├── __init__.py       public API surface (re-exports below)
-│   ├── reference.py      6 operators, neighbour graph, REST matrix, sklearn transformer
+│   ├── reference.py      8 operators, neighbour graph, REST + CSD matrices, sklearn transformer
 │   ├── data.py           load_dl_data + on-disk preprocessed-tensor cache
 │   ├── model.py          make_csp_lda_pipeline + make_dl_model (braindecode + skorch)
 │   ├── jitter.py         RandomReferenceTransform for per-sample reference jitter
@@ -67,7 +100,7 @@ Reference-Mismatch-MI-Net/
 │   ├── compat.py         MOABB / braindecode workarounds (one place, documented)
 │   └── experiments/      runner per scientific question
 │       ├── calibration.py     calibrate_csp_lda (MOABB WithinSession)
-│       ├── mismatch.py        run_mismatch (6x6 train-test reference matrix)
+│       ├── mismatch.py        run_mismatch (NxN train-test reference matrix)
 │       ├── jitter.py          run_mismatch_jitter, run_lofo_matrix
 │       ├── ems_control.py     run_pre_ems_diagonal
 │       ├── bandpass.py        run_bandpass_mismatch
@@ -303,7 +336,7 @@ plot_dendrogram(cluster, out_path=f"{RESULTS}/iv2a_dendrogram.png")
 
 # Spearman ρ between operator-matrix Frobenius distance and transfer gap.
 # Reports a 95% bootstrap CI and a permutation p-value alongside the
-# asymptotic p, because at 6 operators we have only 15 pairs.
+# asymptotic p, because at 8 operators we have only 28 pairs.
 odc = operator_distance_correlation(M, IV2A_CHS)
 print(
     f"Spearman ρ = {odc.spearman_rho:.3f} "
@@ -389,23 +422,25 @@ override.
 **Per-sample reference jitter.** Implemented as a braindecode `Transform`
 plugged into `AugmentedDataLoader`. Each training sample independently
 gets a reference drawn uniformly from `allowed_modes`. Full-jitter uses
-all available operators on the dataset (typically all 6; on
-Schirrmeister2017, drop `cz_ref` for 5); LOFO uses one fewer (the
+all available operators on the dataset (typically all 8; on
+Schirrmeister2017, drop `cz_ref` for 7); LOFO uses one fewer (the
 held-out operator excluded from the training distribution). See
 `refshift/jitter.py`.
 
 **Operator-distance correlation.** `operator_distance_correlation`
-estimates each reference operator's linear C×C matrix on a Gaussian probe
-(averaged over multiple probes for the median operator's linear-tangent
-estimate), computes pairwise Frobenius distances, and correlates them
-with the symmetric transfer gap `gap_ij = diag_mean - 0.5*(M_ij + M_ji)`.
-Because the upper triangle has only 15 pairs at 6 operators, the
-asymptotic Spearman/Pearson p-values are unreliable; the function
-additionally returns a bootstrap 95% confidence interval and a
-permutation p-value computed by shuffling operator labels of the gap
-matrix. We do not interpret this as a Ben-David H-divergence bound;
-Frobenius distance is a data-free quantity, and its empirical correlation
-with transfer gap is a structural finding, not a tight theoretical bound.
+uses the **exact** C×C operator matrix for every linear operator in the
+8-mode set (native, CAR, REST, CSD, cz_ref, lap_small, lap_large) and a
+Gaussian-probe linear-tangent estimate for `median` (the only non-linear
+operator). It then computes pairwise Frobenius distances and correlates
+them with the symmetric transfer gap `gap_ij = diag_mean - 0.5*(M_ij + M_ji)`.
+Because the upper triangle has 28 pairs at 8 operators (21 when cz_ref
+is dropped on Schirrmeister), the asymptotic Spearman/Pearson p-values
+are unreliable; the function additionally returns a bootstrap 95%
+confidence interval and a permutation p-value computed by shuffling
+operator labels of the gap matrix. We do not interpret this as a
+Ben-David H-divergence bound; Frobenius distance is a data-free
+quantity, and its empirical correlation with transfer gap is a
+structural finding, not a tight theoretical bound.
 
 **Compatibility shims.** All MOABB / braindecode workarounds live in
 `refshift/compat.py` so the rest of the codebase stays library-faithful.

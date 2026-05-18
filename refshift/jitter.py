@@ -67,14 +67,17 @@ def make_random_reference_transform(
 ):
     """braindecode Transform that re-references each training sample.
 
-    allowed_modes is a subset of REFERENCE_MODES. graph is required if any
-    mode in allowed_modes needs one (laplacian, rest, cz_ref). For 'rest',
-    graph must be built with include_rest=True; for 'cz_ref', graph.cz_idx
-    must be set.
+    allowed_modes is a subset of REFERENCE_MODES (the legacy alias 'laplacian'
+    is accepted and resolved to 'lap_small'). graph is required if any mode
+    in allowed_modes needs one (lap_small, lap_large, rest, csd, cz_ref).
+    For 'rest' the graph must be built with include_rest=True; for 'csd'
+    with include_csd=True; for 'cz_ref' graph.cz_idx must be set.
     """
     from braindecode.augmentation import Transform
 
-    allowed = tuple(m.lower() for m in allowed_modes)
+    from refshift.reference import _resolve_alias
+
+    allowed = tuple(_resolve_alias(m) for m in allowed_modes)
     if not allowed:
         raise ValueError("allowed_modes must be non-empty")
     unknown = [m for m in allowed if m not in REFERENCE_MODES]
@@ -85,6 +88,8 @@ def make_random_reference_transform(
         raise ValueError(f"graph=None but allowed_modes includes {needs_graph}")
     if "rest" in allowed and (graph is None or graph.rest_matrix is None):
         raise ValueError("'rest' requires graph built with include_rest=True")
+    if "csd" in allowed and (graph is None or graph.csd_matrix is None):
+        raise ValueError("'csd' requires graph built with include_csd=True")
     if "cz_ref" in allowed and (graph is None or graph.cz_idx is None):
         raise ValueError("'cz_ref' requires Cz in the channel set; got cz_idx=None")
 

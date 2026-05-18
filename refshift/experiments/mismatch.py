@@ -36,6 +36,7 @@ from refshift.reference import (
     _GRAPH_MODES,
     apply_reference,
     build_graph,
+    canonical_mode_tuple,
     reference_modes_for_dataset,
     validate_reference_modes,
 )
@@ -47,7 +48,17 @@ def mismatch_matrix(
     metric: str = "accuracy",
     aggregate: str = "mean",
 ) -> pd.DataFrame:
-    """Pivot long-form results to a train_ref x test_ref table."""
+    """Pivot long-form results to a train_ref x test_ref table.
+
+    Legacy 'laplacian' rows from v0.14 CSVs are resolved to 'lap_small'
+    before pivoting, so old CSVs analyse correctly under v0.15.
+    """
+    from refshift.reference import _resolve_alias
+
+    df = df.copy()
+    for col in ("train_ref", "test_ref"):
+        if col in df.columns:
+            df[col] = df[col].map(lambda m: _resolve_alias(m) if isinstance(m, str) else m)
     grouped = df.groupby(["train_ref", "test_ref"])[metric]
     if aggregate == "mean":
         return grouped.mean().unstack("test_ref")
@@ -98,7 +109,7 @@ def run_mismatch(
     model: str = "csp_lda",
     subjects: Optional[List[int]] = None,
     seeds: List[int] = (0,),
-    reference_modes: Optional[tuple] = None,
+    reference_modes: Optional[Sequence[str]] = None,
     classes: Optional[Sequence[str]] = None,
     split_strategy: str = "auto",
     n_filters: int = 6,
@@ -119,11 +130,21 @@ def run_mismatch(
     dl_trial_stop_offset_s: float = 0.0,
     dl_cache_dir: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Run the 6x6 mismatch matrix on one dataset.
+    """Run the train-test reference mismatch matrix on one dataset.
 
     model in {'csp_lda', 'eegnet', 'shallow'}. classes is currently CSP+LDA
     only (DL would need plumbing through load_dl_data). subjects=None uses
     the dataset's full subject list with known-bad subjects excluded.
+
+    reference_modes accepts any iterable (set, tuple, list, frozenset).
+    Set in your notebook to restrict the matrix to a subset:
+
+        REFERENCES = {"native", "car", "csd"}
+        df = run_mismatch("iv2a", model="csp_lda", reference_modes=REFERENCES)
+
+    The output matrix is always laid out in canonical REFERENCE_MODES order
+    regardless of input iteration order. The legacy name 'laplacian' is
+    accepted as an alias for 'lap_small'.
     """
     model_lc = model.lower()
     if model_lc == "csp_lda":
@@ -139,7 +160,7 @@ def run_mismatch(
     if reference_modes is None:
         modes = reference_modes_for_dataset(dataset_id)
     else:
-        modes = tuple(reference_modes)
+        modes = canonical_mode_tuple(reference_modes)
     rows: List[dict] = []
 
     if is_dl:
@@ -203,11 +224,13 @@ def run_mismatch(
 
     needs_graph = any(m in _GRAPH_MODES for m in modes)
     needs_rest = "rest" in modes
+    needs_csd = "csd" in modes
     graph = None
     if needs_graph:
         ch_names = get_eeg_channel_names(dataset, subject=subjects[0], paradigm=paradigm)
         graph = build_graph(
-            ch_names, k=laplacian_k, montage=montage, include_rest=needs_rest,
+            ch_names, k=laplacian_k, montage=montage,
+            include_rest=needs_rest, include_csd=needs_csd,
         )
         if progress:
             cz_msg = (
@@ -218,7 +241,14 @@ def run_mismatch(
                 f", REST cond={graph.rest_cond:.2e}"
                 if graph.rest_cond is not None else ""
             )
-            print(f"[{dataset.code}] graph: C={len(graph.ch_names)}{cz_msg}{rest_msg}")
+            csd_msg = (
+                f", CSD cond={graph.csd_cond:.2e}"
+                if graph.csd_cond is not None else ""
+            )
+            print(
+                f"[{dataset.code}] graph: C={len(graph.ch_names)}"
+                f"{cz_msg}{rest_msg}{csd_msg}"
+            )
     validate_reference_modes(modes, graph, dataset_id=dataset_id)
 
     cache_kwargs = {"cache_config": build_cache_config()} if cache else {}

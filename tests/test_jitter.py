@@ -27,9 +27,12 @@ _CH_NAMES = ["Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3",
              "CP2", "CP4", "P1", "Pz", "P2", "POz"]
 
 
-def _make_graph(include_rest: bool = True):
-    return build_graph(_CH_NAMES, k=4, montage="standard_1005",
-                       include_rest=include_rest)
+def _make_graph(include_rest: bool = True, include_csd: bool = True):
+    """Default to building rest + csd so tests can pass full REFERENCE_MODES."""
+    return build_graph(
+        _CH_NAMES, k_small=4, montage="standard_1005",
+        include_rest=include_rest, include_csd=include_csd,
+    )
 
 
 def _make_synthetic_batch(B: int = 32, T: int = 250, seed: int = 0):
@@ -54,6 +57,13 @@ def test_make_random_reference_transform_empty_modes_raises():
 
 
 def test_make_random_reference_transform_requires_graph_for_spatial():
+    from refshift.jitter import make_random_reference_transform
+    with pytest.raises(ValueError):
+        make_random_reference_transform(["car", "lap_small"], graph=None)
+
+
+def test_make_random_reference_transform_legacy_laplacian_alias_requires_graph():
+    """Legacy 'laplacian' is still routed as a graph-requiring mode."""
     from refshift.jitter import make_random_reference_transform
     with pytest.raises(ValueError):
         make_random_reference_transform(["car", "laplacian"], graph=None)
