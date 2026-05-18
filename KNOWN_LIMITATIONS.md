@@ -200,21 +200,28 @@ load and analyse without edits; new code should use `"lap_small"`. The
 `DatasetGraph` field `laplacian_idx` is kept as a property aliasing
 `lap_small_idx` so any external code that touched the field still works.
 
-**2. `lap_large` added (McFarland 1997 next-ring large Laplacian).**
-For each channel, the neighbour set is the ring of channels at ranks
-[k_large_skip..k_large_skip+k_large_use) in 3-D Euclidean electrode
-distance, with `k_large_skip=4, k_large_use=4` by default. With these
-defaults, `lap_small` uses ranks 0..3 and `lap_large` uses ranks 4..7,
+**2. `lap_large` added (deterministic next-ring large-Laplacian
+approximation).** For each channel, the neighbour set is the ring of
+channels at ranks [k_large_skip..k_large_skip+k_large_use) in 3-D Euclidean
+electrode distance, with `k_large_skip=4, k_large_use=4` by default. With
+these defaults, `lap_small` uses ranks 0..3 and `lap_large` uses ranks 4..7,
 giving **disjoint neighbour sets between the two operators for every
-channel by construction**. This is the McFarland 1997 next-ring large
-Laplacian (J. Neurosci. Methods 73(2): 169–174), not the k=8-NN variant
-some later papers use under the same name — we picked the next-ring
-variant because the resulting fine-vs-coarse scale separation is more
-useful for the operator-shift analysis. On the Schirrmeister 44-channel
-motor subset the dense h-suffix channels (FFC, FCC, CCP, CPP rows) give
-a natural fine-vs-coarse scale separation between the two Laplacians:
-worth highlighting in the paper as evidence that the two operators are
-not measuring the same thing.
+channel by construction**.
+
+Naming caveat (v0.16): we describe this as a "deterministic next-ring
+large-Laplacian approximation", *motivated by* McFarland et al. 1997
+(J. Neurosci. Methods 73(2): 169–174), but it is NOT literally the same
+operator as a dense-montage large Laplacian. On IV-2a's sparse 22-channel
+montage, ranks 4..7 are not a clean anatomical "ring" — for example,
+Fz's "next ring" includes FC4, Cz, C2, and C1, which is a mixture of
+frontal, midline and central channels rather than a frontal ring. The
+operator is well-defined and disjoint from `lap_small` (which is the
+useful property), and on dense montages like Schirrmeister's 44-channel
+motor subset the ring interpretation is closer to the McFarland intent;
+on sparse montages we recommend reading the paper's `lap_large` results
+as "a deterministic spatial filter at the next-neighbour scale" rather
+than "the McFarland large Laplacian". The implementation is unchanged
+between v0.15 and v0.16; only the framing is corrected.
 
 **3. `csd` added (Perrin spherical-spline surface Laplacian).** The
 formal CSD operator from Perrin et al. 1989 (Electroencephalogr. Clin.
@@ -231,15 +238,57 @@ Defaults match MNE 1.8+: `lambda2=1e-5` (regularization),
 `stiffness=4` (spline order m), `n_legendre_terms=50`, `sphere="auto"`
 (fit to digitization).
 
-**Amplitude scale.** CSD output has very different units (V/m^2) and
-amplitude scale from the other operators. On Gaussian-random unit-variance
-input, CSD output magnitude can be ~10^3-10^4 times the input. For CSP+LDA
-this is benign (OAS covariance is scale-invariant); for the DL models
-ShallowFBCSPNet and EEGNet, the input BatchNorm absorbs scale during
-training, but cross-reference transfer (train CAR, test CSD or vice versa)
-will be visibly affected by the scale difference. **This is the intended
-finding**: CSD is genuinely a different operator and its cross-reference
-transfer should be visibly bad; reporting that is the point.
+**Amplitude scale: a confound, not a feature (v0.16 revision).** CSD output
+has very different units (V/m^2) and amplitude scale from the other
+operators. On real IV-2a EEG post-EMS, CSD output max amplitude is
+~789x CAR's; on Gaussian-random unit-variance input the ratio can reach
+~10^3. This is a unit/scale property of the spherical-spline operator,
+NOT a spatial-topology property.
+
+For CSP+LDA this is benign because the OAS covariance estimator is
+scale-invariant. For DL models with input BatchNorm (ShallowFBCSPNet,
+EEGNet), within-distribution CSD training still converges (verified on
+real IV-2a sub-1: Shallow loss decreases monotonically 1.35 → 0.044
+over 50 epochs, reaching 76% test accuracy). But cross-reference
+transfer involving CSD (train CAR, test CSD or vice versa) confounds
+two distinct effects:
+
+  (a) spatial-derivative operator topology: CSD's high-pass spatial
+      filter produces a fundamentally different view of the signal
+      than CAR or the Laplacians;
+  (b) amplitude scale: regardless of any topology argument, a model
+      trained at 10^0 amplitude and tested at 10^3 amplitude will fail
+      due to BatchNorm's learned statistics being unsuitable for the
+      test distribution.
+
+A reviewer can fairly object that any observed CSD cross-reference
+failure in the headline `run_mismatch` matrix is at least partially a
+scale artefact, not a clean test of operator topology. The honest
+methodological response in v0.16:
+
+  - The headline `operator_distance_correlation` analysis now uses
+    `distance_metric="frobenius_normed"` by default. Each operator is
+    rescaled to unit Frobenius norm before pairwise differencing, so
+    distances reflect only spatial-topology direction. The legacy raw
+    metric is available as `distance_metric="frobenius_raw"` for
+    appendix runs and for cross-comparing against v0.15 results.
+
+  - The new `run_pre_ems_mismatch` runner provides an operator-before-EMS
+    pipeline as a parallel analysis: the reference is applied to the
+    filtered raw, EMS is then applied to the operator's output, and the
+    same NxN matrix is built. If the family structure of the mismatch
+    matrix is similar under both pipelines, the v0.14/v0.15 results
+    were not preprocessing-order artefacts. If they differ
+    substantially for CSD specifically, the operator-before-EMS
+    matrix becomes the primary report for any CSD-related claim and
+    the legacy matrix is appendix-only.
+
+We **do not** drop CSD from the operator set. CSD is a textbook
+reference in the EEG decoding literature and the comparison is
+methodologically informative even when scale-confounded; we just
+report it correctly. The previous framing ("the scale-driven failure is
+the intended finding") was a defensive rationalisation and has been
+withdrawn.
 
 **4. `build_graph` signature extended.** New keyword arguments
 `k_small`, `k_large_skip`, `k_large_use`, `include_csd`, `csd_sfreq`,

@@ -3,15 +3,17 @@
 A classifier trained under one EEG reference operator and tested under another
 suffers a structured, predictable accuracy collapse. This package measures
 that across five MOABB MI datasets, two DL architectures + classical CSP+LDA,
-eight reference and spatial operators, and three interventions: per-sample
-reference jitter, leave-one-reference-out training, and an EMS-control
-ablation.
+eight reference and spatial operators, and four interventions: per-sample
+reference jitter, leave-one-reference-out training, an EMS-control ablation
+(diagonal and full matrix), and a bandpass-mismatch control.
 
-Reference operators (v0.15):
+Reference operators (v0.15+):
     Global symmetric:     native, car, median, rest (Yao 2001 spherical-model)
     Global asymmetric:    cz_ref           (X_i - X_Cz)
     Local spatial-deriv:  lap_small        (Hjorth k=4 NN Laplacian)
-                          lap_large        (McFarland next-ring skip-NN Laplacian)
+                          lap_large        (deterministic next-ring large-Laplacian
+                                            approximation; motivated by McFarland 1997
+                                            but not equivalent on sparse montages)
                           csd              (Perrin spherical-spline surface Laplacian)
 
 Notebook API:
@@ -20,7 +22,10 @@ Notebook API:
     run_mismatch(...)          NxN mismatch matrix (CSP+LDA or DL)
     run_mismatch_jitter(...)   DL with per-sample jitter (full or LOFO)
     run_lofo_matrix(...)       sweep LOFO over every reference
-    run_pre_ems_diagonal(...)  EMS-control ablation
+    run_pre_ems_diagonal(...)  EMS-control diagonal
+    run_pre_ems_mismatch(...)  EMS-control full NxN matrix (v0.16+); apply reference
+                               BEFORE EMS rather than after, to disentangle operator
+                               topology from EMS-interaction effects
     run_bandpass_mismatch(...) bandpass-mismatch control
     mismatch_matrix(df, ...)   long-form -> NxN pivot
 
@@ -32,6 +37,11 @@ Restrict the operator set per run by passing any iterable as reference_modes:
 Output column order is always canonical (REFERENCE_MODES) regardless of
 input iteration order. The legacy name 'laplacian' is accepted as an alias
 for 'lap_small' (operator unchanged; renamed in v0.15).
+
+v0.16 caveat for CSD operator-distance analyses:
+    Use distance_metric='frobenius_normed' (the v0.16 default) when CSD is
+    in the operator set, because raw Frobenius distance is dominated by
+    CSD's amplitude scale rather than spatial topology.
 
 Primitives:
     REFERENCE_MODES, ReferenceTransformer, build_graph, apply_reference,
@@ -57,6 +67,7 @@ from refshift.experiments import (
     run_mismatch,
     run_mismatch_jitter,
     run_pre_ems_diagonal,
+    run_pre_ems_mismatch,
 )
 from refshift.kaggle import setup_kaggle_env, setup_moabb_symlinks
 from refshift.model import SUPPORTED_DL_MODELS, make_csp_lda_pipeline, make_dl_model
@@ -83,6 +94,7 @@ __all__ = [
     "run_mismatch_jitter",
     "run_lofo_matrix",
     "run_pre_ems_diagonal",
+    "run_pre_ems_mismatch",
     "run_bandpass_mismatch",
     # pivots and plots
     "mismatch_matrix",
@@ -110,4 +122,4 @@ __all__ = [
     "SUPPORTED_DL_MODELS",
 ]
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"

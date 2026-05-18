@@ -4,7 +4,10 @@ Eight modes in three families:
     Global symmetric:     native, car, median, rest
     Global asymmetric:    cz_ref           (X_i - X_Cz)
     Local spatial-deriv:  lap_small        (Hjorth k=4 NN local Laplacian)
-                          lap_large        (McFarland next-ring skip-NN Laplacian)
+                          lap_large        (deterministic next-ring large-Laplacian
+                                            approximation: ranks k_large_skip..
+                                            k_large_skip+k_large_use of Euclidean
+                                            neighbour distance)
                           csd              (Perrin spherical-spline surface Laplacian)
 
 LOO-mean is omitted because LOO_i = (C/(C-1)) * CAR_i (scalar multiple of CAR;
@@ -13,16 +16,35 @@ implementation is data-dependent and not a fixed C×C operator. NN-diff was
 removed in v0.13: not a literature-recognised reference, and rank-deficient
 on dense montages.
 
-v0.15 changes:
+v0.15 / v0.16 changes:
     laplacian renamed to lap_small (still accepted via alias for old CSVs).
-    lap_large added with k_skip=4, k_use=4 (McFarland 1997 next-ring variant);
-        on dense h-suffix montages (Schirrmeister motor subset) this produces
-        a natural fine-vs-coarse scale separation against lap_small.
+    lap_large added: deterministic next-ring large-Laplacian approximation
+        with k_skip=4, k_use=4 by default. Motivated by McFarland 1997's
+        large Laplacian but NOT equivalent to it on sparse montages: on
+        IV-2a's 22-channel layout, ranks 4..7 are NOT a clean anatomical
+        ring (e.g. Fz's "next ring" includes FC4, Cz, C2, C1, which are
+        a mixture of frontal, midline and central channels). The operator
+        is still well-defined and useful, but framing it as "the McFarland
+        large Laplacian" overclaims equivalence on sparse montages. See
+        KNOWN_LIMITATIONS.md.
     csd added via mne.preprocessing.compute_current_source_density;
         operator is recovered as a fixed C×C matrix via an identity-basis push
         (purely spatial, time-invariant by construction; verified empirically).
         Defaults match MNE: lambda2=1e-5, stiffness=4, n_legendre_terms=50,
         sphere='auto'.
+
+Important caveat on CSD amplitude scale (v0.16):
+    CSD output magnitude is ~10^2-10^3 times larger than other operators
+    post-EMS on standard MI EEG. This is a unit/scale property of the
+    spherical-spline operator, NOT a spatial-topology property. The raw
+    Frobenius operator distance ||A_csd - A_other||_F is therefore
+    dominated by CSD's scale rather than by spatial-derivative topology.
+    Analyses that depend on operator distance should use scale-normalized
+    variants (see operator_distance_correlation's distance_metric arg).
+    Cross-reference transfer involving CSD also confounds spatial topology
+    with amplitude scale; the run_pre_ems_mismatch runner provides an
+    alternative pipeline (operator before standardization) that controls
+    for this.
 
 All operators take (N, C, T) float arrays. Channel order must match the
 graph's ch_names. Graphs are computed once per dataset via build_graph.
@@ -191,9 +213,7 @@ def _build_rest_matrix(
     on small well-conditioned leadfields and produced numerical noise.
     """
     import mne
-    prev_log_level = mne.get_config("MNE_LOGGING_LEVEL")
-    mne.set_log_level("ERROR")
-    try:
+    with mne.use_log_level("ERROR"):
         info = mne.create_info(
             ch_names=list(ch_names), sfreq=float(sfreq), ch_types="eeg",
         )
@@ -208,9 +228,6 @@ def _build_rest_matrix(
             eeg=True, meg=False, verbose="ERROR",
         )
         G = fwd["sol"]["data"]
-    finally:
-        if prev_log_level is not None:
-            mne.set_log_level(prev_log_level)
 
     C = G.shape[0]
     Ga = G - G.mean(axis=0, keepdims=True)
@@ -245,9 +262,7 @@ def _build_csd_matrix(
     order m), n_legendre_terms=50, sphere='auto' (fit to digitization).
     """
     import mne
-    prev_log_level = mne.get_config("MNE_LOGGING_LEVEL")
-    mne.set_log_level("ERROR")
-    try:
+    with mne.use_log_level("ERROR"):
         C = len(ch_names)
         # Shape (C, C, 1): epoch i has X[i, j, 0] = delta_ij. Use float64
         # internally so the recovered matrix is machine-precision accurate.
@@ -270,9 +285,6 @@ def _build_csd_matrix(
         # epochs_csd[i, :, 0] is A @ e_i = A[:, i], so stack as columns
         # gives A = epochs_csd[..., 0].T
         A = epochs_csd.get_data()[:, :, 0].T
-    finally:
-        if prev_log_level is not None:
-            mne.set_log_level(prev_log_level)
     return np.ascontiguousarray(A, dtype=np.float32)
 
 
@@ -286,7 +298,7 @@ class DatasetGraph:
                          per channel (used by lap_small / Hjorth Laplacian).
         lap_large_idx    (C, k_large_use) int64: indices of the ring of
                          neighbours at ranks [k_large_skip .. k_large_skip+k_large_use)
-                         (used by lap_large / McFarland next-ring Laplacian).
+                         (used by lap_large / deterministic next-ring approximation).
         k_small          number of nearest neighbours for lap_small.
         k_large_skip     number of nearest neighbours to skip before lap_large.
         k_large_use      number of neighbours used by lap_large.
@@ -353,10 +365,12 @@ def build_graph(
         Number of nearest neighbours for lap_small (Hjorth local Laplacian).
         Default 4. Pass via the legacy alias `k=` for backwards compatibility.
     k_large_skip, k_large_use :
-        For lap_large (McFarland-style next-ring Laplacian): each channel's
-        neighbour set is the ring of ranks [k_large_skip .. k_large_skip+k_large_use)
-        in 3D Euclidean distance order. Defaults (4, 4) give disjoint
-        neighbour sets between lap_small and lap_large when both use k=4.
+        For lap_large (deterministic next-ring large-Laplacian approximation):
+        each channel's neighbour set is the ring of ranks
+        [k_large_skip..k_large_skip+k_large_use) in 3D Euclidean distance order.
+        Defaults (4, 4) give disjoint neighbour sets between lap_small and
+        lap_large when both use k=4. Motivated by McFarland 1997; on sparse
+        montages the "ring" is approximate (see module docstring).
     montage :
         MNE standard montage name.
     include_rest :
@@ -448,8 +462,12 @@ _laplacian = _lap_small
 
 
 def _lap_large(X: np.ndarray, lap_large_idx: np.ndarray) -> np.ndarray:
-    """X - mean of the ring of neighbours skipping the closest k_large_skip
-    (McFarland 1997 next-ring large Laplacian).
+    """X - mean of the ring of neighbours skipping the closest k_large_skip.
+
+    A deterministic next-ring large-Laplacian approximation, motivated by but
+    not equivalent to McFarland 1997's dense-montage large Laplacian. On
+    sparse montages the "ring" interpretation breaks down (see module
+    docstring).
     """
     X = _check_3d(X)
     ref = X[:, lap_large_idx].mean(axis=2)

@@ -36,6 +36,8 @@ def setup_dl_run(
     seeds: List[int],
     reference_modes_for_graph: tuple,
     laplacian_k: int = 4,
+    k_large_skip: int = 4,
+    k_large_use: int = 4,
     montage: str = "standard_1005",
     progress: bool = True,
 ) -> DLRunContext:
@@ -44,7 +46,8 @@ def setup_dl_run(
     The graph is built iff any of the declared modes is in _GRAPH_MODES.
     REST is included only when 'rest' is among them (the spherical-model
     forward solution is the slow part). CSD is included only when 'csd' is
-    among them.
+    among them. lap_large uses k_large_skip / k_large_use parameters
+    (defaults match build_graph: 4/4).
     """
     from refshift.reference import _resolve_alias
 
@@ -62,7 +65,9 @@ def setup_dl_run(
             dataset, subject=subjects[0], paradigm=paradigm,
         )
         graph = build_graph(
-            ch_names, k=laplacian_k, montage=montage,
+            ch_names, k_small=laplacian_k,
+            k_large_skip=k_large_skip, k_large_use=k_large_use,
+            montage=montage,
             include_rest=needs_rest, include_csd=needs_csd,
         )
         if progress:

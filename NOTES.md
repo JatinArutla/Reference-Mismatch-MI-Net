@@ -11,7 +11,161 @@ Append, do not edit. New entries on top.
 
 ---
 
-## v0.15.0 — operator-set expansion (spatial-derivative family) and reference-mismatch framing lock
+## v0.16.0 — reviewer-round revisions: CSD scale framing, lap_large humility, pre-EMS mismatch runner
+
+This release responds to an external review round that identified eight
+issues. The work is in three buckets: framing/documentation that was
+defensively wrong (CSD scale, lap_large naming), API gaps that should
+have been caught earlier (`k_large_*` not exposed in runners, raw
+operator distance dominated by CSD scale, MNE log-level not restored
+when previous was `None`), and one genuinely new piece of science
+machinery (`run_pre_ems_mismatch`).
+
+### Framing fix: CSD amplitude scale is a confound, not a feature
+
+v0.15's `KNOWN_LIMITATIONS.md` framed CSD's ~10^3 amplitude scale as
+"the intended finding": *CSD is genuinely a different operator and its
+cross-reference transfer should be visibly bad; reporting that is the
+point.* A reviewer flagged this as defensive rationalisation, and I
+agree on reflection. The honest position:
+
+- **What we measure** in a `run_mismatch` CSD cell with the standard
+  pipeline (reference after EMS): the *joint* effect of CSD's
+  spatial-derivative topology AND the unit/scale mismatch between
+  CSD-output and CAR-output distributions.
+- **What we want to claim**: that operator topology drives transfer
+  failure. The scale argument is uninteresting and uninformative
+  about EEG.
+
+These are not the same thing. A reviewer can fairly say "your CSD
+mismatch is just unit mismatch" and would be right. The v0.16 response:
+
+1. Default `operator_distance_correlation(distance_metric=...)` is now
+   `"frobenius_normed"` instead of `"frobenius_raw"`. Each operator is
+   rescaled to unit Frobenius norm before pairwise differencing, so
+   distances reflect spatial-topology direction only. Raw remains
+   available for appendix runs and cross-version comparison.
+2. New `run_pre_ems_mismatch` runner: applies the reference BEFORE
+   per-channel EMS rather than after. If the family structure of the
+   mismatch matrix is similar under both pipelines, the v0.14/v0.15
+   results were not preprocessing-order artefacts. If they differ for
+   CSD specifically, the pre-EMS pipeline becomes the primary report.
+
+I considered dropping CSD from the operator set to sidestep the
+problem. Rejected: CSD is a textbook EEG reference, and excluding it
+because it's awkward methodologically is worse than including it
+correctly. The paper now reports both raw and scale-normed analyses,
+and both standard and pre-EMS mismatch matrices.
+
+### lap_large naming: deterministic next-ring approximation, not the McFarland Laplacian
+
+v0.15 described lap_large as "the McFarland 1997 next-ring large
+Laplacian". On dense montages this is approximately correct; on
+IV-2a's sparse 22-channel layout it overclaims. For Fz, ranks 4..7 in
+Euclidean order are FC4, Cz, C2, C1 — frontal + midline + central,
+not a frontal ring. The operator math is fine and the disjoint-from-
+lap_small property holds, but calling it "the McFarland large
+Laplacian" invites a fair rebuttal from anyone who actually checks
+the neighbour sets on IV-2a.
+
+Renamed throughout to "deterministic next-ring large-Laplacian
+approximation, motivated by McFarland 1997 but not equivalent on
+sparse montages". Implementation unchanged; only docstrings, README,
+and KNOWN_LIMITATIONS revised.
+
+### API additions and ergonomic fixes
+
+**`k_large_skip` / `k_large_use` exposed in runners.** In v0.15 these
+were accepted by `build_graph` but the only path from `run_mismatch`
+to `build_graph` went through `laplacian_k` (the legacy `k=` alias
+for `k_small`). Now every runner (`run_mismatch`, `run_mismatch_jitter`,
+`run_lofo_matrix`, `run_pre_ems_diagonal`, `run_bandpass_mismatch`,
+new `run_pre_ems_mismatch`) accepts both `k_large_skip` and
+`k_large_use` and threads them through. `load_dl_data` adds
+`pre_ems_k_large_skip` and `pre_ems_k_large_use` to its signature and
+to `_CACHE_KEY_PARAMS`, so distinct settings cache separately.
+
+**`operator_distance_correlation` defaults lowered to 1000/1000.**
+v0.15 defaults of `n_permutations=10_000`, `n_bootstrap=5_000` made
+interactive calls hang. Lowered to 1000 each; for paper-final CIs
+users can raise back up.
+
+**MNE log-level restoration uses `mne.use_log_level("ERROR")` context
+manager.** v0.15's save-restore pattern did nothing useful when the
+previous level was `None`; the context manager handles all cases.
+
+### New runner: `run_pre_ems_mismatch`
+
+DL-only (CSP+LDA doesn't use EMS, so the question doesn't apply). For
+each (subject, seed) and each reference `r` in the mode set, loads
+`load_dl_data(pre_ems_reference=r)` once (cache hit on repeats), then
+runs the full NxN inner loop: train on `X_tr_train_ref`, predict on
+`X_te_test_ref` for every `test_ref`. Trial counts and labels are
+asserted equal across references (the split is metadata-driven, not
+data-driven, so this should always hold; the assertion guards against
+silent corruption).
+
+The output DataFrame has a `pipeline="pre_ems_mismatch"` column to
+allow direct `pd.concat` with `run_mismatch` output for side-by-side
+comparison plotting.
+
+Compute scaling: N refs × S subjects loads (cached after first call,
+shared across seeds), N × S × K trainings. Comparable cost to
+`run_mismatch` (which does N × S × K trainings but only S × K loads).
+
+I considered redesigning the standard DL preprocessing pipeline to do
+reference-then-standardisation by default. Rejected: would break
+v0.14/v0.15 reproducibility for no scientific gain. Add the
+alternative pipeline as a parallel analysis instead, and report both.
+
+### Synthetic test fixture: separated mechanics from interpretation
+
+v0.15 `tests/test_analysis.py`'s `synthetic_df` fixture set
+`base = 0.18` for any CSD pair, with a comment explaining this as
+"CSD's amplitude-scale outlier behaviour". A reviewer correctly
+pointed out that this bakes in a controversial empirical interpretation
+into a test fixture.
+
+The v0.16 fixture keeps the same numerical structure (clustering tests
+need a known ground truth) but reframes the docstring: this is an
+arbitrary structural choice for testing clustering mechanics, not an
+empirical claim. Added a parallel `synthetic_neutral_df` fixture where
+CSD has the same transfer profile as any other spatial-derivative
+operator, for tests that should not depend on CSD being a structural
+outlier (e.g. the new operator-distance metric tests).
+
+### Documentation polish
+
+- "classes is currently CSP+LDA only" claim in `run_mismatch` docstring
+  was stale since v0.14.2 (DL classes plumbing was added then). Removed.
+- "6x6" framing in `experiments/mismatch.py` and `experiments/__init__.py`
+  module docstrings replaced with "NxN" (N depends on the resolved
+  reference set: 8 by default, 7 for Schirrmeister).
+
+### Verification
+
+90 → 95 unit tests after v0.16 additions (1 of the 5 new tests is the
+mocked `run_pre_ems_mismatch` test which skips outside braindecode-
+enabled environments; locally on Kaggle it passes). 0 failures.
+
+### What I rejected
+
+- **Dropping CSD from the operator set.** Methodologically cleaner but
+  scientifically uninformative; CSD is in the EEG decoding literature
+  and our matrix tells readers what they can expect.
+- **Replacing the standard DL pipeline with reference-before-EMS.**
+  Breaks v0.14/v0.15 cache compatibility and downstream notebooks.
+  Adding a parallel runner is the right additive change.
+- **Auto-resolving the `distance_metric` default by inspecting the
+  operator set.** Considered: "if CSD is in the modes, switch to
+  normed; otherwise raw". Rejected as too magic — explicit beats
+  implicit, and a user who wants raw-Frobenius with CSD (e.g. to
+  cross-compare with v0.15) shouldn't have to override an
+  auto-detection.
+
+---
+
+
 
 ### Framing locked: "reference mismatch", not "spatial operator shift"
 

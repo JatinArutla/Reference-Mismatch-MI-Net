@@ -70,6 +70,7 @@ _CACHE_KEY_PARAMS = (
     "trial_start_offset_s", "trial_stop_offset_s",
     "pre_ems_reference",
     "pre_ems_laplacian_k", "pre_ems_montage",
+    "pre_ems_k_large_skip", "pre_ems_k_large_use",
     "classes",
 )
 
@@ -103,15 +104,17 @@ def load_dl_data(
     cache_dir: Optional[str] = None,
     pre_ems_reference: Optional[str] = None,
     pre_ems_laplacian_k: int = 4,
+    pre_ems_k_large_skip: int = 4,
+    pre_ems_k_large_use: int = 4,
     pre_ems_montage: str = "standard_1005",
     classes: Optional[Sequence[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float, List[str]]:
     """Load one subject's MI data through the canonical preprocess pipeline.
 
-    pre_ems_reference, pre_ems_laplacian_k, pre_ems_montage are only used when
-    pre_ems_reference is not None. They control the graph built inside
-    _apply_pre_ems_ref and are part of the cache key, so distinct settings
-    cache to distinct entries.
+    pre_ems_reference, pre_ems_laplacian_k, pre_ems_k_large_skip,
+    pre_ems_k_large_use, pre_ems_montage are only used when pre_ems_reference
+    is not None. They control the graph built inside _apply_pre_ems_ref and
+    are part of the cache key, so distinct settings cache to distinct entries.
 
     classes=None loads the dataset's full class set. classes=(c1, c2, ...) keeps
     only trials whose label is in the tuple and re-indexes y to 0..len(classes)-1
@@ -159,6 +162,8 @@ def load_dl_data(
         "pre_ems_reference": str(pre_ems_reference) if pre_ems_reference else None,
         "pre_ems_laplacian_k": int(pre_ems_laplacian_k),
         "pre_ems_montage": str(pre_ems_montage),
+        "pre_ems_k_large_skip": int(pre_ems_k_large_skip),
+        "pre_ems_k_large_use": int(pre_ems_k_large_use),
         "classes": ",".join(kept_classes),
     }
 
@@ -230,7 +235,9 @@ def load_dl_data(
             needs_graph = canonical_pre_ems in _GRAPH_MODES
             graph = build_graph(
                 ch_names,
-                k=int(pre_ems_laplacian_k),
+                k_small=int(pre_ems_laplacian_k),
+                k_large_skip=int(pre_ems_k_large_skip),
+                k_large_use=int(pre_ems_k_large_use),
                 montage=str(pre_ems_montage),
                 include_rest=(canonical_pre_ems == "rest"),
                 include_csd=(canonical_pre_ems == "csd"),

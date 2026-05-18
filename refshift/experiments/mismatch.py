@@ -1,14 +1,15 @@
-"""6x6 train-test reference mismatch matrix.
+"""NxN train-test reference mismatch matrix.
 
 For each (subject, seed):
   1. Load epoched data (CSP+LDA: paradigm.get_data; DL: load_dl_data via braindecode).
   2. Train/test split.
-  3. Pre-compute all 6 test variants once.
+  3. Pre-compute all N test variants once.
   4. For each train_ref: train one model on apply_reference(X_tr, train_ref);
-     score on each of the 6 test variants.
+     score on each of the N test variants.
 
-The CSP+LDA and DL branches share the inner train-once-evaluate-many loop
-via _train_and_evaluate.
+N is determined by the resolved reference_modes (8 by default, 7 for
+Schirrmeister2017 which drops cz_ref). The CSP+LDA and DL branches share
+the inner train-once-evaluate-many loop via _train_and_evaluate.
 """
 
 from __future__ import annotations
@@ -114,6 +115,8 @@ def run_mismatch(
     split_strategy: str = "auto",
     n_filters: int = 6,
     laplacian_k: int = 4,
+    k_large_skip: int = 4,
+    k_large_use: int = 4,
     montage: str = "standard_1005",
     cache: bool = True,
     progress: bool = True,
@@ -130,11 +133,11 @@ def run_mismatch(
     dl_trial_stop_offset_s: float = 0.0,
     dl_cache_dir: Optional[str] = None,
 ) -> pd.DataFrame:
-    """Run the train-test reference mismatch matrix on one dataset.
+    """Run the NxN train-test reference mismatch matrix on one dataset.
 
-    model in {'csp_lda', 'eegnet', 'shallow'}. classes is currently CSP+LDA
-    only (DL would need plumbing through load_dl_data). subjects=None uses
-    the dataset's full subject list with known-bad subjects excluded.
+    model in {'csp_lda', 'eegnet', 'shallow'}. classes is threaded through
+    both the CSP+LDA and DL paths (DL plumbing added in v0.14.2). subjects=None
+    uses the dataset's full subject list with known-bad subjects excluded.
 
     reference_modes accepts any iterable (set, tuple, list, frozenset).
     Set in your notebook to restrict the matrix to a subset:
@@ -145,6 +148,14 @@ def run_mismatch(
     The output matrix is always laid out in canonical REFERENCE_MODES order
     regardless of input iteration order. The legacy name 'laplacian' is
     accepted as an alias for 'lap_small'.
+
+    Spatial-derivative parameters:
+        laplacian_k:   number of nearest neighbours for lap_small (alias k_small);
+                       default 4.
+        k_large_skip:  number of nearest neighbours to skip for lap_large; default 4.
+        k_large_use:   number of neighbours used by lap_large; default 4.
+        With defaults (k_small=4, skip=4, use=4) lap_small uses ranks 0..3 and
+        lap_large uses ranks 4..7 -- disjoint neighbour sets for every channel.
     """
     model_lc = model.lower()
     if model_lc == "csp_lda":
@@ -169,7 +180,9 @@ def run_mismatch(
         ctx = setup_dl_run(
             dataset_id, subjects=subjects, seeds=seeds,
             reference_modes_for_graph=modes,
-            laplacian_k=laplacian_k, montage=montage, progress=progress,
+            laplacian_k=laplacian_k,
+            k_large_skip=k_large_skip, k_large_use=k_large_use,
+            montage=montage, progress=progress,
         )
         validate_reference_modes(modes, ctx.graph, dataset_id=dataset_id)
         for subject, seed, X_tr, y_tr, X_te, y_te, sfreq in iter_per_subject_dl_jobs(
@@ -229,7 +242,9 @@ def run_mismatch(
     if needs_graph:
         ch_names = get_eeg_channel_names(dataset, subject=subjects[0], paradigm=paradigm)
         graph = build_graph(
-            ch_names, k=laplacian_k, montage=montage,
+            ch_names, k_small=laplacian_k,
+            k_large_skip=k_large_skip, k_large_use=k_large_use,
+            montage=montage,
             include_rest=needs_rest, include_csd=needs_csd,
         )
         if progress:

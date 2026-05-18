@@ -262,8 +262,25 @@ def _estimate_linear_operator(
 
 @dataclass
 class OperatorDistanceResult:
-    """Asymptotic stats unreliable at n=15 pairs; report perm_p and ci95 in papers."""
+    """Asymptotic stats unreliable at small n_pairs; report perm_p and ci95 in papers.
+
+    Fields:
+        references          mode names in matrix order
+        distance_metric     'frobenius_raw' or 'frobenius_normed'
+        distances_frobenius N×N pairwise distance matrix under distance_metric
+        transfer_gaps       N×N transfer-gap matrix (diag_mean - sym_M)
+        spearman_rho        Spearman correlation between upper-triangle of the two
+        spearman_p          asymptotic Spearman p (unreliable at small N; use perm_p_*)
+        pearson_r           Pearson correlation
+        pearson_p           asymptotic Pearson p (unreliable; use perm_p_*)
+        perm_p_spearman     permutation-test p-value (operator-label shuffle)
+        perm_p_pearson      same, for Pearson
+        ci95_spearman       bootstrap 95% CI over pair resampling
+        ci95_pearson        same, for Pearson
+        pair_table          long-form DataFrame of all upper-triangle pairs
+    """
     references: List[str]
+    distance_metric: str
     distances_frobenius: np.ndarray
     transfer_gaps: np.ndarray
     spearman_rho: float
@@ -277,29 +294,95 @@ class OperatorDistanceResult:
     pair_table: pd.DataFrame
 
 
+def _operator_distance_matrix(
+    ops: Dict[str, np.ndarray],
+    refs: List[str],
+    metric: str,
+) -> np.ndarray:
+    """Pairwise Frobenius distance under the requested metric.
+
+    metric='frobenius_raw':
+        ||A_i - A_j||_F. Dominated by the operator with the largest
+        Frobenius norm. For CSD (||A_csd||_F >> others) this means raw
+        distances are dominated by CSD's amplitude scale, not its
+        spatial-derivative topology. Useful when amplitude matters
+        (e.g. decoder transfer where input scale affects BatchNorm); the
+        legacy / v0.15 behaviour.
+
+    metric='frobenius_normed':
+        ||A_i/||A_i||_F - A_j/||A_j||_F||_F. Each operator is rescaled
+        to unit Frobenius norm before differencing, so distance reflects
+        only the operator's spatial-topology direction in matrix space.
+        Values are in [0, sqrt(2)]. This is the metric a paper should
+        use to claim "operator topology drives transfer", because the
+        raw metric confounds topology with scale.
+    """
+    n = len(refs)
+    D = np.zeros((n, n))
+    if metric == "frobenius_raw":
+        for i, a in enumerate(refs):
+            for j, b in enumerate(refs):
+                D[i, j] = np.linalg.norm(ops[a] - ops[b], ord="fro")
+        return D
+    if metric == "frobenius_normed":
+        normed = {}
+        for r in refs:
+            A = ops[r]
+            fro = np.linalg.norm(A, ord="fro")
+            if fro < 1e-12:
+                # Pathological: zero operator. Keep as-is to avoid 0/0.
+                normed[r] = A
+            else:
+                normed[r] = A / fro
+        for i, a in enumerate(refs):
+            for j, b in enumerate(refs):
+                D[i, j] = np.linalg.norm(normed[a] - normed[b], ord="fro")
+        return D
+    raise ValueError(
+        f"Unknown distance_metric={metric!r}. "
+        f"Use 'frobenius_raw' or 'frobenius_normed'."
+    )
+
+
 def operator_distance_correlation(
     mean_matrix: pd.DataFrame,
     ch_names: List[str],
     *,
     k_laplacian: int = 4,
     montage: str = "standard_1005",
+    distance_metric: str = "frobenius_normed",
     n_probe_times: int = 2000,
     n_probes: int = 8,
     seed: int = 0,
-    n_permutations: int = 10_000,
-    n_bootstrap: int = 5_000,
+    n_permutations: int = 1_000,
+    n_bootstrap: int = 1_000,
 ) -> OperatorDistanceResult:
-    """Test whether Frobenius operator distance predicts transfer gap.
+    """Test whether operator distance predicts cross-reference transfer gap.
 
     For every linear operator (native, CAR, REST, CSD, cz_ref, lap_small,
     lap_large) the exact C×C matrix is used. For median (non-linear), an
     n_probes-averaged Gaussian-probe linear tangent is used. Pairwise
-    Frobenius distances are then correlated with
+    distances are then correlated with
         gap_ij = diag_mean - 0.5*(M_ij + M_ji)
     on the upper triangle. Bootstrap CIs over pairs and permutation p-values
     over operator-label shuffles are reported because n=21 pairs at 7
     operators (or 28 at 8) makes asymptotic Spearman/Pearson p-values
     unreliable.
+
+    distance_metric:
+        'frobenius_normed' (default, v0.16+): scale-invariant distance.
+            Each operator is normalised to unit Frobenius norm before
+            differencing. THIS IS WHAT PAPER HEADLINE RESULTS SHOULD USE
+            when CSD is in the operator set, because raw Frobenius is
+            dominated by CSD's ~10^3x amplitude scale, not by spatial
+            topology.
+        'frobenius_raw' (v0.15 default; appendix only when CSD is present):
+            ||A_i - A_j||_F. Confounds topology with operator amplitude.
+
+    n_permutations and n_bootstrap default to 1000 in v0.16 (down from
+    10000 / 5000). For paper-ready CIs you may want to raise n_bootstrap
+    to 5000-10000, but for notebook/interactive use the lower defaults
+    give qualitatively identical results in <10s.
 
     Not a Ben-David H-divergence bound: Frobenius distance is data-free; the
     correlation with empirical transfer gap is a structural finding, not tight.
@@ -311,6 +394,11 @@ def operator_distance_correlation(
     refs = [_resolve_alias(r) for r in mean_matrix.index]
     if [_resolve_alias(c) for c in mean_matrix.columns] != refs:
         raise ValueError("mean_matrix must be square with matching row/col order")
+    if distance_metric not in ("frobenius_raw", "frobenius_normed"):
+        raise ValueError(
+            f"Unknown distance_metric={distance_metric!r}. "
+            f"Use 'frobenius_raw' or 'frobenius_normed'."
+        )
 
     need_rest = "rest" in refs
     need_csd = "csd" in refs
@@ -332,10 +420,7 @@ def operator_distance_correlation(
             )
 
     n = len(refs)
-    D_op = np.zeros((n, n))
-    for i, a in enumerate(refs):
-        for j, b in enumerate(refs):
-            D_op[i, j] = np.linalg.norm(ops[a] - ops[b], ord="fro")
+    D_op = _operator_distance_matrix(ops, refs, distance_metric)
 
     M = mean_matrix.to_numpy().astype(np.float64)
     Msym = 0.5 * (M + M.T)
@@ -406,6 +491,7 @@ def operator_distance_correlation(
 
     return OperatorDistanceResult(
         references=refs,
+        distance_metric=distance_metric,
         distances_frobenius=D_op,
         transfer_gaps=gap,
         spearman_rho=float(r_s), spearman_p=float(p_s),
@@ -425,18 +511,30 @@ def plot_operator_distance_scatter(
     dpi: int = 140,
     annotate: bool = True,
 ):
-    """Scatter Frobenius distance vs transfer gap; returns the figure."""
+    """Scatter operator distance vs transfer gap; returns the figure.
+
+    The x-axis label adapts to result.distance_metric so the plot is
+    self-describing for paper figures.
+    """
     import matplotlib.pyplot as plt
 
     df = result.pair_table
     fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
     ax.scatter(df["distance_frobenius"], df["transfer_gap"], s=36, alpha=0.8)
-    ax.set_xlabel(r"Operator Frobenius distance  $\|A_i - A_j\|_F$")
+    if result.distance_metric == "frobenius_normed":
+        ax.set_xlabel(
+            r"Scale-normalized operator distance  "
+            r"$\|A_i/\|A_i\|_F - A_j/\|A_j\|_F\|_F$"
+        )
+    else:
+        ax.set_xlabel(r"Operator Frobenius distance  $\|A_i - A_j\|_F$")
     ax.set_ylabel("Transfer gap  (diag - symmetric transfer)")
     if title is None:
         title = (
-            f"Operator distance vs transfer gap\n"
-            f"Spearman rho = {result.spearman_rho:.3f}  (p = {result.spearman_p:.1e})"
+            f"Operator distance vs transfer gap "
+            f"({result.distance_metric})\n"
+            f"Spearman rho = {result.spearman_rho:.3f}  "
+            f"(perm p = {result.perm_p_spearman:.3f})"
         )
     ax.set_title(title)
     ax.grid(True, alpha=0.3)

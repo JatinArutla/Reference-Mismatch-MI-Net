@@ -23,17 +23,32 @@ exponential moving standardization composes with reference operators.
 |  | `rest` | REST-like spherical-model re-reference (Yao 2001 approximation) |
 | Global / asymmetric | `cz_ref` | X − X[Cz] (single-electrode reference; sets Cz channel to zero) |
 | Local spatial-derivative | `lap_small` | X − mean of k=4 nearest neighbours (Hjorth local Laplacian) |
-|  | `lap_large` | X − mean of the ring of neighbours at ranks 4..7 (McFarland 1997 next-ring large Laplacian) |
+|  | `lap_large` | X − mean of the ring of neighbours at ranks 4..7 (deterministic next-ring large-Laplacian approximation; motivated by McFarland 1997 but not equivalent on sparse montages) |
 |  | `csd` | Perrin spherical-spline surface Laplacian (`mne.preprocessing.compute_current_source_density`) |
 
 `lap_small`'s default neighbour set is ranks 0..3 in 3-D electrode distance;
 `lap_large` uses ranks 4..7. With these defaults the two operators have
-disjoint neighbour sets for every channel by construction. `csd` is the
-formal current-source-density operator from Perrin et al. 1989; refshift
-recovers it as a fixed C×C matrix by pushing the identity basis through
-`mne.preprocessing.compute_current_source_density` and reading the output
-(per-epoch application of MNE gives identical results to within machine
-precision in float64; the matrix form is much faster).
+disjoint neighbour sets for every channel by construction. The "ring"
+interpretation is approximate on sparse montages — on IV-2a's 22 channels
+the next-ring neighbours can mix hemispheres or anatomical zones (see
+`KNOWN_LIMITATIONS.md`); the disjointness from `lap_small` is the actual
+useful property, regardless of whether "ring" terminology applies.
+
+`csd` is the formal current-source-density operator from Perrin et al. 1989;
+refshift recovers it as a fixed C×C matrix by pushing the identity basis
+through `mne.preprocessing.compute_current_source_density` and reading the
+output (per-epoch application of MNE gives identical results to within
+machine precision in float64; the matrix form is much faster).
+
+**CSD amplitude scale caveat (v0.16).** CSD output amplitude is ~10^2-10^3
+times the other operators (789x CAR on real IV-2a post-EMS). This is a
+unit/scale property of the spherical-spline operator, not spatial topology.
+Analyses that depend on operator distance should use the scale-normalized
+metric (`operator_distance_correlation(..., distance_metric="frobenius_normed")`,
+the v0.16 default). Cross-reference transfer involving CSD confounds
+operator topology with amplitude scale; `run_pre_ems_mismatch` (new in v0.16)
+provides an operator-before-EMS pipeline that allows the two effects to be
+disentangled. See `KNOWN_LIMITATIONS.md` for the full discussion.
 
 `laplacian` is accepted as a legacy alias for `lap_small` (the operator
 was renamed in v0.15; old CSVs and notebooks keep working without edits).

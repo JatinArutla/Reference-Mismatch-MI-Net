@@ -53,6 +53,8 @@ def run_mismatch_jitter(
     classes: Optional[tuple] = None,
     split_strategy: str = "auto",
     laplacian_k: int = 4,
+    k_large_skip: int = 4,
+    k_large_use: int = 4,
     montage: str = "standard_1005",
     progress: bool = True,
     dl_max_epochs: int = 200,
@@ -121,7 +123,9 @@ def run_mismatch_jitter(
     ctx = setup_dl_run(
         dataset_id, subjects=subjects, seeds=seeds,
         reference_modes_for_graph=tuple(set(train_modes) | set(test_modes)),
-        laplacian_k=laplacian_k, montage=montage, progress=progress,
+        laplacian_k=laplacian_k,
+        k_large_skip=k_large_skip, k_large_use=k_large_use,
+        montage=montage, progress=progress,
     )
     validate_reference_modes(train_modes, ctx.graph, dataset_id=dataset_id)
     validate_reference_modes(test_modes, ctx.graph, dataset_id=dataset_id)

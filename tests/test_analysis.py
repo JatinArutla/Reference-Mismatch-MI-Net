@@ -21,21 +21,25 @@ from refshift.reference import REFERENCE_MODES
 
 @pytest.fixture
 def synthetic_df():
-    """Long-form mismatch result with structure designed to match what we
-    expect from v0.15's 8-mode set:
+    """Long-form mismatch result with KNOWN cluster structure for testing
+    clustering and analysis mechanics. The specific numerical values are
+    arbitrary fixture choices, NOT empirical predictions about real EEG.
 
-      - Diagonal ~0.60.
-      - Within global-mean family ({native, car, median, rest}): off-diag ~0.55.
-      - Within spatial-derivative family ({lap_small, lap_large}): off-diag ~0.45.
-      - Spatial-derivative vs global-mean: off-diag ~0.30.
-      - cz_ref vs anything: off-diag ~0.30.
-      - CSD vs anything: off-diag ~0.18 (CSD's amplitude scale is far
-        bigger than any other operator; BatchNorm trained on CAR-scale
-        data fails badly on CSD-scale data, and vice versa).
+    Cluster structure used for the fixture:
+      - Diagonal cells:          0.60
+      - Within global-mean family ({native, car, median, rest}): 0.55
+      - Within spatial-derivative family ({lap_small, lap_large}): 0.45
+      - CSD as own cluster:      0.18 to/from anything else
+      - Cross-family (everything else): 0.30
 
-    With this structure k=2 clustering should separate global-mean from
-    the spatial-derivative outliers, and the operator-distance / transfer-gap
-    correlation should be positive (large operator distance -> large gap).
+    This deliberately makes CSD a maximally separated cluster at k=2 so the
+    clustering-mechanics tests have a clean, unambiguous ground-truth to
+    recover. It does NOT claim that real-world CSD transfer is 0.18 or
+    that the failure is amplitude-driven. The empirical CSD behavior is an
+    open scientific question handled in the full mismatch experiments;
+    the synthetic_neutral_df fixture below is the scale-neutral variant
+    for operator-distance tests that should not bake in any CSD outlier
+    interpretation.
     """
     rng = np.random.default_rng(0)
     refs = list(REFERENCE_MODES)
@@ -48,15 +52,14 @@ def synthetic_df():
                 if train_ref == test_ref:
                     base = 0.60
                 elif "csd" in (train_ref, test_ref):
-                    # CSD's amplitude-scale outlier behaviour: bad transfer
-                    # to/from anything else.
+                    # Fixture choice: maximally separated cluster for testing
+                    # clustering mechanics. NOT an empirical claim.
                     base = 0.18
                 elif train_ref in global_mean and test_ref in global_mean:
                     base = 0.55
                 elif train_ref in spatial and test_ref in spatial:
                     base = 0.45
                 else:
-                    # cross-family (spatial <-> global, cz_ref <-> anything)
                     base = 0.30
                 acc = base + 0.02 * rng.standard_normal()
                 rows.append({
@@ -65,6 +68,52 @@ def synthetic_df():
                     "accuracy": float(np.clip(acc, 0.0, 1.0)),
                 })
     return pd.DataFrame(rows)
+
+
+@pytest.fixture
+def synthetic_neutral_df():
+    """Scale-neutral synthetic data: CSD has the same transfer profile as
+    any other spatial-derivative operator. Use this for operator-distance
+    tests so they don't depend on CSD being a structural outlier.
+
+    Cluster structure:
+      - Diagonal cells:        0.60
+      - Within global-mean ({native, car, median, rest}): 0.55
+      - Within spatial-derivative ({lap_small, lap_large, csd}): 0.45
+      - cz_ref vs anything (asymmetric global): 0.30
+      - Cross-family (global <-> spatial): 0.30
+    """
+    rng = np.random.default_rng(0)
+    refs = list(REFERENCE_MODES)
+    global_mean = {"native", "car", "median", "rest"}
+    spatial_deriv = {"lap_small", "lap_large", "csd"}
+    rows = []
+    for subj in range(1, 6):
+        for train_ref in refs:
+            for test_ref in refs:
+                if train_ref == test_ref:
+                    base = 0.60
+                elif train_ref in global_mean and test_ref in global_mean:
+                    base = 0.55
+                elif train_ref in spatial_deriv and test_ref in spatial_deriv:
+                    base = 0.45
+                else:
+                    base = 0.30
+                acc = base + 0.02 * rng.standard_normal()
+                rows.append({
+                    "subject": subj, "seed": 0,
+                    "train_ref": train_ref, "test_ref": test_ref,
+                    "accuracy": float(np.clip(acc, 0.0, 1.0)),
+                })
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture
+def synthetic_neutral_mean_matrix(synthetic_neutral_df):
+    """Scale-neutral mean matrix counterpart."""
+    return synthetic_neutral_df.groupby(["train_ref", "test_ref"])["accuracy"].mean().unstack("test_ref").reindex(
+        index=list(REFERENCE_MODES), columns=list(REFERENCE_MODES),
+    )
 
 
 @pytest.fixture
@@ -228,11 +277,17 @@ def test_operator_distance_result_shapes(synthetic_mean_matrix, iv2a_ch_names):
 
 def test_operator_distance_identity_row_is_small(synthetic_mean_matrix, iv2a_ch_names):
     """'native' is literally the identity operator; its distance to itself is 0
-    and distance to CAR should be ~sqrt(C*1/C) ~ 1.0 regardless of data.
+    and distance to CAR should be ~sqrt(C*1/C) ~ 1.0 in the raw Frobenius
+    metric regardless of data.
+
+    v0.16: pass distance_metric="frobenius_raw" explicitly. The default became
+    'frobenius_normed' in v0.16 to control for CSD's amplitude scale; the
+    closed-form ||J/C||_F = 1 identity holds only under raw distance.
     """
     pytest.importorskip("mne")
     result = operator_distance_correlation(
         synthetic_mean_matrix, iv2a_ch_names,
+        distance_metric="frobenius_raw",
     )
     refs = result.references
     i = refs.index("native")
@@ -241,6 +296,7 @@ def test_operator_distance_identity_row_is_small(synthetic_mean_matrix, iv2a_ch_
     assert result.distances_frobenius[i, i] == pytest.approx(0.0, abs=1e-10)
     # native vs CAR: ||I - (I - J/C)||_F = ||J/C||_F = sqrt(C * C * 1/C^2) = 1
     assert result.distances_frobenius[i, j] == pytest.approx(1.0, abs=0.1)
+    assert result.distance_metric == "frobenius_raw"
 
 
 def test_operator_distance_correlation_returns_ci_and_perm_p():
@@ -320,3 +376,227 @@ def test_baseline_diagonal_view_resolves_laplacian_alias():
     diag = baseline_diagonal_view(df)
     # Diagonal cells only; both should become 'lap_small' / 'car'.
     assert set(diag["test_ref"].unique()) == {"lap_small", "car"}
+
+
+# ---------------------------------------------------------------------------
+# v0.16: distance_metric in operator_distance_correlation
+# ---------------------------------------------------------------------------
+
+def test_operator_distance_metric_normed_default(iv2a_ch_names):
+    """v0.16: default distance_metric is 'frobenius_normed'. Verify the
+    OperatorDistanceResult records the metric and that normed distances
+    are in [0, sqrt(2)] for every pair (each operator has unit Frobenius
+    norm by construction)."""
+    pytest.importorskip("mne")
+    import pandas as pd
+    refs = ["native", "car", "lap_small", "csd"]
+    rng = np.random.default_rng(0)
+    M = 0.4 + 0.05 * rng.standard_normal((4, 4))
+    np.fill_diagonal(M, 0.7)
+    df = pd.DataFrame(M, index=refs, columns=refs)
+    res = operator_distance_correlation(
+        df, iv2a_ch_names,
+        n_permutations=100, n_bootstrap=100,
+    )
+    # Default in v0.16 is frobenius_normed.
+    assert res.distance_metric == "frobenius_normed"
+    # Normed distances bounded in [0, sqrt(2)]: each normalized operator
+    # has unit Frobenius norm, so ||A_norm_i - A_norm_j||_F <= 2 by
+    # triangle inequality, and equality only at "opposite" operators.
+    # In practice values stay well under sqrt(2).
+    D = res.distances_frobenius
+    assert D.shape == (4, 4)
+    assert (D >= 0).all()
+    assert (D <= np.sqrt(2.0) + 1e-9).all(), (
+        f"normed distances exceed sqrt(2): max={D.max()}"
+    )
+    # Diagonal is exactly zero.
+    np.testing.assert_allclose(np.diag(D), 0.0, atol=1e-10)
+
+
+def test_operator_distance_metric_raw_vs_normed_csd_dominates_raw(iv2a_ch_names):
+    """v0.16: when CSD is included, raw Frobenius is dominated by CSD's
+    amplitude scale. The scale-normed distance suppresses this, so the ratio
+    of (CSD pair distance / non-CSD pair distance) should be much smaller
+    under normed than under raw. This is the test that validates the new
+    metric actually addresses the scale confound.
+    """
+    pytest.importorskip("mne")
+    import pandas as pd
+    refs = ["native", "car", "lap_small", "csd"]
+    rng = np.random.default_rng(0)
+    M = 0.4 + 0.05 * rng.standard_normal((4, 4))
+    np.fill_diagonal(M, 0.7)
+    df = pd.DataFrame(M, index=refs, columns=refs)
+
+    raw = operator_distance_correlation(
+        df, iv2a_ch_names,
+        distance_metric="frobenius_raw",
+        n_permutations=50, n_bootstrap=50,
+    )
+    nor = operator_distance_correlation(
+        df, iv2a_ch_names,
+        distance_metric="frobenius_normed",
+        n_permutations=50, n_bootstrap=50,
+    )
+
+    # csd pair indices.
+    rrefs = raw.references
+    csd_i = rrefs.index("csd")
+    car_i = rrefs.index("car")
+    nat_i = rrefs.index("native")
+
+    raw_csd_car = raw.distances_frobenius[csd_i, car_i]
+    raw_nat_car = raw.distances_frobenius[nat_i, car_i]
+    nor_csd_car = nor.distances_frobenius[csd_i, car_i]
+    nor_nat_car = nor.distances_frobenius[nat_i, car_i]
+
+    raw_ratio = raw_csd_car / max(raw_nat_car, 1e-9)
+    nor_ratio = nor_csd_car / max(nor_nat_car, 1e-9)
+
+    # The raw ratio is huge (CSD has Frobenius norm ~10^3 vs ~1 for others).
+    # The normed ratio is small (both pairs have ||.||_F = 1 components).
+    assert raw_ratio > 100, (
+        f"Expected CSD-CAR raw distance >> native-CAR raw distance; "
+        f"got raw_ratio={raw_ratio}"
+    )
+    assert nor_ratio < 10, (
+        f"normed distance should suppress the scale dominance; got "
+        f"nor_ratio={nor_ratio} (should be O(1), not O(1000))"
+    )
+
+
+def test_operator_distance_correlation_rejects_unknown_metric(iv2a_ch_names):
+    """Unknown distance_metric must raise ValueError."""
+    pytest.importorskip("mne")
+    import pandas as pd
+    refs = ["native", "car", "lap_small"]
+    df = pd.DataFrame(
+        np.diag([0.7, 0.7, 0.7]) + 0.4 * (1 - np.eye(3)),
+        index=refs, columns=refs,
+    )
+    with pytest.raises(ValueError, match="Unknown distance_metric"):
+        operator_distance_correlation(
+            df, iv2a_ch_names,
+            distance_metric="cosine_similarity",
+            n_permutations=10, n_bootstrap=10,
+        )
+
+
+def test_operator_distance_correlation_neutral_fixture(
+    synthetic_neutral_mean_matrix, iv2a_ch_names,
+):
+    """Scale-neutral fixture (CSD not baked as outlier). With
+    frobenius_normed, the topology-driven distance should still produce a
+    sensible Spearman correlation (likely positive) without CSD dominating.
+    """
+    pytest.importorskip("mne")
+    res = operator_distance_correlation(
+        synthetic_neutral_mean_matrix, iv2a_ch_names,
+        n_permutations=100, n_bootstrap=100,
+    )
+    # Test mechanics: result has the right shape and metadata, doesn't crash.
+    n = len(synthetic_neutral_mean_matrix)
+    assert res.distances_frobenius.shape == (n, n)
+    assert len(res.pair_table) == n * (n - 1) // 2
+    assert res.distance_metric == "frobenius_normed"
+    assert -1.0 <= res.spearman_rho <= 1.0
+    assert 0.0 < res.perm_p_spearman <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# v0.16: run_pre_ems_mismatch (mocked, DL-only)
+# ---------------------------------------------------------------------------
+
+def test_run_pre_ems_mismatch_produces_nxn_long_form(monkeypatch):
+    """run_pre_ems_mismatch should call load_dl_data once per reference,
+    train one model per train_ref, and score on all test_refs. Output is
+    long-form with the expected columns and N*N cells per (subject, seed)."""
+    pytest.importorskip("braindecode")
+    pytest.importorskip("torch")
+    import pandas as pd
+    from refshift.experiments.pre_ems_mismatch import run_pre_ems_mismatch
+
+    modes = ("native", "car", "lap_small")
+    C, T, N = 4, 100, 16
+    sfreq = 250.0
+    ch_names = ["C1", "C2", "C3", "C4"]
+    y = np.array([0, 1] * (N // 2), dtype=np.int64)
+    metadata = pd.DataFrame({
+        "session": ["0"] * N,
+        "run": ["0"] * (N // 2) + ["1"] * (N // 2),
+        "subject": [1] * N,
+    })
+
+    def fake_load_dl_data(dataset_id, subject, **kwargs):
+        # Return slightly different data for each ref so train/test splits
+        # are stable but predictions are not constant.
+        rng = np.random.default_rng(hash(kwargs["pre_ems_reference"]) & 0xFFFF)
+        X = rng.standard_normal((N, C, T)).astype(np.float32)
+        return X, y, metadata, sfreq, ch_names
+
+    class FakeDLModel:
+        def __init__(self, *args, **kwargs):
+            self.n_classes = kwargs.get("n_classes", 2)
+        def fit(self, X, y):
+            return self
+        def predict(self, X):
+            return np.zeros(X.shape[0], dtype=np.int64)
+
+    class FakeDataset:
+        code = "FAKE"
+        subject_list = [1]
+
+    class FakeParadigm:
+        channels = ch_names
+
+    monkeypatch.setattr(
+        "refshift.experiments.pre_ems_mismatch.load_dl_data",
+        fake_load_dl_data,
+    )
+    monkeypatch.setattr(
+        "refshift.experiments.pre_ems_mismatch.resolve_dataset",
+        lambda dataset_id: (FakeDataset(), FakeParadigm()),
+    )
+    monkeypatch.setattr(
+        "refshift.experiments.pre_ems_mismatch.get_eeg_channel_names",
+        lambda dataset, subject, paradigm: ch_names,
+    )
+    monkeypatch.setattr(
+        "refshift.model.make_dl_model",
+        lambda **kwargs: FakeDLModel(**kwargs),
+    )
+    # validate_reference_modes can pass through; ch_names has C1..C4 which
+    # don't include Cz, but cz_ref isn't in our modes.
+
+    df = run_pre_ems_mismatch(
+        "fake_id",
+        model="shallow",
+        subjects=[1],
+        seeds=[0],
+        reference_modes=modes,
+        progress=False,
+    )
+    # NxN long form: 3 train_ref * 3 test_ref * 1 subject * 1 seed = 9 rows.
+    assert df.shape[0] == 9
+    expected_cols = {
+        "dataset", "subject", "seed", "pipeline",
+        "train_ref", "test_ref", "accuracy", "kappa",
+        "n_train", "n_test",
+    }
+    assert expected_cols.issubset(set(df.columns))
+    # Every (train_ref, test_ref) cell present.
+    pairs = set(zip(df["train_ref"], df["test_ref"]))
+    expected_pairs = {(a, b) for a in modes for b in modes}
+    assert pairs == expected_pairs
+    # All rows tagged pipeline="pre_ems_mismatch".
+    assert (df["pipeline"] == "pre_ems_mismatch").all()
+
+
+def test_run_pre_ems_mismatch_rejects_csp_lda():
+    """run_pre_ems_mismatch is DL-only because CSP+LDA doesn't use EMS."""
+    from refshift.experiments.pre_ems_mismatch import run_pre_ems_mismatch
+    with pytest.raises(ValueError, match="DL-only"):
+        run_pre_ems_mismatch(
+            "iv2a", model="csp_lda", subjects=[1], seeds=[0],
+        )

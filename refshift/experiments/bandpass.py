@@ -37,6 +37,8 @@ def run_bandpass_mismatch(
     classes: Optional[Tuple[str, ...]] = None,
     split_strategy: str = "auto",
     laplacian_k: int = 4,
+    k_large_skip: int = 4,
+    k_large_use: int = 4,
     montage: str = "standard_1005",
     progress: bool = True,
     dl_max_epochs: int = 200,
@@ -72,7 +74,9 @@ def run_bandpass_mismatch(
     ctx = setup_dl_run(
         dataset_id, subjects=subjects, seeds=seeds,
         reference_modes_for_graph=(reference_mode,),
-        laplacian_k=laplacian_k, montage=montage, progress=progress,
+        laplacian_k=laplacian_k,
+        k_large_skip=k_large_skip, k_large_use=k_large_use,
+        montage=montage, progress=progress,
     )
 
     all_test_bands = (train_band,) + tuple(b for b in test_bands if b != train_band)

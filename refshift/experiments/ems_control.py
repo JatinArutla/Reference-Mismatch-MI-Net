@@ -50,6 +50,8 @@ def run_pre_ems_diagonal(
     classes: Optional[Iterable[str]] = None,
     split_strategy: str = "auto",
     laplacian_k: int = 4,
+    k_large_skip: int = 4,
+    k_large_use: int = 4,
     montage: str = "standard_1005",
     progress: bool = True,
     dl_max_epochs: int = 200,
@@ -68,9 +70,9 @@ def run_pre_ems_diagonal(
     """One row per (subject, seed, reference) with same-reference train/test,
     reference applied to filtered raw before EMS in preprocessing.
 
-    laplacian_k and montage are threaded into load_dl_data's pre-EMS graph
-    build and are part of the cache key, so non-default values produce
-    distinct cache entries.
+    laplacian_k, k_large_skip, k_large_use, and montage are threaded into
+    load_dl_data's pre-EMS graph build and are part of the cache key, so
+    non-default values produce distinct cache entries.
     """
     from refshift.data import load_dl_data
     from refshift.model import SUPPORTED_DL_MODELS, make_dl_model
@@ -104,7 +106,9 @@ def run_pre_ems_diagonal(
             dataset, subject=subjects[0], paradigm=paradigm,
         )
         probe_graph = build_graph(
-            ch_names, k=laplacian_k, montage=montage,
+            ch_names, k_small=laplacian_k,
+            k_large_skip=k_large_skip, k_large_use=k_large_use,
+            montage=montage,
             include_rest=("rest" in modes),
             include_csd=("csd" in modes),
         )
@@ -137,6 +141,8 @@ def run_pre_ems_diagonal(
             cache_dir=dl_cache_dir,
             pre_ems_reference=ref,
             pre_ems_laplacian_k=laplacian_k,
+            pre_ems_k_large_skip=k_large_skip,
+            pre_ems_k_large_use=k_large_use,
             pre_ems_montage=montage,
             classes=classes,
         )
