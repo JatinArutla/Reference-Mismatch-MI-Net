@@ -11,7 +11,58 @@ Append, do not edit. New entries on top.
 
 ---
 
-## v0.16.0 — reviewer-round revisions: CSD scale framing, lap_large humility, pre-EMS mismatch runner
+## v0.16.1 — trace-normalised CSP+LDA ablation for CSD-scale confound
+
+External reviewer feedback flagged that the CSD-at-chance cross-reference
+finding in v0.16's mismatch matrix is methodologically vulnerable: a
+skeptical reviewer can argue the failure is driven by CSD's ~10^3
+amplitude scale (the OAS-covariance argument is real for the covariance
+itself but doesn't fully cover the end-to-end pipeline — CSP filters
+fit on data with one variance structure produce projected features
+with different statistics than the same filters applied to data with
+10^6 variance structure, and the LDA boundary trained on the former
+will not work on the latter).
+
+Three suggested ablations:
+1. Trace-normalise covariance per trial: Sigma_i / tr(Sigma_i).
+2. Per-trial RMS normalisation of raw (C, T) array after spatial operator.
+3. Operator-normalised distance for the cross-correlation plot.
+
+#3 is already in v0.16 (`distance_metric="frobenius_normed"` default).
+#1 and #2 are mathematically equivalent for CSP+LDA (both rescale every
+trial to unit total power before downstream estimation), so I implemented
+#1 only -- it sits inside the canonical MOABB CSP pipeline as one
+inserted step rather than at the raw-signal layer, and is exactly what
+the reviewer literally specified.
+
+Added `TraceNormalizer` (sklearn-compatible, stateless transformer)
+in refshift.model. Inserts between Covariances(oas) and CSP when
+`make_csp_lda_pipeline(trace_normalize=True)`. Threaded through
+`run_mismatch` via `csp_trace_normalize: bool = False`. Default
+False preserves MOABB CSP.yml canonical behaviour and v0.14/v0.15
+reproducibility.
+
+If the CSD cross-reference cells remain at chance under
+`csp_trace_normalize=True`, the result graduates from "consistent with
+amplitude-scale confound" to "operator-topology effect that survives
+the obvious scale control". That changes the paper's defensibility
+substantially.
+
+### What I rejected
+
+- **Always-on trace normalisation.** Would break v0.14/v0.15
+  reproducibility; trace-normalisation is a methodological choice,
+  not an obviously correct default.
+- **Per-trial RMS at the raw-signal level (Ablation #2).** Equivalent
+  to #1 for the CSP+LDA pipeline. Different code path, same outcome.
+  Could add later for DL pipelines where the scale-control story
+  differs.
+- **Tukey/Z-score normalisation across the dataset.** Population-level
+  rescaling violates train/test isolation. Per-trial only.
+
+---
+
+
 
 This release responds to an external review round that identified eight
 issues. The work is in three buckets: framing/documentation that was

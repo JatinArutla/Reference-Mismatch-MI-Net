@@ -552,3 +552,40 @@ def test_cz_ref_raises_when_cz_absent():
         apply_reference(X, "cz_ref", graph=g)
     with pytest.raises(ValueError, match="cz_idx=None"):
         ReferenceTransformer(mode="cz_ref", graph=g).transform(X)
+
+
+# ---------------------------------------------------------------------------
+# v0.16: TraceNormalizer scale-control for CSD-confound ablation
+# ---------------------------------------------------------------------------
+
+def test_trace_normalizer_unit_trace():
+    """Each covariance gets trace 1.0 after normalisation, regardless of input scale."""
+    from refshift.model import TraceNormalizer
+    rng = np.random.default_rng(0)
+    N, C = 8, 16
+    covs = np.zeros((N, C, C))
+    # Construct SPD covs across 12 orders of magnitude.
+    for i, s in enumerate([1e-6, 1e-3, 1.0, 10, 100, 1e4, 1e8, 1e12][:N]):
+        A = rng.standard_normal((C, C))
+        covs[i] = s * (A @ A.T)
+    normed = TraceNormalizer().fit_transform(covs)
+    np.testing.assert_allclose(np.trace(normed, axis1=-2, axis2=-1), 1.0, atol=1e-9)
+    # Does not mutate input.
+    assert not np.allclose(covs[0], normed[0])
+
+
+def test_trace_normalizer_handles_zero_trace():
+    """Degenerate near-zero covariance (e.g. all-zero trial) shouldn't divide by zero."""
+    from refshift.model import TraceNormalizer
+    covs = np.zeros((1, 4, 4))
+    normed = TraceNormalizer(eps=1e-12).fit_transform(covs)
+    assert np.isfinite(normed).all()
+
+
+def test_trace_normalize_pipeline_step_present():
+    """make_csp_lda_pipeline inserts the trace-norm step iff trace_normalize=True."""
+    from refshift.model import make_csp_lda_pipeline
+    p_false = make_csp_lda_pipeline(trace_normalize=False)
+    p_true  = make_csp_lda_pipeline(trace_normalize=True)
+    assert [n for n, _ in p_false.steps] == ["cov", "csp", "lda"]
+    assert [n for n, _ in p_true.steps]  == ["cov", "trace_norm", "csp", "lda"]

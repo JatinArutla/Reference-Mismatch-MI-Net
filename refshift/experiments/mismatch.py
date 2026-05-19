@@ -114,6 +114,7 @@ def run_mismatch(
     classes: Optional[Sequence[str]] = None,
     split_strategy: str = "auto",
     n_filters: int = 6,
+    csp_trace_normalize: bool = False,
     laplacian_k: int = 4,
     k_large_skip: int = 4,
     k_large_use: int = 4,
@@ -156,6 +157,12 @@ def run_mismatch(
         k_large_use:   number of neighbours used by lap_large; default 4.
         With defaults (k_small=4, skip=4, use=4) lap_small uses ranks 0..3 and
         lap_large uses ranks 4..7 -- disjoint neighbour sets for every channel.
+
+    CSP+LDA-only parameters:
+        csp_trace_normalize: insert a per-trial trace normalisation step
+            between Covariances(oas) and CSP. Set to True for the scale-control
+            ablation that addresses the CSD-amplitude-scale confound. Default
+            False matches v0.14/v0.15 behaviour (MOABB CSP.yml).
     """
     model_lc = model.lower()
     if model_lc == "csp_lda":
@@ -317,7 +324,10 @@ def run_mismatch(
 
         def _fit_csp(train_ref):
             X_tr_ref = apply_reference(X_tr, train_ref, graph=graph)
-            pipe = make_csp_lda_pipeline(reference_mode=None, n_filters=n_filters)
+            pipe = make_csp_lda_pipeline(
+                reference_mode=None, n_filters=n_filters,
+                trace_normalize=csp_trace_normalize,
+            )
             pipe.fit(X_tr_ref, y_tr)
             return pipe
 
