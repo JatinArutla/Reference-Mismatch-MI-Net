@@ -122,4 +122,4 @@ __all__ = [
     "SUPPORTED_DL_MODELS",
 ]
 
-__version__ = "0.16.1"
+__version__ = "0.16.3"

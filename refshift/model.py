@@ -27,7 +27,7 @@ from sklearn.pipeline import Pipeline
 from refshift.reference import DatasetGraph, ReferenceTransformer
 
 
-SUPPORTED_DL_MODELS = ("eegnet", "shallow")
+SUPPORTED_DL_MODELS = ("eegnet", "shallow", "atcnet")
 
 
 class TraceNormalizer(BaseEstimator, TransformerMixin):
@@ -114,11 +114,14 @@ def make_dl_model(
 ):
     """Build a skorch-wrapped braindecode classifier for one training run.
 
-    LR defaults: shallow=6.25e-4 (braindecode MOABB example), eegnet=5e-4
-    (Lawhern 2018 small-data MI; 1e-3 overshoots EEGNet's ~3000 params on
-    Cho2017's ~80 train trials). transforms=[...] swaps in AugmentedDataLoader
-    on the train iterator (used by run_mismatch_jitter); test/predict path is
-    unaffected.
+    LR defaults:
+      shallow=6.25e-4 (braindecode MOABB example);
+      eegnet=5e-4 (Lawhern 2018 small-data MI; 1e-3 overshoots EEGNet's
+                   ~3000 params on Cho2017's ~80 train trials);
+      atcnet=9e-4  (Altaheri 2022 used 1e-3 with Adam; 9e-4 mild downscale for AdamW).
+
+    transforms=[...] swaps in AugmentedDataLoader on the train iterator
+    (used by run_mismatch_jitter); test/predict path is unaffected.
     """
     import torch
     from braindecode import EEGClassifier
@@ -133,9 +136,22 @@ def make_dl_model(
     except ImportError:
         from braindecode.models import EEGNetv4 as _EEGNet
 
+    # ATCNet (Altaheri et al. 2022): convolution + self-attention + TCN.
+    # Available in braindecode 0.8+; uses same n_chans / n_outputs / n_times
+    # / sfreq constructor signature as Shallow and EEGNet.
+    _ATCNet = None
+    try:
+        from braindecode.models import ATCNet as _ATCNet
+    except ImportError:
+        pass
+
     model_lc = model.lower()
     if model_lc not in SUPPORTED_DL_MODELS:
         raise ValueError(f"Unknown DL model {model!r}; supported: {SUPPORTED_DL_MODELS}")
+    if model_lc == "atcnet" and _ATCNet is None:
+        raise ImportError(
+            "ATCNet requires braindecode>=0.8. Upgrade braindecode or pick a different model."
+        )
 
     cuda = torch.cuda.is_available()
     if device is None:
@@ -149,12 +165,27 @@ def make_dl_model(
             n_chans=int(n_channels), n_outputs=int(n_classes),
             n_times=int(n_times), final_conv_length="auto",
         )
-    else:  # eegnet
+    elif model_lc == "eegnet":
         if lr is None:
             lr = 5e-4
         module = _EEGNet(
             n_chans=int(n_channels), n_outputs=int(n_classes),
             n_times=int(n_times), F1=8, D=2, final_conv_length="auto",
+        )
+    else:  # atcnet
+        if lr is None:
+            # Altaheri et al. 2022 used 1e-3 with Adam; 9e-4 with AdamW is a
+            # mild downscale for AdamW's stronger decay. Matches the ranges
+            # used in the Altaheri repo example for IV-2a.
+            lr = 9e-4
+        # ATCNet's __init__ validates n_times == input_window_seconds * sfreq.
+        # Default input_window_seconds is 4.5 (Altaheri's IV-2a window after
+        # cue trimming). Derive the right value from n_times and sfreq to
+        # match whatever trial window the user actually configured.
+        module = _ATCNet(
+            n_chans=int(n_channels), n_outputs=int(n_classes),
+            n_times=int(n_times), sfreq=float(sfreq),
+            input_window_seconds=float(n_times) / float(sfreq),
         )
 
     if device == "cuda":
