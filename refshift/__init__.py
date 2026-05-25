@@ -34,6 +34,12 @@ Restrict the operator set per run by passing any iterable as reference_modes:
     REFERENCES = {"native", "car", "csd"}
     df = run_mismatch("iv2a", model="csp_lda", reference_modes=REFERENCES)
 
+DL runners accept normalization in {"zscore", "ems", "none"} (default "zscore"):
+this selects the per-channel standardisation of the continuous filtered raw
+(static z-score, adaptive EMS, or none) and is part of the load_dl_data cache
+key. It is DL-only; the CSP+LDA path applies no per-channel standardisation by
+design and ignores the argument.
+
 Output column order is always canonical (REFERENCE_MODES) regardless of
 input iteration order. The legacy name 'laplacian' is accepted as an alias
 for 'lap_small' (operator unchanged; renamed in v0.15).
@@ -122,4 +128,4 @@ __all__ = [
     "SUPPORTED_DL_MODELS",
 ]
 
-__version__ = "0.16.3"
+__version__ = "0.17.0"

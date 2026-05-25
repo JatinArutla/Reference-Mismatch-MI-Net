@@ -52,6 +52,7 @@ def run_mismatch_jitter(
     test_reference_modes: Optional[Sequence[str]] = None,
     classes: Optional[tuple] = None,
     split_strategy: str = "auto",
+    normalization: str = "zscore",
     laplacian_k: int = 4,
     k_large_skip: int = 4,
     k_large_use: int = 4,
@@ -79,6 +80,9 @@ def run_mismatch_jitter(
 
     reference_modes / test_reference_modes accept any iterable (set, tuple,
     list, frozenset); both are canonicalised to REFERENCE_MODES order.
+
+    normalization in {"zscore", "ems", "none"}; default "zscore". Selects the
+    per-channel standardisation in load_dl_data (DL-only runner).
     """
     from refshift.jitter import make_random_reference_transform
     from refshift.model import SUPPORTED_DL_MODELS, make_dl_model
@@ -92,6 +96,9 @@ def run_mismatch_jitter(
     cond = condition.lower()
     if cond not in ("full", "lofo"):
         raise ValueError(f"Unknown condition: {condition!r}. Use 'full' or 'lofo'")
+    from refshift.data import NORMALIZATIONS
+    if normalization not in NORMALIZATIONS:
+        raise ValueError(f"normalization={normalization!r} not in {NORMALIZATIONS}")
 
     # Universe of references for this run. Auto-resolved per dataset by default.
     if reference_modes is None:
@@ -135,6 +142,7 @@ def run_mismatch_jitter(
         ctx, split_strategy=split_strategy,
         desc=f"[{ctx.dataset_code}] {model_lc} jitter-{cond}",
         progress=progress,
+        normalization=normalization,
         dl_resample=dl_resample,
         dl_l_freq=dl_l_freq, dl_h_freq=dl_h_freq,
         dl_trial_start_offset_s=dl_trial_start_offset_s,
@@ -203,6 +211,7 @@ def run_lofo_matrix(
     reference_modes: Optional[Sequence[str]] = None,
     seeds: List[int] = (0,),
     subjects: Optional[List[int]] = None,
+    normalization: str = "zscore",
     progress: bool = True,
     **jitter_kwargs,
 ) -> pd.DataFrame:
@@ -234,7 +243,8 @@ def run_lofo_matrix(
         df_h = run_mismatch_jitter(
             dataset_id, model=model, condition="lofo", holdout_ref=h,
             reference_modes=universe,
-            seeds=seeds, subjects=subjects, progress=progress, **jitter_kwargs,
+            seeds=seeds, subjects=subjects, normalization=normalization,
+            progress=progress, **jitter_kwargs,
         )
         frames.append(df_h)
     return pd.concat(frames, ignore_index=True)

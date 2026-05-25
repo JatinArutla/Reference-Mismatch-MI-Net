@@ -113,6 +113,7 @@ def run_mismatch(
     reference_modes: Optional[Sequence[str]] = None,
     classes: Optional[Sequence[str]] = None,
     split_strategy: str = "auto",
+    normalization: str = "zscore",
     n_filters: int = 6,
     csp_trace_normalize: bool = False,
     laplacian_k: int = 4,
@@ -163,8 +164,22 @@ def run_mismatch(
             between Covariances(oas) and CSP. Set to True for the scale-control
             ablation that addresses the CSD-amplitude-scale confound. Default
             False matches v0.14/v0.15 behaviour (MOABB CSP.yml).
+
+    normalization in {"zscore", "ems", "none"}; default "zscore". DL-ONLY:
+    selects the per-channel standardisation of the continuous filtered raw,
+    applied before windowing and the reference operator.
+        "zscore" static per-channel z-score over the recording.
+        "ems"    adaptive exponential_moving_standardize (the pre-v0.17 default).
+        "none"   no standardisation.
+    The CSP+LDA path ignores this argument entirely: it has no per-channel
+    standardisation by design (covariance-based, calibrated against MOABB's
+    CSP.yml), so `run_mismatch("iv2a")` reproduces the classical pipeline
+    regardless of the normalization default.
     """
     model_lc = model.lower()
+    from refshift.data import NORMALIZATIONS
+    if normalization not in NORMALIZATIONS:
+        raise ValueError(f"normalization={normalization!r} not in {NORMALIZATIONS}")
     if model_lc == "csp_lda":
         is_dl = False
     else:
@@ -196,6 +211,7 @@ def run_mismatch(
             ctx, split_strategy=split_strategy,
             desc=f"[{ctx.dataset_code}] {model_lc} mismatch",
             progress=progress,
+            normalization=normalization,
             dl_resample=dl_resample,
             dl_l_freq=dl_l_freq, dl_h_freq=dl_h_freq,
             dl_trial_start_offset_s=dl_trial_start_offset_s,

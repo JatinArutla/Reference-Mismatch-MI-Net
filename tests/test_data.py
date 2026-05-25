@@ -24,6 +24,7 @@ def _params(**overrides):
         resample=250.0,
         l_freq=8.0,
         h_freq=32.0,
+        normalization="zscore",
         ems_factor_new=1e-3,
         ems_init_block_size=1000,
         trial_start_offset_s=0.0,
@@ -31,6 +32,8 @@ def _params(**overrides):
         pre_ems_reference=None,
         pre_ems_laplacian_k=4,
         pre_ems_montage="standard_1005",
+        pre_ems_k_large_skip=4,
+        pre_ems_k_large_use=4,
         classes="left_hand,right_hand,feet,tongue",
     )
     base.update(overrides)
@@ -75,6 +78,7 @@ def test_cache_path_differs_by_dataset_subject_filter_offsets():
             {"resample": 500.0},
             {"l_freq": 4.0},
             {"h_freq": 38.0},
+            {"normalization": "ems"},
             {"trial_start_offset_s": -0.5},
             {"pre_ems_reference": "car"},
         ):

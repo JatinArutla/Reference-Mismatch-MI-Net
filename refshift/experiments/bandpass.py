@@ -36,6 +36,7 @@ def run_bandpass_mismatch(
     seeds: List[int] = (0,),
     classes: Optional[Tuple[str, ...]] = None,
     split_strategy: str = "auto",
+    normalization: str = "zscore",
     laplacian_k: int = 4,
     k_large_skip: int = 4,
     k_large_use: int = 4,
@@ -70,6 +71,10 @@ def run_bandpass_mismatch(
     if reference_mode not in REFERENCE_MODES:
         raise ValueError(f"reference_mode={reference_mode!r} not in REFERENCE_MODES")
 
+    from refshift.data import NORMALIZATIONS
+    if normalization not in NORMALIZATIONS:
+        raise ValueError(f"normalization={normalization!r} not in {NORMALIZATIONS}")
+
     # Graph only needs to support the single fixed reference.
     ctx = setup_dl_run(
         dataset_id, subjects=subjects, seeds=seeds,
@@ -87,6 +92,7 @@ def run_bandpass_mismatch(
         ctx, split_strategy=split_strategy,
         desc=f"[{ctx.dataset_code}] {model_lc} bandpass",
         progress=progress,
+        normalization=normalization,
         dl_resample=dl_resample,
         dl_l_freq=train_band[0], dl_h_freq=train_band[1],
         dl_trial_start_offset_s=dl_trial_start_offset_s,
@@ -121,6 +127,7 @@ def run_bandpass_mismatch(
                 dataset_id, subject,
                 resample=dl_resample,
                 l_freq=tb[0], h_freq=tb[1],
+                normalization=normalization,
                 trial_start_offset_s=dl_trial_start_offset_s,
                 trial_stop_offset_s=dl_trial_stop_offset_s,
                 cache_dir=dl_cache_dir,

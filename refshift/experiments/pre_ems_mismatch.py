@@ -69,6 +69,7 @@ def run_pre_ems_mismatch(
     reference_modes: Optional[Sequence[str]] = None,
     classes: Optional[Sequence[str]] = None,
     split_strategy: str = "auto",
+    normalization: str = "ems",
     laplacian_k: int = 4,
     k_large_skip: int = 4,
     k_large_use: int = 4,
@@ -126,6 +127,12 @@ def run_pre_ems_mismatch(
     pipelines, the v0.14/v0.15 results are not preprocessing-order artefacts.
     If they differ substantially, the headline finding needs the
     pre-EMS pipeline as the primary report.
+
+    normalization in {"zscore", "ems", "none"}; default "ems" (NOT "zscore"
+    like run_mismatch). This is the EMS-ordering control, so it defaults to the
+    normalizer whose ordering it tests. An ordering comparison against
+    run_mismatch is only valid when both are run under the SAME normalization;
+    set this and run_mismatch's normalization to matching values explicitly.
     """
     from refshift.data import load_dl_data
     from refshift.model import SUPPORTED_DL_MODELS, make_dl_model
@@ -140,6 +147,10 @@ def run_pre_ems_mismatch(
         raise ValueError(
             f"Unknown DL model {model!r}; expected one of {SUPPORTED_DL_MODELS}"
         )
+
+    from refshift.data import NORMALIZATIONS
+    if normalization not in NORMALIZATIONS:
+        raise ValueError(f"normalization={normalization!r} not in {NORMALIZATIONS}")
 
     if reference_modes is None:
         modes = reference_modes_for_dataset(dataset_id)
@@ -192,6 +203,7 @@ def run_pre_ems_mismatch(
                 dataset_id, subject,
                 resample=dl_resample,
                 l_freq=dl_l_freq, h_freq=dl_h_freq,
+                normalization=normalization,
                 trial_start_offset_s=dl_trial_start_offset_s,
                 trial_stop_offset_s=dl_trial_stop_offset_s,
                 cache_dir=dl_cache_dir,

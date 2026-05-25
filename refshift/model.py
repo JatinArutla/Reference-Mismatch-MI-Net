@@ -77,6 +77,10 @@ def make_csp_lda_pipeline(
     trace_normalize=True inserts a TraceNormalizer between Covariances(oas)
     and CSP. This is the methodological ablation for the CSD-scale confound
     (see module docstring). All other behaviour is unchanged.
+
+    The CSP+LDA path deliberately applies NO per-channel standardisation: the
+    `normalization` knob on the experiment runners is DL-only (the classical
+    pipeline is covariance-based and calibrated against MOABB's CSP.yml).
     """
     from pyriemann.estimation import Covariances
     from pyriemann.spatialfilters import CSP

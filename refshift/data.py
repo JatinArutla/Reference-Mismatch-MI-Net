@@ -7,18 +7,27 @@ Pipeline:
     -> V -> uV
     -> resample to common rate (default 250 Hz)
     -> bandpass l_freq..h_freq
-    -> [optional pre_ems_reference: applied to filtered raw, before EMS]
-    -> exponential_moving_standardize
+    -> [optional pre_ems_reference: applied to filtered raw, before normalization]
+    -> normalization step (see `normalization` arg)
     -> create_windows_from_events
     -> (X, y, metadata) tensors
 
+The normalization step is selected by the `normalization` argument:
+    "zscore" (default) -> static per-channel z-score over the whole recording
+                          (subtract channel mean, divide by channel std).
+    "ems"              -> exponential_moving_standardize (the v0.16 default):
+                          adaptive per-channel running standardisation.
+    "none"             -> no per-channel standardisation.
+
 Reference operators in the standard pipeline are applied to the windowed X
-*after* this function returns. EMS is per-channel and adaptive, so it does
-not commute with channel-mixing reference operators: CAR(EMS(X)) != EMS(CAR(X))
+*after* this function returns. Both EMS and z-score are per-channel, so neither
+commutes with channel-mixing reference operators: CAR(norm(X)) != norm(CAR(X))
 in general. The pre_ems_reference argument flips the order to "filter then
-reference then EMS" for the EMS-control ablation. Fix in v0.14: the reference
-operator is now applied AFTER the bandpass filter (it was earlier applied to
-the broadband raw, which mattered for the non-linear median operator).
+reference then normalize" for the normalization-order control ablation (the
+'ems' in the name is historical; it applies to whichever normalization is
+selected). Fix in v0.14: the reference operator is now applied AFTER the
+bandpass filter (it was earlier applied to the broadband raw, which mattered
+for the non-linear median operator).
 
 The disk cache keys on all parameters that affect the preprocessed output
 (see _CACHE_KEY_PARAMS). Reference operators are post-cache, so all 6
@@ -60,12 +69,35 @@ def _scale_volts_to_microvolts(data):
     return data * 1e6
 
 
+# Allowed values for the `normalization` argument. "ems" is the adaptive
+# braindecode standardiser; "zscore" is a static per-channel z-score over the
+# whole recording; "none" applies no per-channel standardisation.
+NORMALIZATIONS = ("zscore", "ems", "none")
+
+
+def _zscore_standardize(data, eps: float = 1e-7):
+    """Static per-channel z-score over time. Module-level so it pickles.
+
+    Operates on the continuous (C, T) raw: each channel is centred and scaled
+    by its own mean/std across the whole recording. The non-adaptive sibling of
+    exponential_moving_standardize. eps floors a flat channel's std so a
+    constant channel maps to all-zeros rather than NaN/inf.
+    """
+    import numpy as _np
+
+    data = _np.asarray(data, dtype=_np.float64)
+    mean = data.mean(axis=1, keepdims=True)
+    std = data.std(axis=1, keepdims=True)
+    return (data - mean) / _np.maximum(std, eps)
+
+
 # ---------------------------------------------------------------------------
 # Disk cache for preprocessed (X, y, metadata, sfreq, ch_names) tensors
 # ---------------------------------------------------------------------------
 
 _CACHE_KEY_PARAMS = (
     "dataset_id", "subject", "resample", "l_freq", "h_freq",
+    "normalization",
     "ems_factor_new", "ems_init_block_size",
     "trial_start_offset_s", "trial_stop_offset_s",
     "pre_ems_reference",
@@ -95,6 +127,7 @@ def load_dl_data(
     resample: float = 250.0,
     l_freq: float = 8.0,
     h_freq: float = 32.0,
+    normalization: str = "zscore",
     ems_factor_new: float = 1e-3,
     ems_init_block_size: int = 1000,
     trial_start_offset_s: float = 0.0,
@@ -110,6 +143,16 @@ def load_dl_data(
     classes: Optional[Sequence[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float, List[str]]:
     """Load one subject's MI data through the canonical preprocess pipeline.
+
+    normalization selects the per-channel standardisation applied to the
+    filtered raw before windowing:
+        "zscore" (default) static per-channel z-score over the whole recording.
+        "ems"              exponential_moving_standardize (adaptive; the v0.16
+                           default). ems_factor_new / ems_init_block_size are
+                           only consulted for this option.
+        "none"             no per-channel standardisation.
+    It is part of the cache key, so distinct normalizations cache to distinct
+    entries.
 
     pre_ems_reference, pre_ems_laplacian_k, pre_ems_k_large_skip,
     pre_ems_k_large_use, pre_ems_montage are only used when pre_ems_reference
@@ -138,6 +181,12 @@ def load_dl_data(
         resolve_classes,
     )
 
+    normalization = str(normalization).lower()
+    if normalization not in NORMALIZATIONS:
+        raise ValueError(
+            f"normalization={normalization!r} not in {NORMALIZATIONS}"
+        )
+
     kept_classes = resolve_classes(dataset_id, classes)
     full_classes = dataset_full_classes(dataset_id)
     # mapping for braindecode: every dataset-defined class -> a stable int.
@@ -155,6 +204,7 @@ def load_dl_data(
         "resample": float(resample),
         "l_freq": float(l_freq),
         "h_freq": float(h_freq),
+        "normalization": normalization,
         "ems_factor_new": float(ems_factor_new),
         "ems_init_block_size": int(ems_init_block_size),
         "trial_start_offset_s": float(trial_start_offset_s),
@@ -249,11 +299,19 @@ def load_dl_data(
 
         preprocessors.append(Preprocessor(_apply_pre_ems_ref, apply_on_array=False))
 
-    preprocessors.append(Preprocessor(
-        exponential_moving_standardize,
-        factor_new=ems_factor_new,
-        init_block_size=ems_init_block_size,
-    ))
+    # Per-channel standardisation of the filtered raw, selected by `normalization`.
+    # "none" skips this step entirely.
+    if normalization == "ems":
+        preprocessors.append(Preprocessor(
+            exponential_moving_standardize,
+            factor_new=ems_factor_new,
+            init_block_size=ems_init_block_size,
+        ))
+    elif normalization == "zscore":
+        preprocessors.append(Preprocessor(
+            _zscore_standardize, apply_on_array=True,
+        ))
+    # normalization == "none": no standardisation preprocessor.
 
     preprocess(dataset, preprocessors, n_jobs=n_jobs)
 

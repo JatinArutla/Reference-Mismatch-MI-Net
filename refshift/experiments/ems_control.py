@@ -49,6 +49,7 @@ def run_pre_ems_diagonal(
     reference_modes: Optional[Iterable[str]] = None,
     classes: Optional[Iterable[str]] = None,
     split_strategy: str = "auto",
+    normalization: str = "ems",
     laplacian_k: int = 4,
     k_large_skip: int = 4,
     k_large_use: int = 4,
@@ -56,7 +57,7 @@ def run_pre_ems_diagonal(
     progress: bool = True,
     dl_max_epochs: int = 200,
     dl_batch_size: int = 32,
-    dl_lr: float = 6.25e-4,
+    dl_lr: Optional[float] = None,
     dl_weight_decay: float = 0.0,
     dl_device: Optional[str] = None,
     dl_verbose: int = 0,
@@ -68,11 +69,20 @@ def run_pre_ems_diagonal(
     dl_cache_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     """One row per (subject, seed, reference) with same-reference train/test,
-    reference applied to filtered raw before EMS in preprocessing.
+    reference applied to filtered raw before the normalization step.
 
     laplacian_k, k_large_skip, k_large_use, and montage are threaded into
-    load_dl_data's pre-EMS graph build and are part of the cache key, so
-    non-default values produce distinct cache entries.
+    load_dl_data's pre-normalization graph build and are part of the cache key,
+    so non-default values produce distinct cache entries.
+
+    normalization in {"zscore", "ems", "none"}; default "ems". The reference
+    is applied to the filtered raw BEFORE this standardisation step. The default
+    is "ems" (not "zscore" like the main runners) because this is specifically
+    the EMS-ordering control: EMS is adaptive, so reference-before-EMS differs
+    from reference-after-EMS in a time-varying way that is the whole point of
+    the ablation. To probe ordering under a different normalization, set this
+    AND run_mismatch with the SAME value -- an ordering comparison is only valid
+    when both arms share a normalization.
     """
     from refshift.data import load_dl_data
     from refshift.model import SUPPORTED_DL_MODELS, make_dl_model
@@ -85,6 +95,10 @@ def run_pre_ems_diagonal(
         )
     if model_lc not in SUPPORTED_DL_MODELS:
         raise ValueError(f"Unknown DL model {model!r}; expected one of {SUPPORTED_DL_MODELS}")
+
+    from refshift.data import NORMALIZATIONS
+    if normalization not in NORMALIZATIONS:
+        raise ValueError(f"normalization={normalization!r} not in {NORMALIZATIONS}")
 
     if reference_modes is None:
         modes = reference_modes_for_dataset(dataset_id)
@@ -136,6 +150,7 @@ def run_pre_ems_diagonal(
             dataset_id, subject,
             resample=dl_resample,
             l_freq=dl_l_freq, h_freq=dl_h_freq,
+            normalization=normalization,
             trial_start_offset_s=dl_trial_start_offset_s,
             trial_stop_offset_s=dl_trial_stop_offset_s,
             cache_dir=dl_cache_dir,
