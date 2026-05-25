@@ -25,8 +25,15 @@ dependencies = [
 # Phase 2 DL dependencies. Install with `pip install -e '.[dl]'`.
 # braindecode 1.12 renamed EEGNetv4 -> EEGNet (with v4 alias); 1.14 removes
 # the alias. refshift.model handles both via try/except, so >=1.0 is fine.
+# mne>=1.11 is REQUIRED here: braindecode >=1.5 builds its preprocessing
+# classes (FilterData, Filter, Resample, ...) dynamically from mne at import
+# time and declares mne>=1.11. The base dep's looser `mne>=1.5` lets a
+# resolver (e.g. Kaggle's pre-pinned older mne) keep an mne too old for
+# braindecode, yielding "cannot import name 'FilterData'". Pinning the floor
+# at the top level forces the upgrade regardless of install order.
 dl = [
     "braindecode>=1.0",
+    "mne>=1.11",
     "torch>=2.0",
     "skorch>=0.15",
 ]
