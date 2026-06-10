@@ -11,6 +11,66 @@ Append, do not edit. New entries on top.
 
 ---
 
+## v0.18.0 — Euclidean Alignment as a post-reference whitening (EA ablation)
+
+Added EA (He & Wu 2020) to test whether the standard MI-EEG preprocessing
+step absorbs the reference-induced shift. Motivation: MIRepNet (and most
+cross-subject MI pipelines) apply EA, and a reviewer will fairly ask "does
+your reference mismatch survive EA?" This release lets me answer that with
+the existing mismatch machinery.
+
+### What I added
+
+- `refshift.reference.euclidean_alignment(X)`: the MIRepNet-exact EA.
+  Per-trial sample covariance, mean across trials -> R_bar, then
+  X_i <- R_bar^{-1/2} X_i. I matched MIRepNet's released `utils.EA`
+  line-for-line in spirit (np.cov per trial, fractional_matrix_power),
+  with two deliberate deviations, both documented in the docstring:
+  (1) a tiny diagonal ridge (eps=1e-12) before the inverse-sqrt, because
+  cz_ref and the Laplacians are rank-reducing operators in this codebase
+  and produce singular reference covariances that MIRepNet never hits
+  (their data is always native-referenced); without the ridge,
+  fractional_matrix_power emits complex/NaN. (2) np.real() on the result
+  for the same reason.
+- `apply_reference_then_ea(X, mode, graph, apply_ea=...)`: one place that
+  owns the reference->EA ordering.
+- `run_mismatch(..., apply_ea=False, ea_eps=1e-12)`: threaded through both
+  the CSP+LDA and DL branches. EA is applied to each (subject, split) block
+  AFTER the reference operator.
+
+### Decisions
+
+- **EA is NOT a `normalization` value.** The data.py normalization rail
+  (zscore/ems/none) is per-channel and DL-only by design. EA is cross-channel
+  spatial whitening and must apply on the CSP+LDA path too (CSP+LDA is EA's
+  home turf — the whole point of the ablation). So EA rides its own
+  `apply_ea` flag at the mismatch-loop level, not the normalization arg.
+- **Reference -> EA ordering, not EA -> reference.** The question is "does EA
+  absorb the reference shift", so EA must see the already-referenced
+  covariance. EA->reference would re-introduce structure EA just removed and
+  answers nothing.
+- **Per-split EA estimation** (train and test each get their own R_bar),
+  matching MIRepNet's `process_and_replace_loader`, which calls EA separately
+  on the train and val loaders. No train->test leakage, but also no shared
+  whitening. A stricter fit-on-train-apply-to-test variant is a future option;
+  per-split matches the paper I'm comparing against.
+- **CSD stays droppable.** Not run in the EA ablation (excluded from the
+  REFERENCES set in the notebook); EA + CSD's 10^3 scale would confound two
+  effects at once.
+
+### What I rejected
+
+- **Folding MIRepNet's channel-template interpolation in alongside EA.**
+  `pad_missing_channels_diff` is itself a linear spatial operator on channels
+  — same class of object as the reference operators. Composing it with
+  referencing makes the reference attribution unfalsifiable. Took only EA
+  (the separable, widely-used piece); left the template out.
+- **Always-on EA.** Default `apply_ea=False` preserves every existing call
+  and all prior CSVs.
+
+---
+
+
 ## v0.16.1 — trace-normalised CSP+LDA ablation for CSD-scale confound
 
 External reviewer feedback flagged that the CSD-at-chance cross-reference

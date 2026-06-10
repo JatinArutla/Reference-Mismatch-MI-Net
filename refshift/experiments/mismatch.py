@@ -36,6 +36,7 @@ from refshift.reference import (
     REFERENCE_MODES,
     _GRAPH_MODES,
     apply_reference,
+    apply_reference_then_ea,
     build_graph,
     canonical_mode_tuple,
     reference_modes_for_dataset,
@@ -114,6 +115,8 @@ def run_mismatch(
     classes: Optional[Sequence[str]] = None,
     split_strategy: str = "auto",
     normalization: str = "zscore",
+    apply_ea: bool = False,
+    ea_eps: float = 1e-12,
     n_filters: int = 6,
     csp_trace_normalize: bool = False,
     laplacian_k: int = 4,
@@ -175,6 +178,17 @@ def run_mismatch(
     standardisation by design (covariance-based, calibrated against MOABB's
     CSP.yml), so `run_mismatch("iv2a")` reproduces the classical pipeline
     regardless of the normalization default.
+
+    apply_ea (default False): if True, apply Euclidean Alignment (He & Wu 2020,
+    MIRepNet-exact form) to each (subject, split) block of trials AFTER the
+    reference operator and before the model. EA whitens per-subject second-order
+    statistics to the identity. Applies on BOTH the CSP+LDA and DL paths (unlike
+    `normalization`, which is DL-only and per-channel). The reference->EA ordering
+    answers "does EA absorb the reference-induced shift": the whitening is fit on
+    the already-referenced trials. EA is fit per split (train and test get
+    independently estimated reference covariances), matching MIRepNet's own
+    behaviour. ea_eps is a small diagonal ridge guarding the inverse-sqrt against
+    rank-deficient reference covariances (cz_ref, Laplacians zero/reduce rank).
     """
     model_lc = model.lower()
     from refshift.data import NORMALIZATIONS
@@ -219,11 +233,18 @@ def run_mismatch(
             dl_cache_dir=dl_cache_dir,
             classes=classes,
         ):
-            X_te_by_ref = {m: apply_reference(X_te, m, graph=ctx.graph) for m in modes}
+            X_te_by_ref = {
+                m: apply_reference_then_ea(
+                    X_te, m, graph=ctx.graph, apply_ea=apply_ea, ea_eps=ea_eps
+                )
+                for m in modes
+            }
             n_classes = int(max(int(y_tr.max()), int(y_te.max()))) + 1
 
             def _fit_dl(train_ref):
-                X_tr_ref = apply_reference(X_tr, train_ref, graph=ctx.graph)
+                X_tr_ref = apply_reference_then_ea(
+                    X_tr, train_ref, graph=ctx.graph, apply_ea=apply_ea, ea_eps=ea_eps
+                )
                 pipe = make_dl_model(
                     model=model_lc,
                     n_channels=X_tr_ref.shape[1],
@@ -336,10 +357,17 @@ def run_mismatch(
             X, y_int, metadata, strategy=split_strategy, seed=seed,
             dataset_id=dataset_id,
         )
-        X_te_by_ref = {m: apply_reference(X_te, m, graph=graph) for m in modes}
+        X_te_by_ref = {
+            m: apply_reference_then_ea(
+                X_te, m, graph=graph, apply_ea=apply_ea, ea_eps=ea_eps
+            )
+            for m in modes
+        }
 
         def _fit_csp(train_ref):
-            X_tr_ref = apply_reference(X_tr, train_ref, graph=graph)
+            X_tr_ref = apply_reference_then_ea(
+                X_tr, train_ref, graph=graph, apply_ea=apply_ea, ea_eps=ea_eps
+            )
             pipe = make_csp_lda_pipeline(
                 reference_mode=None, n_filters=n_filters,
                 trace_normalize=csp_trace_normalize,

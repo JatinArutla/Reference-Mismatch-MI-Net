@@ -82,8 +82,10 @@ from refshift.reference import (
     REFERENCE_MODES,
     ReferenceTransformer,
     apply_reference,
+    apply_reference_then_ea,
     build_graph,
     canonical_mode_tuple,
+    euclidean_alignment,
     reference_modes_for_dataset,
     validate_reference_modes,
 )
@@ -120,6 +122,8 @@ __all__ = [
     "ReferenceTransformer",
     "build_graph",
     "apply_reference",
+    "apply_reference_then_ea",
+    "euclidean_alignment",
     "canonical_mode_tuple",
     "reference_modes_for_dataset",
     "validate_reference_modes",
@@ -128,4 +132,4 @@ __all__ = [
     "SUPPORTED_DL_MODELS",
 ]
 
-__version__ = "0.17.0"
+__version__ = "0.18.0"

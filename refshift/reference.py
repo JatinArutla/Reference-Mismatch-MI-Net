@@ -558,3 +558,96 @@ class ReferenceTransformer(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         return apply_reference(X, self.mode, graph=self.graph)
+
+
+# ---------------------------------------------------------------------------
+# Euclidean Alignment (He & Wu 2020), MIRepNet-exact form.
+# ---------------------------------------------------------------------------
+# EA is a per-subject spatial whitening, NOT a per-channel standardisation,
+# so it does not belong in the data.py `normalization` rail (zscore/ems/none),
+# which is per-channel and DL-only. EA is applied to windowed (N, C, T) trials
+# AFTER the reference operator, in the mismatch loop, on both the CSP+LDA and
+# DL paths. This module-level function is the single source of truth.
+#
+# Implementation matches MIRepNet's released `utils.EA` exactly:
+#   R_bar = mean_i cov(X_i)          (per-trial sample covariance, then mean)
+#   X_i  <- R_bar^{-1/2} @ X_i
+# After EA, mean_i (X_i X_i^T) = I, so per-subject second-order statistics are
+# matched to the identity. The reference covariance is computed over whatever
+# set of trials is passed in: callers apply it per split (fit on the trials in
+# hand), which is MIRepNet's own behaviour (train and test get independently
+# estimated R_bar; no train->test leakage, but also no shared whitening).
+
+
+def euclidean_alignment(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Euclidean-align a block of trials. Input/output (N, C, T) float32.
+
+    Computes one reference covariance R_bar as the mean of per-trial sample
+    covariances, then left-multiplies every trial by R_bar^{-1/2}. This is the
+    He & Wu (2020) Euclidean alignment, in the exact form MIRepNet uses.
+
+    Parameters
+    ----------
+    X : (N, C, T) array. The block of trials to align together (e.g. one
+        subject's train split, or one subject's test split).
+    eps : ridge added to R_bar's diagonal before the inverse-sqrt, guarding
+        against a singular / ill-conditioned reference covariance on short or
+        low-rank blocks (e.g. cz_ref, which zeroes a channel and so produces a
+        rank-deficient covariance). MIRepNet's bare implementation omits this;
+        we add a tiny ridge because some reference operators in this codebase
+        (cz_ref, the Laplacians) are deliberately rank-reducing and would
+        otherwise make fractional_matrix_power emit complex/NaN values.
+
+    Returns
+    -------
+    (N, C, T) float32, Euclidean-aligned.
+    """
+    from scipy.linalg import fractional_matrix_power
+
+    X = _check_3d(X)
+    N, C, T = X.shape
+    if N == 0:
+        return X.copy()
+
+    # Per-trial sample covariance, then mean across trials -> reference cov.
+    # np.cov(X[i]) treats rows as variables (channels), matching MIRepNet.
+    cov = np.empty((N, C, C), dtype=np.float64)
+    for i in range(N):
+        cov[i] = np.cov(X[i].astype(np.float64))
+    R_bar = cov.mean(axis=0)
+
+    # Ridge for numerical stability on rank-deficient reference covariances.
+    if eps:
+        R_bar = R_bar + eps * np.eye(C, dtype=np.float64)
+
+    R_inv_sqrt = fractional_matrix_power(R_bar, -0.5)
+    # fractional_matrix_power can return a complex array with ~0 imaginary part
+    # when R_bar is numerically non-PSD; take the real part (MIRepNet relies on
+    # R_bar being PSD and does not guard this).
+    R_inv_sqrt = np.real(R_inv_sqrt).astype(np.float64)
+
+    out = np.einsum("ij,njt->nit", R_inv_sqrt, X.astype(np.float64))
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+def apply_reference_then_ea(
+    X: np.ndarray,
+    mode: str,
+    graph: Optional[DatasetGraph] = None,
+    *,
+    apply_ea: bool = False,
+    ea_eps: float = 1e-12,
+) -> np.ndarray:
+    """Apply the reference operator, then (optionally) Euclidean-align.
+
+    Convenience wrapper used by the mismatch runner so the reference->EA
+    ordering lives in one place. With apply_ea=False this is exactly
+    apply_reference(X, mode, graph); with apply_ea=True the EA whitening is
+    computed on the *referenced* trials, which is the ordering that answers
+    "does EA absorb the reference shift" (reference first, then whiten the
+    already-referenced covariance).
+    """
+    Y = apply_reference(X, mode, graph=graph)
+    if apply_ea:
+        Y = euclidean_alignment(Y, eps=ea_eps)
+    return Y
