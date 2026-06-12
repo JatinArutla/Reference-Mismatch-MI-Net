@@ -69,6 +69,7 @@ from refshift.experiments import (
     calibrate_csp_lda,
     mismatch_matrix,
     run_bandpass_mismatch,
+    run_cross_subject_mismatch,
     run_lofo_matrix,
     run_mismatch,
     run_mismatch_jitter,
@@ -87,6 +88,7 @@ from refshift.reference import (
     canonical_mode_tuple,
     euclidean_alignment,
     reference_modes_for_dataset,
+    stratified_calibration_index,
     validate_reference_modes,
 )
 from refshift.report import report_experiment
@@ -101,6 +103,7 @@ __all__ = [
     "run_mismatch",
     "run_mismatch_jitter",
     "run_lofo_matrix",
+    "run_cross_subject_mismatch",
     "run_pre_ems_diagonal",
     "run_pre_ems_mismatch",
     "run_bandpass_mismatch",
@@ -124,6 +127,7 @@ __all__ = [
     "apply_reference",
     "apply_reference_then_ea",
     "euclidean_alignment",
+    "stratified_calibration_index",
     "canonical_mode_tuple",
     "reference_modes_for_dataset",
     "validate_reference_modes",
@@ -132,4 +136,4 @@ __all__ = [
     "SUPPORTED_DL_MODELS",
 ]
 
-__version__ = "0.18.0"
+__version__ = "0.20.0"

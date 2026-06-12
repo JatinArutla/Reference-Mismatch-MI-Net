@@ -35,11 +35,14 @@ from refshift.model import make_csp_lda_pipeline
 from refshift.reference import (
     REFERENCE_MODES,
     _GRAPH_MODES,
+    _ea_apply,
+    _ea_fit,
     apply_reference,
     apply_reference_then_ea,
     build_graph,
     canonical_mode_tuple,
     reference_modes_for_dataset,
+    stratified_calibration_index,
     validate_reference_modes,
 )
 
@@ -67,6 +70,64 @@ def mismatch_matrix(
     if aggregate == "std":
         return grouped.std().unstack("test_ref")
     raise ValueError(f"Unknown aggregate: {aggregate!r}")
+
+
+def _build_test_variants(
+    *,
+    X_te: np.ndarray,
+    y_te: np.ndarray,
+    modes: tuple,
+    graph,
+    apply_ea: bool,
+    ea_calib_trials,  # None = full-block EA; int = k per class; ignored if not apply_ea
+    ea_eps: float,
+    seed: int,
+):
+    """Construct {test_ref: aligned_test_X} and the matching scored y.
+
+    Three regimes:
+      apply_ea=False                  -> reference only, score all test trials.
+      apply_ea=True, calib=None       -> reference then full-block EA (fit on the
+                                         whole referenced test split), score all.
+      apply_ea=True, calib=k (int)    -> reference, then carve k trials/class as a
+                                         calibration subset, fit R_bar on THOSE,
+                                         apply to the remaining test trials, and
+                                         score only the remaining trials. The
+                                         calibration trials are excluded from
+                                         scoring (no leakage). The calibration
+                                         index is shared across test_refs (drawn
+                                         from y_te once), so every test_ref scores
+                                         the same held-out trials.
+
+    Returns (X_te_by_ref, y_scored, n_calib_realized).
+    """
+    if not apply_ea:
+        X_te_by_ref = {m: apply_reference(X_te, m, graph=graph) for m in modes}
+        return X_te_by_ref, y_te, 0
+
+    if ea_calib_trials is None:
+        # Full-block EA: fit-and-apply on the whole referenced test split.
+        X_te_by_ref = {
+            m: apply_reference_then_ea(
+                X_te, m, graph=graph, apply_ea=True, ea_eps=ea_eps
+            )
+            for m in modes
+        }
+        return X_te_by_ref, y_te, int(len(y_te))
+
+    # Calibration-EA: k trials/class estimate R_bar, the rest are scored.
+    calib_idx = stratified_calibration_index(y_te, int(ea_calib_trials), seed=seed)
+    mask = np.zeros(len(y_te), dtype=bool)
+    mask[calib_idx] = True
+    score_idx = np.flatnonzero(~mask)
+    y_scored = y_te[score_idx]
+
+    X_te_by_ref = {}
+    for m in modes:
+        Xr = apply_reference(X_te, m, graph=graph)  # reference first
+        whit = _ea_fit(Xr[calib_idx], eps=ea_eps)   # R_bar from calibration only
+        X_te_by_ref[m] = _ea_apply(Xr[score_idx], whit)  # apply to scored trials
+    return X_te_by_ref, y_scored, int(len(calib_idx))
 
 
 def _train_and_evaluate(
@@ -117,6 +178,8 @@ def run_mismatch(
     normalization: str = "zscore",
     apply_ea: bool = False,
     ea_eps: float = 1e-12,
+    ea_calib_trials: Optional[int] = None,
+    ea_train_side: bool = True,
     n_filters: int = 6,
     csp_trace_normalize: bool = False,
     laplacian_k: int = 4,
@@ -189,6 +252,26 @@ def run_mismatch(
     independently estimated reference covariances), matching MIRepNet's own
     behaviour. ea_eps is a small diagonal ridge guarding the inverse-sqrt against
     rank-deficient reference covariances (cz_ref, Laplacians zero/reduce rank).
+
+    ea_calib_trials (default None): controls how the TEST-side EA whitener is
+    estimated. Only meaningful when apply_ea=True.
+        None  -> full-block EA: R_bar fit on the entire referenced test split,
+                 all test trials scored. (Reproduces the v0.18 EA behaviour.)
+        k(int)-> low-target-data EA: k trials PER CLASS are carved from the test
+                 split to estimate R_bar; that whitener is applied to the
+                 REMAINING test trials, which are the only ones scored. The
+                 calibration trials are excluded from scoring (no leakage). This
+                 is the deployment-realistic regime (a few calibration trials
+                 under the target reference, then decode the rest). Sweep k to
+                 see whether the transfer gap reopens when EA is starved of data.
+    ea_train_side (default True): when apply_ea, whether to also EA-align the
+    TRAINING split (full-block EA on the referenced train data). Set False to
+    align only at test time, isolating the test-side calibration effect. The
+    train side never uses ea_calib_trials (training data is not calibration-
+    starved in the deployment scenario; you keep the full training set).
+
+    Output rows gain two columns when apply_ea: ea_calib_trials (-1 for full
+    block, else k) and n_calib (realized calibration-trial count).
     """
     model_lc = model.lower()
     from refshift.data import NORMALIZATIONS
@@ -233,17 +316,21 @@ def run_mismatch(
             dl_cache_dir=dl_cache_dir,
             classes=classes,
         ):
-            X_te_by_ref = {
-                m: apply_reference_then_ea(
-                    X_te, m, graph=ctx.graph, apply_ea=apply_ea, ea_eps=ea_eps
-                )
-                for m in modes
-            }
+            X_te_by_ref, y_te_scored, n_calib = _build_test_variants(
+                X_te=X_te, y_te=y_te, modes=modes, graph=ctx.graph,
+                apply_ea=apply_ea, ea_calib_trials=ea_calib_trials,
+                ea_eps=ea_eps, seed=int(seed),
+            )
             n_classes = int(max(int(y_tr.max()), int(y_te.max()))) + 1
+
+            # Train-side alignment: full-block EA on the referenced train split
+            # when apply_ea and ea_train_side. Independent of test-side calib.
+            _train_ea = bool(apply_ea and ea_train_side)
 
             def _fit_dl(train_ref):
                 X_tr_ref = apply_reference_then_ea(
-                    X_tr, train_ref, graph=ctx.graph, apply_ea=apply_ea, ea_eps=ea_eps
+                    X_tr, train_ref, graph=ctx.graph,
+                    apply_ea=_train_ea, ea_eps=ea_eps,
                 )
                 pipe = make_dl_model(
                     model=model_lc,
@@ -264,11 +351,15 @@ def run_mismatch(
 
             _train_and_evaluate(
                 fit_pipe=_fit_dl,
-                X_tr=X_tr, y_tr=y_tr, X_te_by_ref=X_te_by_ref, y_te=y_te,
+                X_tr=X_tr, y_tr=y_tr, X_te_by_ref=X_te_by_ref, y_te=y_te_scored,
                 modes=modes,
-                row_template={"dataset": ctx.dataset_code, "subject": subject, "seed": seed},
+                row_template={
+                    "dataset": ctx.dataset_code, "subject": subject, "seed": seed,
+                    "ea_calib_trials": (-1 if ea_calib_trials is None else int(ea_calib_trials)),
+                    "n_calib": int(n_calib),
+                },
                 rows=rows,
-                n_train=int(len(y_tr)), n_test=int(len(y_te)),
+                n_train=int(len(y_tr)), n_test=int(len(y_te_scored)),
             )
 
         return pd.DataFrame(rows)
@@ -357,16 +448,17 @@ def run_mismatch(
             X, y_int, metadata, strategy=split_strategy, seed=seed,
             dataset_id=dataset_id,
         )
-        X_te_by_ref = {
-            m: apply_reference_then_ea(
-                X_te, m, graph=graph, apply_ea=apply_ea, ea_eps=ea_eps
-            )
-            for m in modes
-        }
+        X_te_by_ref, y_te_scored, n_calib = _build_test_variants(
+            X_te=X_te, y_te=y_te, modes=modes, graph=graph,
+            apply_ea=apply_ea, ea_calib_trials=ea_calib_trials,
+            ea_eps=ea_eps, seed=int(seed),
+        )
+        _train_ea = bool(apply_ea and ea_train_side)
 
         def _fit_csp(train_ref):
             X_tr_ref = apply_reference_then_ea(
-                X_tr, train_ref, graph=graph, apply_ea=apply_ea, ea_eps=ea_eps
+                X_tr, train_ref, graph=graph,
+                apply_ea=_train_ea, ea_eps=ea_eps,
             )
             pipe = make_csp_lda_pipeline(
                 reference_mode=None, n_filters=n_filters,
@@ -377,11 +469,15 @@ def run_mismatch(
 
         _train_and_evaluate(
             fit_pipe=_fit_csp,
-            X_tr=X_tr, y_tr=y_tr, X_te_by_ref=X_te_by_ref, y_te=y_te,
+            X_tr=X_tr, y_tr=y_tr, X_te_by_ref=X_te_by_ref, y_te=y_te_scored,
             modes=modes,
-            row_template={"dataset": dataset.code, "subject": subject, "seed": seed},
+            row_template={
+                "dataset": dataset.code, "subject": subject, "seed": seed,
+                "ea_calib_trials": (-1 if ea_calib_trials is None else int(ea_calib_trials)),
+                "n_calib": int(n_calib),
+            },
             rows=rows,
-            n_train=int(len(y_tr)), n_test=int(len(y_te)),
+            n_train=int(len(y_tr)), n_test=int(len(y_te_scored)),
         )
 
     return pd.DataFrame(rows)

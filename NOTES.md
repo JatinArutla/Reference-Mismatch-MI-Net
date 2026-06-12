@@ -11,6 +11,113 @@ Append, do not edit. New entries on top.
 
 ---
 
+## v0.20.0 — Cross-subject (LOSO) reference mismatch, CSP+LDA
+
+The v0.19 sweep showed EA from 5 target trials/class already closes the gap
+(flat at ~2.3 across k). That settles the WITHIN-subject question. The last
+open regime is zero-target-calibration cross-subject transfer: when you cannot
+estimate the target subject's R_bar from target data and must borrow it.
+
+### What I added
+
+- `run_cross_subject_mismatch(dataset, ea_regime=...)`: leave-one-subject-out.
+  Train CSP+LDA on the pooled SOURCE subjects (everyone but the held-out
+  target), test on the target, under three EA regimes:
+    within   -> R_bar from the target's own test block (the v0.19 floor; anchor).
+    source   -> R_bar from the source pool under the same ref; ZERO target data.
+    target_k -> R_bar from k target trials/class (excluded from scoring).
+- New module experiments/cross_subject.py; a sibling of run_mismatch rather than
+  a flag on it (the LOSO pooling is a different split axis; forcing it into
+  run_mismatch would tangle the per-subject loop).
+
+### Decisions
+
+- **The metric is the transfer GAP, not accuracy.** Cross-subject CSP+LDA is
+  just harder, so the diagonal drops regardless of references. Only the gap
+  (matched-ref diagonal minus off-diagonal) isolates the reference-specific
+  effect. The runner reports per-cell accuracy; the notebook computes the gap.
+- **Train side is source-aligned, not target-aligned.** A model trained on a
+  heterogeneous pool of source subjects needs EA with the POOL's own R_bar.
+  Only the test-side R_bar varies by regime. Conflating the two would change
+  the question.
+- **One graph for the dataset.** Within IV-2a the montage is shared across
+  subjects (asserted on load). Cross-DATASET (different montages) is
+  deliberately out of scope: it reintroduces the channel-template spatial
+  operator we excluded in v0.18, which would confound montage mismatch with
+  reference mismatch. Cross-subject within one dataset is the clean test.
+- **CSP+LDA only.** Same logic as every prior decisive run: cheaper, cleaner,
+  EA's home turf. If the gap stays closed here, Shallow adds nothing.
+
+### What this decides (the last branch)
+
+- Gap stays ~2 under "source" -> EA solves reference shift even at zero target
+  calibration. Reference-robustness is fully solved; no method paper. Pivot.
+- Gap balloons under "source" but "target_k" recovers it -> "a few target
+  trials fix cross-subject too"; still basically solved.
+- Gap balloons under "source" AND "target_k" does not recover -> the one
+  regime where a reference-robust method could earn its place. Only then is
+  jitter/pretraining worth building.
+
+---
+
+
+## v0.19.0 — Low-target-data EA sweep (when does EA stop saving you?)
+
+The v0.18 EA ablation showed EA removes ~88% of the reference-mismatch gap
+(20.1 -> 2.4 CSP, 20.6 -> 2.5 Shallow) when R_bar is fit on the full target
+split. That is a strong-target-adaptation result, NOT "reference shift is
+solved": it assumes a full unlabelled target session under the new reference.
+This release answers the reviewer question that decides the project: what
+happens with only a few calibration trials?
+
+### What I added
+
+- Split EA into `_ea_fit` (R_bar^{-1/2} from a block) and `_ea_apply`
+  (left-multiply by a given whitener). `euclidean_alignment` is now exactly
+  `_ea_apply(X, _ea_fit(X))` — pinned by a unit test so the k=full sweep
+  endpoint still matches the v0.18 numbers.
+- `stratified_calibration_index`: k trials/class, reproducible, class-balanced.
+- `run_mismatch(..., ea_calib_trials=None, ea_train_side=True)`:
+  - ea_calib_trials=None -> full-block test EA (v0.18 behaviour).
+  - ea_calib_trials=k    -> carve k/class from the test split to estimate
+    R_bar, apply to the REMAINING test trials, score only those. Calibration
+    trials are excluded from scoring (no leakage).
+  - ea_train_side toggles whether the train split is also EA-aligned (full
+    data; training is never calibration-starved in the deployment scenario).
+- Output rows gain ea_calib_trials and n_calib columns.
+
+### Decisions
+
+- **Test-time calibration starvation only.** The deployment scenario is: you
+  cannot re-collect training data, you only get a few calibration trials under
+  the reference you will deploy with. So train side keeps full EA; only the
+  test-side whitener is starved. ea_train_side=False isolates test-side effect
+  if needed.
+- **Per-class calibration**, not k-total. EA's R_bar should see both classes'
+  covariance; k/class is the statistically sound and realistic choice. At k=5
+  on 4-class IV-2a that is 20 calibration trials — read the x-axis accordingly.
+- **The comparator at each k is EA-from-k, not no-EA.** The trap this avoids:
+  a learned/jitter method that beats UNALIGNED low-trial decoding but not
+  EA-from-the-same-k-trials is still dead. The sweep is built so EA-from-k is
+  the honest baseline any future method must beat.
+- **Extended run_mismatch rather than a separate runner.** A standalone sweep
+  runner would duplicate the per-subject load/split/graph/train loop and drift
+  out of sync. One code path, one set of channel-order asserts. The sweep is a
+  thin notebook loop over ea_calib_trials.
+- **k=full reproduces v0.18 exactly.** Enforced by
+  test_fit_apply_equals_euclidean_alignment so the right endpoint of the curve
+  is continuous with the prior result.
+
+### What this decides
+
+- EA still closes the gap at k=5/10 -> reference shift not worth a headline; pivot.
+- Gap reopens at low k AND nothing cheap beats EA-from-k -> real low-calibration
+  paper; jitter/pretraining resurrected in a narrow, defensible setting.
+- (Separate follow-up) EA fails cross-subject/cross-dataset -> stronger paper.
+
+---
+
+
 ## v0.18.0 — Euclidean Alignment as a post-reference whitening (EA ablation)
 
 Added EA (He & Wu 2020) to test whether the standard MI-EEG preprocessing

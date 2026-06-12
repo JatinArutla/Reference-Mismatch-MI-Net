@@ -14,6 +14,7 @@ Public entry points (re-exported at refshift package root):
 
 from refshift.experiments.bandpass import run_bandpass_mismatch
 from refshift.experiments.calibration import calibrate_csp_lda
+from refshift.experiments.cross_subject import run_cross_subject_mismatch
 from refshift.experiments.ems_control import run_pre_ems_diagonal
 from refshift.experiments.jitter import run_lofo_matrix, run_mismatch_jitter
 from refshift.experiments.mismatch import mismatch_matrix, run_mismatch
@@ -24,6 +25,7 @@ __all__ = [
     "calibrate_csp_lda",
     "mismatch_matrix",
     "run_bandpass_mismatch",
+    "run_cross_subject_mismatch",
     "run_lofo_matrix",
     "run_mismatch",
     "run_mismatch_jitter",

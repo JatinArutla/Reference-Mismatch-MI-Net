@@ -579,12 +579,51 @@ class ReferenceTransformer(BaseEstimator, TransformerMixin):
 # estimated R_bar; no train->test leakage, but also no shared whitening).
 
 
+def _ea_fit(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Estimate the EA whitener R_bar^{-1/2} from a block of trials.
+
+    R_bar is the mean of per-trial sample covariances (np.cov per trial, then
+    mean), matching MIRepNet. Returns the (C, C) inverse-square-root whitening
+    matrix. Separated from application so a whitener fit on a small calibration
+    subset can be applied to other trials (the low-target-data EA sweep).
+    """
+    from scipy.linalg import fractional_matrix_power
+
+    X = _check_3d(X)
+    N, C, T = X.shape
+    if N == 0:
+        raise ValueError("cannot fit EA on an empty block")
+
+    cov = np.empty((N, C, C), dtype=np.float64)
+    for i in range(N):
+        cov[i] = np.cov(X[i].astype(np.float64))
+    R_bar = cov.mean(axis=0)
+
+    if eps:
+        R_bar = R_bar + eps * np.eye(C, dtype=np.float64)
+
+    R_inv_sqrt = fractional_matrix_power(R_bar, -0.5)
+    # Guard the rank-reducing operators (cz_ref, Laplacians): non-PSD R_bar can
+    # make fractional_matrix_power return a ~0-imaginary complex array.
+    return np.real(R_inv_sqrt).astype(np.float64)
+
+
+def _ea_apply(X: np.ndarray, whitener: np.ndarray) -> np.ndarray:
+    """Left-multiply every (C, T) trial by a precomputed (C, C) whitener."""
+    X = _check_3d(X)
+    if X.shape[0] == 0:
+        return X.copy()
+    out = np.einsum("ij,njt->nit", whitener, X.astype(np.float64))
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
 def euclidean_alignment(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """Euclidean-align a block of trials. Input/output (N, C, T) float32.
 
     Computes one reference covariance R_bar as the mean of per-trial sample
     covariances, then left-multiplies every trial by R_bar^{-1/2}. This is the
-    He & Wu (2020) Euclidean alignment, in the exact form MIRepNet uses.
+    He & Wu (2020) Euclidean alignment, in the exact form MIRepNet uses. This
+    is fit-and-apply on the SAME block; it equals _ea_apply(X, _ea_fit(X)).
 
     Parameters
     ----------
@@ -602,32 +641,30 @@ def euclidean_alignment(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     -------
     (N, C, T) float32, Euclidean-aligned.
     """
-    from scipy.linalg import fractional_matrix_power
-
     X = _check_3d(X)
-    N, C, T = X.shape
-    if N == 0:
+    if X.shape[0] == 0:
         return X.copy()
+    return _ea_apply(X, _ea_fit(X, eps=eps))
 
-    # Per-trial sample covariance, then mean across trials -> reference cov.
-    # np.cov(X[i]) treats rows as variables (channels), matching MIRepNet.
-    cov = np.empty((N, C, C), dtype=np.float64)
-    for i in range(N):
-        cov[i] = np.cov(X[i].astype(np.float64))
-    R_bar = cov.mean(axis=0)
 
-    # Ridge for numerical stability on rank-deficient reference covariances.
-    if eps:
-        R_bar = R_bar + eps * np.eye(C, dtype=np.float64)
+def stratified_calibration_index(
+    y: np.ndarray, k_per_class: int, *, seed: int = 0
+) -> np.ndarray:
+    """Indices of k trials per class, drawn reproducibly.
 
-    R_inv_sqrt = fractional_matrix_power(R_bar, -0.5)
-    # fractional_matrix_power can return a complex array with ~0 imaginary part
-    # when R_bar is numerically non-PSD; take the real part (MIRepNet relies on
-    # R_bar being PSD and does not guard this).
-    R_inv_sqrt = np.real(R_inv_sqrt).astype(np.float64)
-
-    out = np.einsum("ij,njt->nit", R_inv_sqrt, X.astype(np.float64))
-    return np.ascontiguousarray(out, dtype=np.float32)
+    Used to carve a small calibration subset out of the test block for the
+    low-target-data EA sweep: these trials estimate R_bar and are then EXCLUDED
+    from scoring. If a class has fewer than k_per_class trials, all of its
+    trials are taken; the runner reports the realized calibration count.
+    """
+    y = np.asarray(y)
+    rng = np.random.default_rng(seed)
+    picks: List[int] = []
+    for c in np.unique(y):
+        idx = np.flatnonzero(y == c)
+        rng.shuffle(idx)
+        picks.extend(idx[:k_per_class].tolist())
+    return np.asarray(sorted(picks), dtype=int)
 
 
 def apply_reference_then_ea(
