@@ -1,468 +1,116 @@
 # refshift
 
-Reference-shift experiments for motor-imagery (MI) EEG decoding, built on
-top of [MOABB](https://github.com/NeuroTechX/moabb) and
-[braindecode](https://github.com/braindecode/braindecode).
+Reference-mismatch experiments for motor-imagery EEG decoding on **BCI
+Competition IV-2a**.
 
-**Empirical claim.** A classifier trained under one EEG reference (or
-spatial-derivative) operator and tested under another suffers a structured,
-predictable accuracy collapse. We measure this across five MOABB
-motor-imagery datasets, two deep architectures (ShallowFBCSPNet, EEGNet)
-plus the classical CSP+LDA pipeline, eight reference and spatial operators,
-and three interventions: per-sample reference jitter, leave-one-reference-out
-training, and an EMS-control ablation that pins down the order in which
-exponential moving standardization composes with reference operators.
+The choice of EEG **reference** (how each channel's baseline is defined) is a
+preprocessing decision that is usually treated as fixed. This package measures
+what happens when a decoder is trained under one reference and tested under
+another: how large the resulting accuracy gap is, whether it clusters by the
+*kind* of reference operation, and whether training-time reference jitter makes
+a model invariant to the choice.
 
-## Reference and spatial operators
+## Results
 
-| Family | Operator | What it does |
-|---|---|---|
-| Global / symmetric | `native` | identity (whatever the dataset was recorded with) |
-|  | `car` | X − mean across channels |
-|  | `median` | X − median across channels (non-linear robustness control) |
-|  | `rest` | REST-like spherical-model re-reference (Yao 2001 approximation) |
-| Global / asymmetric | `cz_ref` | X − X[Cz] (single-electrode reference; sets Cz channel to zero) |
-| Local spatial-derivative | `lap_small` | X − mean of k=4 nearest neighbours (Hjorth local Laplacian) |
-|  | `lap_large` | X − mean of the ring of neighbours at ranks 4..7 (deterministic next-ring large-Laplacian approximation; motivated by McFarland 1997 but not equivalent on sparse montages) |
-|  | `csd` | Perrin spherical-spline surface Laplacian (`mne.preprocessing.compute_current_source_density`) |
+Fill these in after running `notebooks/consolidated.ipynb`. Each is a mean over
+subjects (and seeds, for the deep nets) on IV-2a.
 
-`lap_small`'s default neighbour set is ranks 0..3 in 3-D electrode distance;
-`lap_large` uses ranks 4..7. With these defaults the two operators have
-disjoint neighbour sets for every channel by construction. The "ring"
-interpretation is approximate on sparse montages — on IV-2a's 22 channels
-the next-ring neighbours can mix hemispheres or anatomical zones (see
-`KNOWN_LIMITATIONS.md`); the disjointness from `lap_small` is the actual
-useful property, regardless of whether "ring" terminology applies.
+| Model        | Matched (diag) | Mismatched (off-diag) | Transfer gap |
+|--------------|---------------:|----------------------:|-------------:|
+| CSP+LDA      |                |                       |              |
+| ShallowConvNet |              |                       |              |
+| EEGNet       |                |                       |              |
+| ATCNet       |                |                       |              |
 
-`csd` is the formal current-source-density operator from Perrin et al. 1989;
-refshift recovers it as a fixed C×C matrix by pushing the identity basis
-through `mne.preprocessing.compute_current_source_density` and reading the
-output (per-epoch application of MNE gives identical results to within
-machine precision in float64; the matrix form is much faster).
+| Intervention            | Mean acc | Worst reference | Spread |
+|-------------------------|---------:|----------------:|-------:|
+| Full jitter (Shallow)   |          |                 |        |
+| LORO recovery gap       |          |                 |        |
+| LOFO family recovery gap|          |                 |        |
 
-**CSD amplitude scale caveat (v0.16).** CSD output amplitude is ~10^2-10^3
-times the other operators (789x CAR on real IV-2a post-EMS). This is a
-unit/scale property of the spherical-spline operator, not spatial topology.
-Analyses that depend on operator distance should use the scale-normalized
-metric (`operator_distance_correlation(..., distance_metric="frobenius_normed")`,
-the v0.16 default). Cross-reference transfer involving CSD confounds
-operator topology with amplitude scale; `run_pre_ems_mismatch` (new in v0.16)
-provides an operator-before-EMS pipeline that allows the two effects to be
-disentangled. See `KNOWN_LIMITATIONS.md` for the full discussion.
-
-`laplacian` is accepted as a legacy alias for `lap_small` (the operator
-was renamed in v0.15; old CSVs and notebooks keep working without edits).
-
-Nearest-neighbour graphs are computed from MNE's `standard_1005` montage.
-REST is built from the same montage via a three-layer spherical head model
-(`mne.make_sphere_model` + `mne.make_forward_solution`) with a regularized
-pseudo-inverse (rcond=1e-4), 10–60 seconds per dataset, computed once.
-
-`cz_ref` requires `Cz` to be present in the dataset's analysis montage.
-On Schirrmeister2017, `Cz` was the recording reference and is excluded
-from the published 44-channel motor subset; `cz_ref` is therefore
-undefined on Schirrmeister2017, and `apply_reference(..., "cz_ref", ...)`
-raises a clear error there. Drop `cz_ref` from `reference_modes` for
-Schirrmeister runs. The other four datasets (IV-2a, OpenBMI, Cho2017,
-Dreyer2023) all have Cz as a separately-recorded channel.
-
-We deliberately do not include a leave-one-out (LOO) mean reference because
-LOO_i = (C/(C−1)) · CAR_i — a constant scaling of CAR that produces
-identical results for any scale-invariant decoder (CSP+LDA's eigenvalue
-problem; batch-normalised neural networks). We do not include a
-projection-based "Gram-Schmidt" operator in the main set because the
-natural implementation is data-dependent and doesn't form a fixed C×C
-linear operator. Earlier versions also included a "NN-diff" operator
-(nearest-neighbour difference, `Y_i = X_i − X_{nn(i)}`); it was removed
-in v0.13 because it is not a literature-recognised reference choice — it
-was constructed for this codebase as an analogue to clinical bipolar
-montages — and its dimension-reducing rank deficiency on dense montages
-would confound the per-sample jitter and SSL experiments.
-
-### Restricting the operator set per run
-
-Every runner (`run_mismatch`, `run_mismatch_jitter`, `run_lofo_matrix`,
-`run_pre_ems_diagonal`) accepts a `reference_modes` keyword that takes any
-iterable — set, tuple, list, frozenset. Define `REFERENCES` once at the
-top of your notebook and pass it everywhere; the runners canonicalise the
-order so the output matrix is always in `REFERENCE_MODES` sequence
-regardless of input iteration order:
-
-```python
-REFERENCES = {"native", "car", "csd"}
-
-df = run_mismatch(
-    "iv2a", model="csp_lda",
-    reference_modes=REFERENCES,
-    seeds=[0, 1, 2],
-)
-```
-
-## Package layout
+## Repository structure
 
 ```
-Reference-Mismatch-MI-Net/
-├── refshift/
-│   ├── __init__.py       public API surface (re-exports below)
-│   ├── reference.py      8 operators, neighbour graph, REST + CSD matrices, sklearn transformer
-│   ├── data.py           load_dl_data + on-disk preprocessed-tensor cache
-│   ├── model.py          make_csp_lda_pipeline + make_dl_model (braindecode + skorch)
-│   ├── jitter.py         RandomReferenceTransform for per-sample reference jitter
-│   ├── analysis.py       std matrix, clustering, op-distance correlation
-│   │                     (bootstrap CI + permutation p), paired Wilcoxon
-│   ├── plotting.py       plot_mismatch_matrix
-│   ├── kaggle.py         Kaggle setup + per-dataset cache symlinks
-│   ├── compat.py         MOABB / braindecode workarounds (one place, documented)
-│   └── experiments/      runner per scientific question
-│       ├── calibration.py     calibrate_csp_lda (MOABB WithinSession)
-│       ├── mismatch.py        run_mismatch (NxN train-test reference matrix)
-│       ├── jitter.py          run_mismatch_jitter, run_lofo_matrix
-│       ├── ems_control.py     run_pre_ems_diagonal
-│       ├── bandpass.py        run_bandpass_mismatch
-│       └── _datasets.py, _split.py, _dl_runner.py    shared scaffolding
-├── scripts/
-│   └── audit_cz_channel.py    pre-flight check that Cz is a separately-recorded
-│                              channel, not a derived virtual zero
-├── tests/                     synthetic-only unit tests, no MOABB downloads
-├── KNOWN_LIMITATIONS.md       methodological caveats and upstream-bug workarounds
-├── NOTES.md                   running design-decision log (filled by author)
-├── pyproject.toml
-├── requirements.txt
-├── LICENSE
-└── README.md
+refshift/
+  datasets.py     Registry of all five datasets (MOABB codes, classes, channel
+                  subsets, split strategies) plus loaders for both pipelines.
+  preprocess.py   The preprocessing pipeline: pick EEG, [channel subset], uV,
+                  resample, bandpass, z-score, window. Disk-cached per subject.
+                  Plus the train/test split (session- or run-based per dataset).
+  references.py   The seven reference operators, their families, and Euclidean
+                  Alignment. The numerical core (kept verbatim from the
+                  original repo, annotated).
+  models.py       Model factories: CSP+LDA, ShallowConvNet, EEGNet, ATCNet.
+  jitter.py       Per-sample reference-jitter data augmentation.
+  experiments.py  run_mismatch, run_mismatch_jitter, run_loro_matrix,
+                  run_lofo_matrix, calibrate_csp_lda (all take dataset_id first).
+  analysis.py     Matrix pivots and the report_* printers used in the notebook.
+tests/            Unit tests (datasets, operators, families, sweeps, reports).
+scripts/
+  verify_equivalence.py  Diff the lean pipeline against the original repo.
+notebooks/
+  consolidated.ipynb     Runs every experiment end to end.
 ```
 
-The package was a flat layout through v0.13 (a single 1400-line `experiments.py`,
-a 600-line `dl.py`, and a `pipelines.py` with one factory). v0.14 reorganised
-it into the structure above so each file maps to one scientific question
-or one technical concern.
+### The seven references
+
+`native` (no change), `car` (common average), `median` (robust average),
+`cz_ref` (single-electrode), `lap_small` / `lap_large` (Laplacians of near and
+far neighbours), `rest` (head-model reference). Families for the
+leave-one-family-out experiment: **global** = {car, median, rest}, **single** =
+{cz_ref}, **spatial** = {lap_small, lap_large}.
 
 ## Install
 
 ```bash
-pip install -r requirements.txt
-pip install -e ".[dl]"      # `[dl]` adds torch / braindecode / skorch
+pip install -e ".[dl]"
 ```
 
-MOABB is pinned to 1.5.0. See `KNOWN_LIMITATIONS.md` for upstream issues
-the codebase works around at this version.
+The deep-learning extras (`braindecode`, `torch`, `skorch`) are needed for every
+model except CSP+LDA. `moabb` is pinned to 1.5.0 because the CSP+LDA calibration
+target was verified at that version.
 
-## Tests
+## Reproduce
 
-```bash
-pytest tests/ -v
-```
+1. Open `notebooks/consolidated.ipynb`.
+2. Section A: install the package (point `REFSHIFT_SRC` at the attached Kaggle
+   dataset folder), then call `setup_kaggle_env()`. This sets `MNE_DATA` and
+   thread caps and **symlinks your attached Kaggle datasets into MOABB's cache
+   layout so nothing downloads**. Run it once per kernel, before any data load.
+3. Section C is the calibration sanity check: bare CSP+LDA should reproduce the
+   standard IV-2a baseline, and a no-op reference transformer should change
+   nothing.
+4. Sections D-I produce the mismatch matrices, jitter, LORO, and LOFO results.
 
-None of the tests requires MOABB downloads or network access.
+### Kaggle data wiring
 
-## Kaggle usage
+`refshift/kaggle.py` symlinks the attached Kaggle datasets into the layout MOABB
+expects, handling each dataset's quirks (OpenBMI's flat layout, Dreyer2023's
+`mne_bids` lock files on a read-only mount, Schirrmeister's pooch paths). The
+hardcoded `/kaggle/input/...` source paths live at the top of that file; edit
+them if your attached dataset slugs differ.
 
-Clone → install → setup → run. The notebook API is the intended entry
-point; there is no CLI.
+## Verifying against the original repo
 
-### Cell 1 — clone, install, environment
+`scripts/verify_equivalence.py` checks that this lean package reproduces the
+original implementation: `check_preprocessing` confirms the preprocessed trials
+are identical, and `diff_result_csvs` compares result tables cell by cell. The
+reference operators are byte-identical to the original by construction (the
+unit tests prove this), so matching preprocessing implies matching results up
+to GPU/seed nondeterminism.
 
-```python
-import os, pathlib, subprocess
+## Datasets
 
-os.chdir("/kaggle/working")
-if pathlib.Path("Reference-Mismatch-MI-Net").exists():
-    subprocess.run(["rm", "-rf", "Reference-Mismatch-MI-Net"], check=True)
-subprocess.run(
-    ["git", "clone", "https://github.com/JatinArutla/Reference-Mismatch-MI-Net"],
-    check=True,
-)
-os.chdir("Reference-Mismatch-MI-Net")
+Five MOABB motor-imagery datasets. Each runner takes ``dataset_id`` first.
 
-!pip install -r requirements.txt --quiet
-!pip install -e ".[dl]" --quiet
+| dataset_id          | MOABB code       | classes | split   | notes |
+|---------------------|------------------|--------:|---------|-------|
+| `iv2a`              | BNCI2014_001     | 4       | session | 22 ch, 2 sessions |
+| `openbmi`           | Lee2019_MI       | 2       | session | needs a compat fix to load both sessions |
+| `cho2017`           | Cho2017          | 2       | session | |
+| `dreyer2023`        | Dreyer2023       | 2       | session | |
+| `schirrmeister2017` | Schirrmeister2017| 4       | run     | 44-ch motor subset; no Cz, so cz_ref is excluded |
 
-from refshift import setup_kaggle_env
-setup_kaggle_env()
-
-RESULTS = "/kaggle/working/results"
-os.makedirs(RESULTS, exist_ok=True)
-```
-
-`setup_kaggle_env()` sets `MNE_DATA=/kaggle/working/mne_data`,
-`MOABB_RESULTS=/kaggle/working/moabb_results`, caps BLAS threads at 1, and
-symlinks Kaggle input datasets into MOABB's cache layout so MOABB does not
-re-download.
-
-Known Kaggle paths (override via env vars if yours differ):
-
-| Dataset | Env var | Default Kaggle path |
-|---|---|---|
-| IV-2a | `REFSHIFT_IV2A_ROOT` | `/kaggle/input/datasets/delhialli/four-class-motor-imagery-bnci-001-2014` |
-| OpenBMI | `REFSHIFT_OPENBMI_ROOT` | `/kaggle/input/datasets/imaginer369/openbmi-dataset` |
-| Cho2017 | `REFSHIFT_CHO2017_ROOT` | `/kaggle/input/datasets/delhialli/cho2017` |
-| Dreyer2023 | `REFSHIFT_DREYER_ROOT` | `/kaggle/input/datasets/delhialli/dreyer2023/MNE-Dreyer2023-data` |
-| Schirrmeister2017 | `REFSHIFT_SCHIRRMEISTER_ROOT` | `/kaggle/input/datasets/hangtrance/high-gamma-dts` |
-
-### Cell 2 — calibration (optional but recommended for first-time setup)
-
-```python
-from refshift import calibrate_csp_lda
-_, summary, passed = calibrate_csp_lda("iv2a")
-assert passed, "calibration FAILED — do not trust downstream numbers"
-```
-
-Expected: CSP+LDA (bare) ≈ 65.99 ± 15 on IV-2a, identity check within 0.5%
-of bare. If this fails, stop and debug before running the mismatch matrix.
-
-### Cell 3 — Phase 1: CSP+LDA mismatch matrix per dataset
-
-```python
-from refshift import run_mismatch, mismatch_matrix, plot_mismatch_matrix
-import matplotlib.pyplot as plt
-
-# `reference_modes=None` (the default) auto-resolves the reference set
-# per dataset: cz_ref is excluded automatically for Schirrmeister2017
-# (which uses Cz as recording reference, so there's no Cz channel).
-# Override with reference_modes=(...) for ablations.
-for ds in ["iv2a", "openbmi", "cho2017", "dreyer2023", "schirrmeister2017"]:
-    df = run_mismatch(ds, model="csp_lda", seeds=[0])
-    df.to_csv(f"{RESULTS}/{ds}_csp_lda.csv", index=False)
-    fig = plot_mismatch_matrix(
-        df, out_path=f"{RESULTS}/{ds}_csp_lda_heatmap.png",
-        title=f"CSP+LDA {ds}",
-    )
-    plt.close(fig)
-    print(mismatch_matrix(df).round(3))
-```
-
-`subjects=None` (default) excludes any known-bad subjects automatically; see
-`KNOWN_LIMITATIONS.md` for the OpenBMI subject-29 exclusion. Pass
-`subjects=[...]` to override.
-
-### Cell 4 — Phase 2: DL mismatch matrix (Shallow / EEGNet)
-
-```python
-df = run_mismatch(
-    "iv2a",
-    model="shallow",                  # or "eegnet"
-    seeds=[0, 1, 2],
-    dl_max_epochs=200,
-    dl_batch_size=32,
-    dl_cache_dir="/kaggle/working/cache",   # preprocessed-tensor cache
-)
-df.to_csv(f"{RESULTS}/iv2a_shallow_seeds012.csv", index=False)
-```
-
-The DL pipeline resamples to 250 Hz on every dataset (`dl_resample=250.0`
-default) so Shallow's `filter_time_length=25` corresponds to ~100 ms of
-physical time regardless of the dataset's native acquisition rate. Pass
-a different `dl_resample=` to override; the value is part of the cache
-key, so different rates get different cache entries.
-
-EEGNet uses 5e-4 for all datasets (Lawhern et al. 2018 small-data MI
-recommendation); no per-dataset learning-rate override is needed.
-
-### Cell 5 — Phase 2 intervention: per-sample reference jitter
-
-```python
-from refshift import run_mismatch_jitter, run_lofo_matrix
-
-# Full-jitter: each training sample gets a random reference from all 6 modes
-df_full = run_mismatch_jitter(
-    "iv2a",
-    model="shallow",
-    condition="full",
-    seeds=[0, 1, 2],
-    dl_cache_dir="/kaggle/working/cache",
-)
-df_full.to_csv(f"{RESULTS}/iv2a_shallow_jitter_full_seeds012.csv", index=False)
-
-# LOFO: hold out one reference at a time; train on the other 5; evaluate
-# on all 6. Produces the full LOFO matrix in one call.
-df_lofo = run_lofo_matrix(
-    "iv2a",
-    model="shallow",
-    seeds=[0, 1, 2],
-    dl_cache_dir="/kaggle/working/cache",
-)
-df_lofo.to_csv(f"{RESULTS}/iv2a_shallow_lofo_matrix_seeds012.csv", index=False)
-```
-
-### Cell 6 — EMS-control ablation (highest-priority methodological control)
-
-```python
-from refshift import run_pre_ems_diagonal
-
-# 6-element diagonal with the reference applied BEFORE EMS, on the
-# continuous filtered raw. Compare against the diagonal of the standard
-# run_mismatch matrix to verify the reference operator's effect on
-# accuracy is not driven by EMS-after-reference non-commutativity.
-df_pre = run_pre_ems_diagonal(
-    "iv2a",
-    model="shallow",
-    seeds=[0, 1, 2],
-    dl_cache_dir="/kaggle/working/cache",
-)
-df_pre.to_csv(f"{RESULTS}/iv2a_shallow_pre_ems_diag_seeds012.csv", index=False)
-```
-
-### Cell 7 — Bandpass-mismatch control (preprocessing-brittleness baseline)
-
-```python
-from refshift import run_bandpass_mismatch
-
-# Train at 8-32 Hz; test at 6-32 Hz and 8-30 Hz, holding reference fixed
-# at native. Quantifies the per-test-band accuracy drop attributable to
-# generic bandpass mismatch, against which the reference-mismatch gap
-# can be compared.
-df_bp = run_bandpass_mismatch(
-    "iv2a",
-    model="shallow",
-    train_band=(8.0, 32.0),
-    test_bands=((6.0, 32.0), (8.0, 30.0)),
-    seeds=[0, 1, 2],
-    dl_cache_dir="/kaggle/working/cache",
-)
-df_bp.to_csv(f"{RESULTS}/iv2a_shallow_bandpass_mismatch_seeds012.csv", index=False)
-```
-
-### Cell 8 — post-hoc analyses
-
-Three analyses, all pure numpy/scipy, no MOABB, ~1 second each (operator
-distance correlation runs ~10 seconds because of the bootstrap +
-permutation):
-
-```python
-import pandas as pd
-import matplotlib.pyplot as plt
-from refshift import (
-    mismatch_matrix, mismatch_std_matrix,
-    cluster_references, plot_dendrogram,
-    operator_distance_correlation, plot_operator_distance_scatter,
-    paired_wilcoxon_per_test_ref,
-    baseline_diagonal_view, baseline_col_off_diag_view,
-)
-
-IV2A_CHS = ["Fz","FC3","FC1","FCz","FC2","FC4","C5","C3","C1","Cz","C2","C4","C6",
-            "CP3","CP1","CPz","CP2","CP4","P1","Pz","P2","POz"]
-
-baseline = pd.read_csv(f"{RESULTS}/iv2a_shallow_seeds012.csv")
-M = mismatch_matrix(baseline)
-
-# Hierarchical clustering of references by transfer pattern
-cluster = cluster_references(M)
-plot_dendrogram(cluster, out_path=f"{RESULTS}/iv2a_dendrogram.png")
-
-# Spearman ρ between operator-matrix Frobenius distance and transfer gap.
-# Reports a 95% bootstrap CI and a permutation p-value alongside the
-# asymptotic p, because at 8 operators we have only 28 pairs.
-odc = operator_distance_correlation(M, IV2A_CHS)
-print(
-    f"Spearman ρ = {odc.spearman_rho:.3f} "
-    f"(95% CI [{odc.ci95_spearman[0]:.3f}, {odc.ci95_spearman[1]:.3f}], "
-    f"perm p = {odc.perm_p_spearman:.4f})"
-)
-
-# Significance of jitter intervention vs baseline diagonal
-jitter = pd.read_csv(f"{RESULTS}/iv2a_shallow_jitter_full_seeds012.csv")
-result = paired_wilcoxon_per_test_ref(
-    jitter, baseline_diagonal_view(baseline),
-    label_a="full_jitter", label_b="baseline_diag",
-    alternative="two-sided",
-)
-print(result.round(4).to_string(index=False))
-```
-
-## Design notes
-
-**Why `run_mismatch` does not use MOABB's `Evaluation` class.** MOABB
-evaluators train once and score once per fold. The mismatch matrix needs
-one training per `train_ref` and six scorings per fitted model. Wrapping
-MOABB's evaluation to extract the fitted classifier mid-fold requires
-private-API access. Instead, `run_mismatch` calls `paradigm.get_data()`
-directly and loops over train/test reference pairs in ~50 lines. The
-calibration function (Cell 2) uses `WithinSessionEvaluation` to validate
-against MOABB's published 65.99% number, and the mismatch runner inherits
-trust from the shared `make_csp_lda_pipeline`.
-
-**Cross-session vs within-session.** The mismatch runner uses cross-session
-splits where the dataset has more than one MOABB session (IV-2a, OpenBMI),
-run-based splits where the dataset has a natural train/test run split
-within a single session (Schirrmeister2017), and stratified 80/20
-within-session splits otherwise (Cho2017, Dreyer2023). The diagonal of the
-mismatch matrix is therefore a few points below the calibration number —
-expected, not a bug.
-
-**`ReferenceTransformer('native')` is a true identity but we still
-calibrate it.** `calibrate_csp_lda` runs both the bare CSP+LDA and the
-`ReferenceTransformer('native') → CSP+LDA` variants; their mean scores
-must match within 0.5%. This catches any accidental side-effect of
-inserting a step into MOABB's pipeline (dtype change, contiguity,
-non-clone-ability). A silent regression here would corrupt every cell of
-the mismatch matrix.
-
-**REST (Yao 2001).** Implemented as a linear transformation matrix built
-from a three-layer spherical head model fit to the channel montage. The
-transform incorporates the centering operator `(I − 1_C 1_C^T / C)` so the
-result is invariant to additive re-referencing. Validated by unit tests:
-`T @ 1_C = 0` (reference invariance) and `REST(V) ≠ V` (non-trivial).
-
-**Standardization and reference order.** Phase 1 (CSP+LDA) uses none —
-CSP's OAS covariance estimator handles scale. Phase 2 (DL) uses
-braindecode's `exponential_moving_standardize` on continuous raw before
-epoching; references are then applied to the windowed, standardized X
-array. EMS is per-channel and adaptive, so it does **not** commute with
-channel-mixing reference operators. The standard pipeline therefore
-measures "reference applied to EMS-standardized signals." The
-`run_pre_ems_diagonal` ablation flips this order — applying the
-reference to the continuous filtered raw before EMS — and reports a
-diagonal that should match the standard pipeline's diagonal within seed
-noise if the EMS-after-reference order is not driving the cluster
-structure.
-
-**DL resample standardization.** The DL pipeline resamples every dataset
-to a common rate (`dl_resample=250.0` default) before bandpass + EMS, so
-the time-domain receptive field of every model is identical regardless
-of the dataset's native acquisition rate. Without this, Shallow's
-`filter_time_length=25` (samples) gave ~100 ms physical-time at IV-2a's
-250 Hz, ~50 ms at Cho2017/Dreyer2023's 512 Hz, and ~25 ms at OpenBMI's
-1000 Hz, complicating cross-dataset comparisons. The CSP+LDA path is left
-at MOABB's native paradigm settings (Schirrmeister2017 uses 250 Hz via
-`paradigm.resample`; the others run at native rate); CSP-based decoders
-are not sensitive to absolute sample rate, so the inconsistency does not
-affect their comparability.
-
-**EEGNet learning rate.** `make_dl_model("eegnet", ...)` uses 5e-4 by
-default — Lawhern et al. 2018's recommendation for small-data MI — for
-all datasets uniformly. Earlier code branches set 1e-3 for some datasets
-and 5e-4 for Cho2017 specifically; uniform 5e-4 removes the per-dataset
-override.
-
-**Per-sample reference jitter.** Implemented as a braindecode `Transform`
-plugged into `AugmentedDataLoader`. Each training sample independently
-gets a reference drawn uniformly from `allowed_modes`. Full-jitter uses
-all available operators on the dataset (typically all 8; on
-Schirrmeister2017, drop `cz_ref` for 7); LOFO uses one fewer (the
-held-out operator excluded from the training distribution). See
-`refshift/jitter.py`.
-
-**Operator-distance correlation.** `operator_distance_correlation`
-uses the **exact** C×C operator matrix for every linear operator in the
-8-mode set (native, CAR, REST, CSD, cz_ref, lap_small, lap_large) and a
-Gaussian-probe linear-tangent estimate for `median` (the only non-linear
-operator). It then computes pairwise Frobenius distances and correlates
-them with the symmetric transfer gap `gap_ij = diag_mean - 0.5*(M_ij + M_ji)`.
-Because the upper triangle has 28 pairs at 8 operators (21 when cz_ref
-is dropped on Schirrmeister), the asymptotic Spearman/Pearson p-values
-are unreliable; the function additionally returns a bootstrap 95%
-confidence interval and a permutation p-value computed by shuffling
-operator labels of the gap matrix. We do not interpret this as a
-Ben-David H-divergence bound; Frobenius distance is a data-free
-quantity, and its empirical correlation with transfer gap is a
-structural finding, not a tight theoretical bound.
-
-**Compatibility shims.** All MOABB / braindecode workarounds live in
-`refshift/compat.py` so the rest of the codebase stays library-faithful.
-Each shim documents the upstream issue, the version the workaround was
-needed at, and what would let it be removed. See also
-`KNOWN_LIMITATIONS.md`.
-
-## License
-
-MIT — see `LICENSE`.
+Each dataset always uses its full class set. Per-dataset behaviour lives in one
+config table (`DATASETS` in `datasets.py`); adding a sixth dataset means adding
+one `DatasetSpec` there.

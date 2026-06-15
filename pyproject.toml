@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "refshift"
-version = "0.16.3"
-description = "Reference-shift experiments for motor-imagery EEG decoding."
+version = "1.0.0"
+description = "Reference-mismatch experiments for motor-imagery EEG decoding (BCI IV-2a)."
 requires-python = ">=3.10"
 dependencies = [
-    # MOABB pinned for reproducibility of the 65.99% IV-2a CSP+LDA calibration
-    # (verified at this version; loosen only after re-verifying the target).
+    # moabb pinned: the IV-2a CSP+LDA calibration target (65.99%) was verified
+    # at this version. Loosen only after re-verifying the target.
     "moabb==1.5.0",
     "mne>=1.5",
     "pyriemann>=0.5",
@@ -22,15 +22,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Phase 2 DL dependencies. Install with `pip install -e '.[dl]'`.
-# braindecode 1.12 renamed EEGNetv4 -> EEGNet (with v4 alias); 1.14 removes
-# the alias. refshift.model handles both via try/except, so >=1.0 is fine.
-# mne>=1.11 is REQUIRED here: braindecode >=1.5 builds its preprocessing
-# classes (FilterData, Filter, Resample, ...) dynamically from mne at import
-# time and declares mne>=1.11. The base dep's looser `mne>=1.5` lets a
-# resolver (e.g. Kaggle's pre-pinned older mne) keep an mne too old for
-# braindecode, yielding "cannot import name 'FilterData'". Pinning the floor
-# at the top level forces the upgrade regardless of install order.
+# Deep-learning dependencies. Install with: pip install -e '.[dl]'
+# mne>=1.11 is REQUIRED here: braindecode builds its preprocessing classes
+# (Filter, Resample, ...) dynamically from mne at import time and needs >=1.11.
+# The base 'mne>=1.5' floor lets a resolver keep an older mne that braindecode
+# cannot import; pinning the floor here forces the upgrade.
 dl = [
     "braindecode>=1.0",
     "mne>=1.11",

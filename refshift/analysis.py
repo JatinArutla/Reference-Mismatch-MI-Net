@@ -1,704 +1,206 @@
-"""Post-hoc analyses on mismatch-matrix results.
+"""Turn long-form result tables into the matrices and summaries you read.
 
-Four pure-numpy/scipy functions on the long-form DataFrame from run_mismatch
-or the aggregate from mismatch_matrix:
-
-    mismatch_std_matrix              per-cell std across (subject, seed)
-    cluster_references               agglomerative on D = diag - sym(M)
-    operator_distance_correlation    Frobenius operator distance vs transfer gap
-    paired_wilcoxon_per_test_ref     paired Wilcoxon per test_ref + Holm
-
-Plus helpers baseline_diagonal_view, baseline_col_off_diag_view to extract
-comparable subsets from a baseline run_mismatch DataFrame.
+These are the reporting helpers the notebook uses. They take the long-form
+DataFrame a runner returns and produce a printed matrix plus a few summary
+numbers. None of them touch the models or data; they are pure pandas/numpy on
+the results table, so they are easy to read and to trust.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 
-from refshift.reference import (
-    REFERENCE_MODES,
-    DatasetGraph,
-    _resolve_alias,
-    apply_reference,
-    build_graph,
-)
+from refshift.references import FAMILIES, REFERENCE_MODES
 
 
-def _resolve_aliases_in_df(
-    df: pd.DataFrame, columns: Tuple[str, ...] = ("train_ref", "test_ref"),
-) -> pd.DataFrame:
-    """Replace legacy mode names (e.g. 'laplacian') with canonical ones in the
-    given columns. Returns a copy with the resolution applied; original
-    DataFrame is not mutated.
+def mismatch_matrix(df: pd.DataFrame, *, metric: str = "accuracy") -> pd.DataFrame:
+    """Mean ``metric`` as a train_ref x test_ref table."""
+    return df.groupby(["train_ref", "test_ref"])[metric].mean().unstack("test_ref")
 
-    v0.14 CSVs use 'laplacian'; v0.15 uses 'lap_small'. Without this
-    normalisation, analysis helpers that reindex against REFERENCE_MODES
-    would silently drop 'laplacian' rows, producing an undersized output
-    matrix with no warning. This helper guarantees old CSVs survive.
+
+def mismatch_std_matrix(df: pd.DataFrame, *, metric: str = "accuracy") -> pd.DataFrame:
+    """Std of ``metric`` over (subject, seed) as a train_ref x test_ref table."""
+    return df.groupby(["train_ref", "test_ref"])[metric].std().unstack("test_ref")
+
+
+def report_matrix(df, *, title, modes=REFERENCE_MODES):
+    """Print the accuracy mismatch matrix and a transfer-gap summary.
+
+    Sections: [A] diagonal vs off-diagonal means and their gap; [B] per
+    test-reference view of how hard each reference is to transfer into; [C]
+    per-cell std over (subject, seed). Returns the accuracy matrix.
     """
-    out = df.copy()
-    for col in columns:
-        if col in out.columns:
-            out[col] = out[col].map(lambda m: _resolve_alias(m) if isinstance(m, str) else m)
-    return out
+    present = [m for m in modes if m in df["train_ref"].unique()]
+    M = mismatch_matrix(df).reindex(index=present, columns=present)
+    A = M.to_numpy(dtype=float)
+    n = A.shape[0]
+    off_mask = ~np.eye(n, dtype=bool)
 
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+    print("Accuracy matrix (rows = train_ref, cols = test_ref), %:")
+    print((M * 100).round(1).to_string())
 
-# ---------------------------------------------------------------------------
-# 1. Standard-deviation matrix
-# ---------------------------------------------------------------------------
+    diag = np.diag(A)
+    off = A[off_mask]
+    print("\n[A] Transfer summary")
+    print(f"    diagonal mean   = {np.nanmean(diag) * 100:6.2f}%")
+    print(f"    off-diag mean   = {np.nanmean(off) * 100:6.2f}%")
+    print(f"    transfer gap    = {(np.nanmean(diag) - np.nanmean(off)) * 100:6.2f}%"
+          "  (bigger = worse mismatch)")
 
-def mismatch_std_matrix(
-    df: pd.DataFrame,
-    *,
-    metric: str = "accuracy",
-    reference_order: Tuple[str, ...] = REFERENCE_MODES,
-) -> pd.DataFrame:
-    """Per-cell std over (subject, seed). Counterpart to mismatch_matrix(..., 'mean').
-
-    Accepts v0.14 CSVs with legacy 'laplacian' rows: they are silently
-    resolved to 'lap_small' before pivoting.
-    """
-    df = _resolve_aliases_in_df(df)
-    agg = df.groupby(["train_ref", "test_ref"])[metric].std()
-    present_train = [m for m in reference_order if m in agg.index.get_level_values("train_ref").unique()]
-    present_test = [m for m in reference_order if m in agg.index.get_level_values("test_ref").unique()]
-    return agg.unstack("test_ref").reindex(index=present_train, columns=present_test)
-
-
-# ---------------------------------------------------------------------------
-# 2. Hierarchical clustering
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ClusterResult:
-    references: List[str]
-    distance_matrix: np.ndarray
-    linkage: np.ndarray
-    clusters: Dict[int, List[List[str]]]
-    diag_mean: float
-
-
-def cluster_references(
-    mean_matrix: pd.DataFrame,
-    *,
-    method: str = "average",
-    cluster_sizes: Tuple[int, ...] = (2, 3, 4),
-) -> ClusterResult:
-    """Agglomerative cluster references on D_ij = diag_mean - 0.5*(M_ij + M_ji).
-
-    method='average' (UPGMA) because the distance is behavioural, not Euclidean
-    (so 'ward' isn't strictly applicable). cluster_sizes lists ks for which
-    fcluster assignments are reported.
-    """
-    from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import squareform
-
-    M = mean_matrix.to_numpy().astype(np.float64)
-    refs = list(mean_matrix.index)
-    if list(mean_matrix.columns) != refs:
-        raise ValueError(
-            f"cluster_references expects square matrix with matching row/col order; "
-            f"got rows={refs}, cols={list(mean_matrix.columns)}"
-        )
-
-    Msym = 0.5 * (M + M.T)
-    diag_mean = float(np.diag(M).mean())
-    D = diag_mean - Msym
-    np.fill_diagonal(D, 0.0)
-    D = np.maximum(D, 0.0)  # clip numerical noise
-
-    Z = linkage(squareform(D, checks=False), method=method)
-
-    clusters: Dict[int, List[List[str]]] = {}
-    for k in cluster_sizes:
-        labels = fcluster(Z, t=k, criterion="maxclust")
-        groups: Dict[int, List[str]] = {}
-        for r, lab in zip(refs, labels):
-            groups.setdefault(int(lab), []).append(r)
-        clusters[k] = [groups[i] for i in sorted(groups)]
-
-    return ClusterResult(
-        references=refs, distance_matrix=D, linkage=Z,
-        clusters=clusters, diag_mean=diag_mean,
-    )
-
-
-def plot_dendrogram(
-    result: ClusterResult,
-    out_path: Optional[str] = None,
-    *,
-    title: str = "Reference-operator clustering",
-    figsize: Tuple[float, float] = (8, 4),
-    dpi: int = 140,
-):
-    """Dendrogram from cluster_references output. Returns the figure."""
-    import matplotlib.pyplot as plt
-    from scipy.cluster.hierarchy import dendrogram
-
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    dendrogram(
-        result.linkage, labels=result.references,
-        leaf_rotation=45, leaf_font_size=10,
-        color_threshold=0.0, above_threshold_color="black",
-        ax=ax,
-    )
-    ax.set_ylabel("Distance  (diag mean - symmetric transfer)")
-    ax.set_title(title)
-    fig.tight_layout()
-    if out_path is not None:
-        fig.savefig(out_path, bbox_inches="tight", dpi=dpi)
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# 3. Operator-distance vs transfer-gap correlation
-# ---------------------------------------------------------------------------
-
-def _exact_operator_matrix(
-    mode: str, graph: DatasetGraph, n_channels: int,
-) -> Optional[np.ndarray]:
-    """Return the exact C×C operator matrix for genuinely linear operators.
-
-    For every operator in REFERENCE_MODES except 'median', the operator is
-    exactly linear and a closed-form matrix is available. Using it directly
-    (instead of a Gaussian probe approximation) removes a small variance
-    source from the operator-distance correlation analysis at no cost.
-
-    Returns None for 'median' (non-linear; the caller should fall back to
-    the probe-based linear-tangent estimate).
-    """
-    from refshift.reference import _resolve_alias
-    mode = _resolve_alias(mode)
-    C = n_channels
-    if mode == "native":
-        return np.eye(C, dtype=np.float64)
-    if mode == "car":
-        return np.eye(C) - np.ones((C, C)) / C
-    if mode == "median":
-        # Non-linear; let the probe handle it.
-        return None
-    if mode == "rest":
-        if graph is None or graph.rest_matrix is None:
-            raise ValueError(
-                "_exact_operator_matrix('rest') requires graph with rest_matrix"
-            )
-        return graph.rest_matrix.astype(np.float64)
-    if mode == "csd":
-        if graph is None or graph.csd_matrix is None:
-            raise ValueError(
-                "_exact_operator_matrix('csd') requires graph with csd_matrix"
-            )
-        return graph.csd_matrix.astype(np.float64)
-    if mode == "cz_ref":
-        if graph is None or graph.cz_idx is None:
-            raise ValueError(
-                "_exact_operator_matrix('cz_ref') requires graph with cz_idx"
-            )
-        A = np.eye(C, dtype=np.float64)
-        A[:, graph.cz_idx] -= 1.0
-        return A
-    if mode == "lap_small":
-        if graph is None:
-            raise ValueError(
-                "_exact_operator_matrix('lap_small') requires a DatasetGraph"
-            )
-        return _idx_to_laplacian_matrix(graph.lap_small_idx, C)
-    if mode == "lap_large":
-        if graph is None:
-            raise ValueError(
-                "_exact_operator_matrix('lap_large') requires a DatasetGraph"
-            )
-        return _idx_to_laplacian_matrix(graph.lap_large_idx, C)
-    raise ValueError(f"Unknown reference mode for exact matrix: {mode!r}")
-
-
-def _idx_to_laplacian_matrix(idx: np.ndarray, C: int) -> np.ndarray:
-    """Build a C×C local-Laplacian matrix from neighbour indices.
-
-    A[i, i] = 1; A[i, idx[i, j]] = -1/k. Each row sums to zero (rank C-1).
-    """
-    k = idx.shape[1]
-    A = np.zeros((C, C), dtype=np.float64)
-    for i in range(C):
-        A[i, i] = 1.0
-        for j in idx[i]:
-            A[i, int(j)] -= 1.0 / k
-    return A
-
-
-def _estimate_linear_operator(
-    mode: str,
-    graph: DatasetGraph,
-    *,
-    n_times: int = 2000,
-    seed: int = 0,
-    n_probes: int = 1,
-) -> np.ndarray:
-    """Best linear approximation of the operator: A = Y @ pinv(X) on Gaussian X.
-
-    For median (non-linear), returns the linear tangent — empirically close
-    to CAR's I - J/C since median of zero-mean Gaussian is approximately zero.
-    n_probes>1 averages independent probes; matters mostly for median.
-
-    For genuinely linear operators (everything else in REFERENCE_MODES),
-    prefer ``_exact_operator_matrix`` which returns the closed-form matrix
-    without any probe noise. This function is kept for the median fallback
-    and for any operator where the exact form isn't available.
-    """
-    C = len(graph.ch_names)
-    rng = np.random.default_rng(seed)
-    A_acc = np.zeros((C, C), dtype=np.float64)
-    for _ in range(int(n_probes)):
-        X = rng.standard_normal((1, C, n_times)).astype(np.float32)
-        Y = apply_reference(X, mode, graph=graph)
-        A_acc += Y[0] @ np.linalg.pinv(X[0])
-    return (A_acc / float(n_probes)).astype(np.float64)
-
-
-@dataclass
-class OperatorDistanceResult:
-    """Asymptotic stats unreliable at small n_pairs; report perm_p and ci95 in papers.
-
-    Fields:
-        references          mode names in matrix order
-        distance_metric     'frobenius_raw' or 'frobenius_normed'
-        distances_frobenius N×N pairwise distance matrix under distance_metric
-        transfer_gaps       N×N transfer-gap matrix (diag_mean - sym_M)
-        spearman_rho        Spearman correlation between upper-triangle of the two
-        spearman_p          asymptotic Spearman p (unreliable at small N; use perm_p_*)
-        pearson_r           Pearson correlation
-        pearson_p           asymptotic Pearson p (unreliable; use perm_p_*)
-        perm_p_spearman     permutation-test p-value (operator-label shuffle)
-        perm_p_pearson      same, for Pearson
-        ci95_spearman       bootstrap 95% CI over pair resampling
-        ci95_pearson        same, for Pearson
-        pair_table          long-form DataFrame of all upper-triangle pairs
-    """
-    references: List[str]
-    distance_metric: str
-    distances_frobenius: np.ndarray
-    transfer_gaps: np.ndarray
-    spearman_rho: float
-    spearman_p: float
-    pearson_r: float
-    pearson_p: float
-    perm_p_spearman: float
-    perm_p_pearson: float
-    ci95_spearman: Tuple[float, float]
-    ci95_pearson: Tuple[float, float]
-    pair_table: pd.DataFrame
-
-
-def _operator_distance_matrix(
-    ops: Dict[str, np.ndarray],
-    refs: List[str],
-    metric: str,
-) -> np.ndarray:
-    """Pairwise Frobenius distance under the requested metric.
-
-    metric='frobenius_raw':
-        ||A_i - A_j||_F. Dominated by the operator with the largest
-        Frobenius norm. For CSD (||A_csd||_F >> others) this means raw
-        distances are dominated by CSD's amplitude scale, not its
-        spatial-derivative topology. Useful when amplitude matters
-        (e.g. decoder transfer where input scale affects BatchNorm); the
-        legacy / v0.15 behaviour.
-
-    metric='frobenius_normed':
-        ||A_i/||A_i||_F - A_j/||A_j||_F||_F. Each operator is rescaled
-        to unit Frobenius norm before differencing, so distance reflects
-        only the operator's spatial-topology direction in matrix space.
-        Values are in [0, sqrt(2)]. This is the metric a paper should
-        use to claim "operator topology drives transfer", because the
-        raw metric confounds topology with scale.
-    """
-    n = len(refs)
-    D = np.zeros((n, n))
-    if metric == "frobenius_raw":
-        for i, a in enumerate(refs):
-            for j, b in enumerate(refs):
-                D[i, j] = np.linalg.norm(ops[a] - ops[b], ord="fro")
-        return D
-    if metric == "frobenius_normed":
-        normed = {}
-        for r in refs:
-            A = ops[r]
-            fro = np.linalg.norm(A, ord="fro")
-            if fro < 1e-12:
-                # Pathological: zero operator. Keep as-is to avoid 0/0.
-                normed[r] = A
-            else:
-                normed[r] = A / fro
-        for i, a in enumerate(refs):
-            for j, b in enumerate(refs):
-                D[i, j] = np.linalg.norm(normed[a] - normed[b], ord="fro")
-        return D
-    raise ValueError(
-        f"Unknown distance_metric={metric!r}. "
-        f"Use 'frobenius_raw' or 'frobenius_normed'."
-    )
-
-
-def operator_distance_correlation(
-    mean_matrix: pd.DataFrame,
-    ch_names: List[str],
-    *,
-    k_laplacian: int = 4,
-    montage: str = "standard_1005",
-    distance_metric: str = "frobenius_normed",
-    n_probe_times: int = 2000,
-    n_probes: int = 8,
-    seed: int = 0,
-    n_permutations: int = 1_000,
-    n_bootstrap: int = 1_000,
-) -> OperatorDistanceResult:
-    """Test whether operator distance predicts cross-reference transfer gap.
-
-    For every linear operator (native, CAR, REST, CSD, cz_ref, lap_small,
-    lap_large) the exact C×C matrix is used. For median (non-linear), an
-    n_probes-averaged Gaussian-probe linear tangent is used. Pairwise
-    distances are then correlated with
-        gap_ij = diag_mean - 0.5*(M_ij + M_ji)
-    on the upper triangle. Bootstrap CIs over pairs and permutation p-values
-    over operator-label shuffles are reported because n=21 pairs at 7
-    operators (or 28 at 8) makes asymptotic Spearman/Pearson p-values
-    unreliable.
-
-    distance_metric:
-        'frobenius_normed' (default, v0.16+): scale-invariant distance.
-            Each operator is normalised to unit Frobenius norm before
-            differencing. THIS IS WHAT PAPER HEADLINE RESULTS SHOULD USE
-            when CSD is in the operator set, because raw Frobenius is
-            dominated by CSD's ~10^3x amplitude scale, not by spatial
-            topology.
-        'frobenius_raw' (v0.15 default; appendix only when CSD is present):
-            ||A_i - A_j||_F. Confounds topology with operator amplitude.
-
-    n_permutations and n_bootstrap default to 1000 in v0.16 (down from
-    10000 / 5000). For paper-ready CIs you may want to raise n_bootstrap
-    to 5000-10000, but for notebook/interactive use the lower defaults
-    give qualitatively identical results in <10s.
-
-    Not a Ben-David H-divergence bound: Frobenius distance is data-free; the
-    correlation with empirical transfer gap is a structural finding, not tight.
-    """
-    from scipy.stats import pearsonr, spearmanr
-
-    from refshift.reference import _resolve_alias
-
-    refs = [_resolve_alias(r) for r in mean_matrix.index]
-    if [_resolve_alias(c) for c in mean_matrix.columns] != refs:
-        raise ValueError("mean_matrix must be square with matching row/col order")
-    if distance_metric not in ("frobenius_raw", "frobenius_normed"):
-        raise ValueError(
-            f"Unknown distance_metric={distance_metric!r}. "
-            f"Use 'frobenius_raw' or 'frobenius_normed'."
-        )
-
-    need_rest = "rest" in refs
-    need_csd = "csd" in refs
-    graph = build_graph(
-        ch_names, k=k_laplacian, montage=montage,
-        include_rest=need_rest, include_csd=need_csd,
-    )
-
-    C = len(ch_names)
-    ops: Dict[str, np.ndarray] = {}
-    for r in refs:
-        exact = _exact_operator_matrix(r, graph, C)
-        if exact is not None:
-            ops[r] = exact
-        else:
-            # Currently only 'median' falls through; probe-estimated.
-            ops[r] = _estimate_linear_operator(
-                r, graph, n_times=n_probe_times, seed=seed, n_probes=n_probes,
-            )
-
-    n = len(refs)
-    D_op = _operator_distance_matrix(ops, refs, distance_metric)
-
-    M = mean_matrix.to_numpy().astype(np.float64)
-    Msym = 0.5 * (M + M.T)
-    diag_mean = float(np.diag(M).mean())
-    gap = diag_mean - Msym
-    np.fill_diagonal(gap, 0.0)
-
-    iu = np.triu_indices(n, k=1)
-    dist_flat = D_op[iu]
-    gap_flat = gap[iu]
-
-    r_s, p_s = spearmanr(dist_flat, gap_flat)
-    r_p, p_p = pearsonr(dist_flat, gap_flat)
-
-    rng = np.random.default_rng(seed)
-    n_pairs = len(dist_flat)
-    boot_rho = np.empty(n_bootstrap, dtype=np.float64)
-    boot_pear = np.empty(n_bootstrap, dtype=np.float64)
-    for b in range(n_bootstrap):
-        idx = rng.integers(0, n_pairs, size=n_pairs)
-        d_b, g_b = dist_flat[idx], gap_flat[idx]
-        if np.std(d_b) == 0 or np.std(g_b) == 0:
-            boot_rho[b] = np.nan
-            boot_pear[b] = np.nan
-            continue
-        boot_rho[b], _ = spearmanr(d_b, g_b)
-        boot_pear[b], _ = pearsonr(d_b, g_b)
-    valid_rho = boot_rho[~np.isnan(boot_rho)]
-    valid_pear = boot_pear[~np.isnan(boot_pear)]
-    ci_rho = (
-        (float(np.percentile(valid_rho, 2.5)), float(np.percentile(valid_rho, 97.5)))
-        if len(valid_rho) else (float("nan"), float("nan"))
-    )
-    ci_pear = (
-        (float(np.percentile(valid_pear, 2.5)), float(np.percentile(valid_pear, 97.5)))
-        if len(valid_pear) else (float("nan"), float("nan"))
-    )
-
-    # Permutation: shuffle operator labels of the symmetric gap matrix.
-    perm_count_s = 0
-    perm_count_p = 0
-    obs_abs_s = abs(r_s)
-    obs_abs_p = abs(r_p)
-    for _ in range(n_permutations):
-        perm = rng.permutation(n)
-        gap_perm = gap[np.ix_(perm, perm)]
-        gp = gap_perm[iu]
-        if np.std(gp) == 0:
-            continue
-        r_s_perm, _ = spearmanr(dist_flat, gp)
-        r_p_perm, _ = pearsonr(dist_flat, gp)
-        if abs(r_s_perm) >= obs_abs_s:
-            perm_count_s += 1
-        if abs(r_p_perm) >= obs_abs_p:
-            perm_count_p += 1
-    # Phipson-Smyth +1/+1 small-sample correction
-    perm_p_s = (perm_count_s + 1) / (n_permutations + 1)
-    perm_p_p = (perm_count_p + 1) / (n_permutations + 1)
-
+    print("\n[B] Per-test-ref view (which references are hardest to transfer INTO)")
     rows = []
-    for i, j in zip(*iu):
-        rows.append({
-            "ref_i": refs[i], "ref_j": refs[j],
-            "distance_frobenius": float(D_op[i, j]),
-            "transfer_gap": float(gap[i, j]),
-        })
-    pair_table = pd.DataFrame(rows)
+    for j, t in enumerate(present):
+        col = A[:, j]
+        matched = col[j]
+        mismatched = np.nanmean(np.delete(col, j))
+        rows.append({"test_ref": t, "matched_%": round(matched * 100, 1),
+                     "mismatched_%": round(mismatched * 100, 1),
+                     "gap_%": round((matched - mismatched) * 100, 1)})
+    print(pd.DataFrame(rows).sort_values("gap_%", ascending=False).to_string(index=False))
 
-    return OperatorDistanceResult(
-        references=refs,
-        distance_metric=distance_metric,
-        distances_frobenius=D_op,
-        transfer_gaps=gap,
-        spearman_rho=float(r_s), spearman_p=float(p_s),
-        pearson_r=float(r_p), pearson_p=float(p_p),
-        perm_p_spearman=float(perm_p_s), perm_p_pearson=float(perm_p_p),
-        ci95_spearman=ci_rho, ci95_pearson=ci_pear,
-        pair_table=pair_table,
-    )
+    S = mismatch_std_matrix(df).reindex(index=present, columns=present)
+    print("\n[C] Per-cell std over (subject, seed), %:")
+    print((S * 100).round(1).to_string())
+    print()
+    return M
 
 
-def plot_operator_distance_scatter(
-    result: OperatorDistanceResult,
-    out_path: Optional[str] = None,
-    *,
-    title: Optional[str] = None,
-    figsize: Tuple[float, float] = (6, 5),
-    dpi: int = 140,
-    annotate: bool = True,
-):
-    """Scatter operator distance vs transfer gap; returns the figure.
+def report_families(df, *, title, modes=REFERENCE_MODES, families=FAMILIES):
+    """Within-family transfer gaps and a cross-family transfer grid.
 
-    The x-axis label adapts to result.distance_metric so the plot is
-    self-describing for paper figures.
+    [A] for each family with >=2 members, the diagonal-vs-off gap inside the
+    family. [B] a family x family grid of mean transfer accuracy. Returns the
+    full accuracy matrix (percent).
     """
-    import matplotlib.pyplot as plt
+    present = [m for m in modes if m in df["train_ref"].unique()]
+    M = (df.groupby(["train_ref", "test_ref"])["accuracy"].mean()
+           .unstack("test_ref").reindex(index=present, columns=present)) * 100
 
-    df = result.pair_table
-    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
-    ax.scatter(df["distance_frobenius"], df["transfer_gap"], s=36, alpha=0.8)
-    if result.distance_metric == "frobenius_normed":
-        ax.set_xlabel(
-            r"Scale-normalized operator distance  "
-            r"$\|A_i/\|A_i\|_F - A_j/\|A_j\|_F\|_F$"
-        )
-    else:
-        ax.set_xlabel(r"Operator Frobenius distance  $\|A_i - A_j\|_F$")
-    ax.set_ylabel("Transfer gap  (diag - symmetric transfer)")
-    if title is None:
-        title = (
-            f"Operator distance vs transfer gap "
-            f"({result.distance_metric})\n"
-            f"Spearman rho = {result.spearman_rho:.3f}  "
-            f"(perm p = {result.perm_p_spearman:.3f})"
-        )
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
+    groups = {}
+    for name, members in families.items():
+        g = [m for m in members if m in present]
+        if g:
+            groups[name] = g
+    if "native" in present:
+        groups["native"] = ["native"]
 
-    if annotate:
-        for _, row in df.iterrows():
-            ax.annotate(
-                f"{row['ref_i']}-{row['ref_j']}",
-                xy=(row["distance_frobenius"], row["transfer_gap"]),
-                xytext=(3, 3), textcoords="offset points",
-                fontsize=7, alpha=0.7,
-            )
-
-    fig.tight_layout()
-    if out_path is not None:
-        fig.savefig(out_path, bbox_inches="tight", dpi=dpi)
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# 4. Paired Wilcoxon for jitter / LOFO experiments
-# ---------------------------------------------------------------------------
-
-def baseline_diagonal_view(baseline_df: pd.DataFrame) -> pd.DataFrame:
-    """Diagonal cells of a run_mismatch DataFrame: train_ref == test_ref.
-
-    Returns columns subject, seed, test_ref, accuracy. Compare a jitter
-    DataFrame against this for the "is jitter different from clean training"
-    test. Legacy 'laplacian' rows from v0.14 CSVs are resolved to 'lap_small'.
-    """
-    required = {"subject", "seed", "train_ref", "test_ref", "accuracy"}
-    missing = required - set(baseline_df.columns)
-    if missing:
-        raise ValueError(f"baseline_df missing columns: {sorted(missing)}")
-    baseline_df = _resolve_aliases_in_df(baseline_df)
-    diag = baseline_df[baseline_df["train_ref"] == baseline_df["test_ref"]]
-    return diag[["subject", "seed", "test_ref", "accuracy"]].reset_index(drop=True)
-
-
-def baseline_col_off_diag_view(baseline_df: pd.DataFrame) -> pd.DataFrame:
-    """Per (subject, seed, test_ref): mean accuracy across all train_ref != test_ref.
-
-    Compare a LOFO DataFrame against this: both sides are "model never saw
-    test_ref at training" — but the baseline saw exactly one alternative
-    reference, while LOFO saw 5. The Wilcoxon then tests whether
-    multi-reference training helps unseen-reference transfer. Legacy
-    'laplacian' rows from v0.14 CSVs are resolved to 'lap_small'.
-    """
-    required = {"subject", "seed", "train_ref", "test_ref", "accuracy"}
-    missing = required - set(baseline_df.columns)
-    if missing:
-        raise ValueError(f"baseline_df missing columns: {sorted(missing)}")
-    baseline_df = _resolve_aliases_in_df(baseline_df)
-    off = baseline_df[baseline_df["train_ref"] != baseline_df["test_ref"]]
-    return (
-        off.groupby(["subject", "seed", "test_ref"], as_index=False)["accuracy"]
-           .mean()
-    )
-
-
-def _holm_bonferroni(p_values: np.ndarray) -> np.ndarray:
-    """Holm-Bonferroni step-down. Returns adjusted p-values."""
-    p = np.asarray(p_values, dtype=float)
-    m = len(p)
-    if m == 0:
-        return p
-    order = np.argsort(p)
-    p_sorted = p[order]
-    multipliers = np.arange(m, 0, -1)
-    adjusted_sorted = np.minimum(1.0, p_sorted * multipliers)
-    adjusted_sorted = np.maximum.accumulate(adjusted_sorted)
-    out = np.empty_like(adjusted_sorted)
-    out[order] = adjusted_sorted
-    return out
-
-
-def paired_wilcoxon_per_test_ref(
-    df_a: pd.DataFrame,
-    df_b: pd.DataFrame,
-    *,
-    label_a: str = "A",
-    label_b: str = "B",
-    alternative: str = "two-sided",
-    correction: str = "holm",
-) -> pd.DataFrame:
-    """Per-test-ref paired Wilcoxon of accuracy_a - accuracy_b, Holm-corrected.
-
-    Both DataFrames need columns subject, seed, test_ref, accuracy. Inner-joined
-    on (subject, seed, test_ref); per test_ref the signed-rank test runs on the
-    paired differences. A 'pooled' row is appended (uncorrected — different
-    question: 'is there an overall effect' vs 'which test_refs differ').
-    """
-    from scipy.stats import wilcoxon
-
-    required = {"subject", "seed", "test_ref", "accuracy"}
-    for name, df in (("df_a", df_a), ("df_b", df_b)):
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"{name} missing columns: {sorted(missing)}")
-    if alternative not in ("two-sided", "greater", "less"):
-        raise ValueError(f"Unknown alternative: {alternative!r}")
-    if correction not in (None, "holm"):
-        raise ValueError(f"Unknown correction: {correction!r}")
-
-    merged = pd.merge(
-        df_a[["subject", "seed", "test_ref", "accuracy"]].rename(columns={"accuracy": "acc_a"}),
-        df_b[["subject", "seed", "test_ref", "accuracy"]].rename(columns={"accuracy": "acc_b"}),
-        on=["subject", "seed", "test_ref"], how="inner",
-    )
-    if merged.empty:
-        raise ValueError(
-            "After joining on (subject, seed, test_ref), no paired observations remain. "
-            "Check df_a and df_b cover the same subjects/seeds."
-        )
-    merged["delta"] = merged["acc_a"] - merged["acc_b"]
-
-    rows = []
-    for ref in sorted(merged["test_ref"].unique()):
-        sub = merged[merged["test_ref"] == ref]
-        n = len(sub)
-        if n == 0:
+    print("=" * 78)
+    print(title + "  -- family view")
+    print("=" * 78)
+    print("[A] Within-family transfer gap (diag - off), pp  [families with >=2 members]")
+    wrows = []
+    for name, g in groups.items():
+        if len(g) < 2:
             continue
-        if np.allclose(sub["delta"].to_numpy(), 0.0):
-            stat, p = 0.0, 1.0
-        else:
-            res = wilcoxon(
-                sub["acc_a"].to_numpy(), sub["acc_b"].to_numpy(),
-                alternative=alternative, zero_method="wilcox",
+        d = np.nanmean([M.loc[a, a] for a in g])
+        o = np.nanmean([M.loc[a, b] for a in g for b in g if a != b])
+        wrows.append({"family": name, "members": ",".join(g),
+                      "diag_%": round(d, 1), "off_%": round(o, 1),
+                      "gap_pp": round(d - o, 1)})
+    print(pd.DataFrame(wrows).to_string(index=False) if wrows else "  (none)")
+
+    print("\n[B] Cross-family mean transfer accuracy, %  (train-family -> test-family)")
+    fams = list(groups.keys())
+    grid = pd.DataFrame(index=fams, columns=fams, dtype=float)
+    for f1 in fams:
+        for f2 in fams:
+            grid.loc[f1, f2] = np.nanmean(
+                [M.loc[a, b] for a in groups[f1] for b in groups[f2]]
             )
-            stat, p = float(res.statistic), float(res.pvalue)
-        rows.append({
-            "test_ref": ref,
-            "n_pairs": int(n),
-            f"mean_{label_a}": float(sub["acc_a"].mean()),
-            f"mean_{label_b}": float(sub["acc_b"].mean()),
-            "median_delta": float(sub["delta"].median()),
-            "mean_delta": float(sub["delta"].mean()),
-            "wilcoxon_stat": stat,
-            "p_value": p,
-        })
+    print(grid.round(1).to_string())
+    print("  (rows = trained-on family, cols = tested-on family; "
+          "low off-diagonal = collapse)")
+    print()
+    return M
 
-    out = pd.DataFrame(rows)
-    if correction == "holm" and len(out) > 0:
-        out["p_adjusted"] = _holm_bonferroni(out["p_value"].to_numpy())
-    else:
-        out["p_adjusted"] = out["p_value"]
 
-    if np.allclose(merged["delta"].to_numpy(), 0.0):
-        pooled_stat, pooled_p = 0.0, 1.0
-    else:
-        res = wilcoxon(
-            merged["acc_a"].to_numpy(), merged["acc_b"].to_numpy(),
-            alternative=alternative, zero_method="wilcox",
-        )
-        pooled_stat, pooled_p = float(res.statistic), float(res.pvalue)
-    pooled_row = {
-        "test_ref": "pooled",
-        "n_pairs": int(len(merged)),
-        f"mean_{label_a}": float(merged["acc_a"].mean()),
-        f"mean_{label_b}": float(merged["acc_b"].mean()),
-        "median_delta": float(merged["delta"].median()),
-        "mean_delta": float(merged["delta"].mean()),
-        "wilcoxon_stat": pooled_stat,
-        "p_value": pooled_p,
-        "p_adjusted": pooled_p,
-    }
-    return pd.concat([out, pd.DataFrame([pooled_row])], ignore_index=True)
+def report_jitter_full(df, *, title, modes=REFERENCE_MODES):
+    """Per-test-reference accuracy of a full-jitter model, with an invariance
+    summary (mean, worst reference, spread). Returns the per-ref table."""
+    present = [m for m in modes if m in df["test_ref"].unique()]
+    g = df.groupby("test_ref")["accuracy"]
+    mean = g.mean().reindex(present)
+    std = g.std().reindex(present)
+    tbl = pd.DataFrame({
+        "test_ref": present,
+        "acc_%": (mean.values * 100).round(1),
+        "std_%": (std.values * 100).round(1),
+    }).sort_values("acc_%", ascending=False)
+
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+    print("Per-test-ref accuracy of the jitter-trained model, %:")
+    print(tbl.to_string(index=False))
+    a = mean.values
+    print("\n[A] Invariance summary")
+    print(f"    mean over test_refs = {np.nanmean(a) * 100:6.2f}%")
+    print(f"    worst test_ref      = {np.nanmin(a) * 100:6.2f}%"
+          f"  ({present[int(np.nanargmin(a))]})")
+    print(f"    spread (max - min)  = {(np.nanmax(a) - np.nanmin(a)) * 100:6.2f}%"
+          "  (smaller = more invariant)")
+    print()
+    return tbl
+
+
+def report_loro(df, *, title, modes=REFERENCE_MODES):
+    """Leave-one-reference-out: holdout_ref x test_ref matrix; diagonal is the
+    unseen-reference accuracy. Returns the matrix (percent)."""
+    present = [m for m in modes if m in df["holdout_ref"].unique()]
+    M = (df.groupby(["holdout_ref", "test_ref"])["accuracy"].mean()
+           .unstack("test_ref").reindex(index=present, columns=present))
+    A = M.to_numpy(dtype=float)
+    n = A.shape[0]
+
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+    print("Accuracy matrix (rows = holdout_ref, cols = test_ref), %:")
+    print((M * 100).round(1).to_string())
+    diag = np.diag(A)
+    off = A[~np.eye(n, dtype=bool)]
+    print("\n[A] Held-out-reference summary")
+    print(f"    diagonal mean (unseen ref)  = {np.nanmean(diag) * 100:6.2f}%")
+    print(f"    off-diag mean (in-mix refs) = {np.nanmean(off) * 100:6.2f}%")
+    print(f"    recovery gap                = "
+          f"{(np.nanmean(off) - np.nanmean(diag)) * 100:6.2f}%"
+          "  (cost of holding a ref out)")
+    print()
+    return M
+
+
+def report_lofo(df, *, title):
+    """Leave-one-family-out: holdout_family x test_family matrix.
+
+    Diagonal cells are the held-out (unseen) family's transfer; off-diagonal is
+    in-distribution. Returns the family x family matrix (percent).
+    """
+    M = (df.groupby(["holdout_family", "test_family"])["accuracy"].mean()
+           .unstack("test_family"))
+    order = list(dict.fromkeys(df["holdout_family"].tolist()))
+    rows = [f for f in order if f in M.index]
+    cols = rows + [f for f in M.columns if f not in rows]
+    M = (M.reindex(index=rows, columns=cols)) * 100
+    A = M.to_numpy(dtype=float)
+
+    print("=" * 78)
+    print(title + "  -- family view")
+    print("=" * 78)
+    print("Accuracy matrix (rows = held-out family, cols = test family), %:")
+    print(M.round(1).to_string())
+    diag = [A[i, i] for i in range(len(rows)) if i < A.shape[1] and not np.isnan(A[i, i])]
+    off = [A[i, j] for i in range(len(rows)) for j in range(A.shape[1])
+           if i != j and not np.isnan(A[i, j])]
+    held = float(np.nanmean(diag)) if diag else float("nan")
+    seen = float(np.nanmean(off)) if off else float("nan")
+    print("\n[A] Held-out-family summary")
+    print(f"    held-out family mean = {held:6.2f}%  (whole family unseen)")
+    print(f"    seen family mean     = {seen:6.2f}%  (in-distribution)")
+    print(f"    family recovery gap  = {seen - held:6.2f}%"
+          "  (smaller = better cross-family generalisation)")
+    print()
+    return M
