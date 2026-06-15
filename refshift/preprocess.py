@@ -161,10 +161,10 @@ def load_windows(
             "pick_channels", ch_names=list(s.channels), ordered=True,
         ))
     preprocessors.extend([
-        Preprocessor(_volts_to_microvolts, apply_on_array=False),
+        Preprocessor(_volts_to_microvolts, apply_on_array=True),
         Preprocessor("resample", sfreq=resample_hz),
         Preprocessor("filter", l_freq=l_freq, h_freq=h_freq),
-        Preprocessor(_zscore_per_channel, apply_on_array=False),
+        Preprocessor(_zscore_per_channel, apply_on_array=True),
     ])
     preprocess(dataset, preprocessors, n_jobs=1)
 
