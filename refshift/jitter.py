@@ -24,6 +24,7 @@ from refshift.references import (
     GRAPH_MODES,
     REFERENCE_MODES,
     DatasetGraph,
+    _zscore_trials,
     apply_reference,
 )
 
@@ -50,6 +51,9 @@ def _random_reference_op(
         by_mode.setdefault(m, []).append(i)
     for mode, idxs in by_mode.items():
         out_np[idxs] = apply_reference(X_np[idxs], mode, graph=graph)
+
+    # Per-trial z-score after referencing, matching the fixed-reference runner.
+    out_np = _zscore_trials(out_np)
 
     return torch.from_numpy(out_np).to(device, non_blocking=True), y
 

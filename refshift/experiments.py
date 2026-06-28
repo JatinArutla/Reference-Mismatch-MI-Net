@@ -24,8 +24,9 @@ calibrate_csp_lda
     no-op reference transformer changes nothing.
 
 Two data sources, on purpose:
-  * Deep nets use braindecode windows from preprocess.load_windows (bandpassed,
-    z-scored). References are applied to those windowed trials.
+  * Deep nets use braindecode windows from preprocess.load_windows (bandpassed
+    microvolts, not z-scored). References are applied to those windowed trials,
+    then per-trial z-score (see apply_reference_then_ea, zscore=True).
   * CSP+LDA uses MOABB's paradigm output directly, which is what the
     calibration check compares against.
 """
@@ -202,13 +203,14 @@ def run_mismatch(
             X_tr, y_tr, X_te, y_te = split_train_test(X, y, metadata, dataset_id)
             n_classes = int(max(y_tr.max(), y_te.max())) + 1
             X_te_by_ref = {
-                m: apply_reference_then_ea(X_te, m, graph=graph,
+                m: apply_reference_then_ea(X_te, m, graph=graph, zscore=True,
                                            apply_ea=apply_ea, ea_eps=ea_eps)
                 for m in modes
             }
             for train_ref in modes:
                 X_tr_ref = apply_reference_then_ea(
-                    X_tr, train_ref, graph=graph, apply_ea=apply_ea, ea_eps=ea_eps,
+                    X_tr, train_ref, graph=graph, zscore=True,
+                    apply_ea=apply_ea, ea_eps=ea_eps,
                 )
                 pipe = make_dl_model(
                     model=model_lc, n_channels=X_tr_ref.shape[1],
@@ -342,7 +344,10 @@ def run_mismatch_jitter(
             last_subject = subject
         X_tr, y_tr, X_te, y_te = split_train_test(X, y, metadata, dataset_id)
         n_classes = int(max(y_tr.max(), y_te.max())) + 1
-        X_te_by_ref = {m: apply_reference(X_te, m, graph=graph) for m in test_modes}
+        X_te_by_ref = {
+            m: apply_reference_then_ea(X_te, m, graph=graph, zscore=True)
+            for m in test_modes
+        }
 
         rng_seed = int(1_000_003 * int(seed) + 7919 * int(subject))
         ref_transform = make_random_reference_transform(
@@ -356,8 +361,8 @@ def run_mismatch_jitter(
             lr=dl_lr, device=dl_device, verbose=dl_verbose,
             transforms=[ref_transform],
         )
-        # Training data stays native; the transform re-references each sample at
-        # batch time, so we must NOT pre-reference here.
+        # Training data stays native; the transform re-references and z-scores
+        # each sample at batch time, so we must NOT pre-reference here.
         pipe.fit(X_tr, y_tr)
 
         for test_ref in test_modes:

@@ -9,6 +9,7 @@ from refshift.references import (
     REFERENCE_MODES,
     DatasetGraph,
     apply_reference,
+    build_graph,
     canonical_mode_tuple,
     euclidean_alignment,
 )
@@ -87,3 +88,17 @@ def test_ea_handles_empty_block():
     X = np.empty((0, 5, 100), dtype=np.float32)
     out = euclidean_alignment(X)
     assert out.shape == (0, 5, 100)
+
+
+def test_laplacian_neighbours_are_anatomical():
+    # The small Laplacian must pick each channel's true nearest neighbours on the
+    # IV-2a montage, not just subtract the mean of arbitrary indices.
+    pytest.importorskip("mne")
+    chans = ["Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1", "Cz",
+             "C2", "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz",
+             "P2", "POz"]
+    g = build_graph(chans)
+    idx = {c: i for i, c in enumerate(chans)}
+    neighbours = lambda c: {chans[j] for j in g.lap_small_idx[idx[c]]}
+    assert neighbours("Cz") == {"C1", "C2", "CPz", "FCz"}
+    assert neighbours("C3") == {"C1", "C5", "CP3", "FC3"}

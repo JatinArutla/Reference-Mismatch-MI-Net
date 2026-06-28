@@ -7,17 +7,20 @@ This is the whole deep-learning preprocessing pipeline, in order:
     3. volts -> microvolts          (MOABB returns volts; models expect uV)
     4. resample                     (to the dataset's rate, default 250 Hz)
     5. bandpass 8-32 Hz             (the motor-imagery mu/beta band)
-    6. per-channel z-score          (centre and scale each channel over time)
-    7. cut into trials              (one window per cue, labelled 0..K-1)
+    6. cut into trials              (one window per cue, labelled 0..K-1)
+
+The windows returned here are bandpassed microvolts: NOT z-scored and NOT yet
+referenced.
 
 Two ordering choices matter:
 
   * Filtering happens BEFORE the reference operator. References (CAR, Laplacian,
     ...) are applied later, to the windowed trials, so one preprocessed copy
     serves every reference.
-  * Standardisation is per-channel and does NOT commute with channel-mixing
-    references. We z-score here, then reference afterwards, identically for
-    every reference, which is what makes the mismatch matrix a fair comparison.
+  * Per-channel z-scoring is applied AFTER the reference, in the runner (see
+    references.apply_reference_then_ea with zscore=True). The operator therefore
+    acts on raw voltage and each channel is standardised afterwards, which is how
+    a real re-reference is applied and keeps the operator's effect intact.
 
 The preprocessed (X, y, metadata, sfreq, ch_names) tuple is cached to disk per
 (dataset, subject, pipeline-params), so repeated runs and multiple seeds reuse
@@ -49,19 +52,6 @@ BANDPASS_HIGH_HZ: float = 32.0
 def _volts_to_microvolts(data):
     """Scale V -> uV. Module-level (not a lambda) so braindecode can pickle it."""
     return data * 1e6
-
-
-def _zscore_per_channel(data, eps: float = 1e-7):
-    """Centre and scale each channel over time: (x - mean) / std, per channel.
-
-    ``data`` is one continuous recording (channels, time). ``eps`` floors the
-    divisor so a flat channel maps to zeros instead of NaN. Module-level so it
-    pickles for braindecode's Preprocessor.
-    """
-    data = np.asarray(data, dtype=np.float64)
-    mean = data.mean(axis=1, keepdims=True)
-    std = data.std(axis=1, keepdims=True)
-    return (data - mean) / np.maximum(std, eps)
 
 
 # ---------------------------------------------------------------------------
@@ -122,8 +112,8 @@ def load_windows(
 
     Returns
     -------
-    X : (n_trials, n_channels, n_times) float32, z-scored and bandpassed but
-        NOT yet referenced.
+    X : (n_trials, n_channels, n_times) float32, bandpassed microvolts, NOT
+        z-scored and NOT yet referenced.
     y : (n_trials,) int64, labels 0..K-1 in the dataset's canonical class order.
     metadata : DataFrame with 'session', 'run', 'subject' columns.
     sfreq : float, sampling rate after resampling.
@@ -138,6 +128,8 @@ def load_windows(
         "resample": resample_hz, "l_freq": float(l_freq), "h_freq": float(h_freq),
         "channels": list(s.channels) if s.channels else None,
         "classes": list(classes),
+        # windows are no longer z-scored here; this invalidates any old cache.
+        "zscore": False,
     }
     path = _cache_path(cache_dir, dataset_id, subject, params) if cache_dir else None
     if path and os.path.exists(path):
@@ -164,7 +156,6 @@ def load_windows(
         Preprocessor(_volts_to_microvolts, apply_on_array=True),
         Preprocessor("resample", sfreq=resample_hz),
         Preprocessor("filter", l_freq=l_freq, h_freq=h_freq),
-        Preprocessor(_zscore_per_channel, apply_on_array=True),
     ])
     preprocess(dataset, preprocessors, n_jobs=1)
 

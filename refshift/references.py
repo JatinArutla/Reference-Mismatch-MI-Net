@@ -407,21 +407,41 @@ def euclidean_alignment(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return _ea_apply(X, _ea_fit(X, eps=eps))
 
 
+def _zscore_trials(X: np.ndarray, eps: float = 1e-7) -> np.ndarray:
+    """Per-trial, per-channel z-score over time. (N, C, T) -> (N, C, T).
+
+    Standardises each channel of each trial independently, so there is no
+    train/test leakage. Used by the deep-learning runners to normalise *after*
+    the reference operator (the operator acts on raw voltage; channels are
+    standardised afterwards).
+    """
+    X = _check_3d(X)
+    mean = X.mean(axis=2, keepdims=True)
+    std = X.std(axis=2, keepdims=True)
+    return ((X - mean) / np.maximum(std, eps)).astype(np.float32)
+
+
 def apply_reference_then_ea(
     X: np.ndarray,
     mode: str,
     graph: Optional[DatasetGraph] = None,
     *,
+    zscore: bool = False,
     apply_ea: bool = False,
     ea_eps: float = 1e-12,
 ) -> np.ndarray:
-    """Apply the reference operator, then optionally Euclidean-align.
+    """Apply the reference operator, then optionally z-score and Euclidean-align.
 
-    With apply_ea=False this is just apply_reference. With apply_ea=True the
-    whitening is computed on the already-referenced trials, which is the
+    The order is reference -> (z-score) -> (EA). z-scoring sits after the
+    reference so the operator acts on raw voltage and each channel is
+    standardised afterwards, matching how a real re-reference is applied; the
+    deep-learning runners pass zscore=True, the CSP+LDA runner does not. With
+    apply_ea=True the whitening is computed on the resulting trials, which is the
     ordering that answers "does EA absorb the reference shift?"
     """
     Y = apply_reference(X, mode, graph=graph)
+    if zscore:
+        Y = _zscore_trials(Y)
     if apply_ea:
         Y = euclidean_alignment(Y, eps=ea_eps)
     return Y
