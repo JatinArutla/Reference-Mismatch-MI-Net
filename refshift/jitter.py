@@ -62,7 +62,6 @@ def make_random_reference_transform(
     allowed_modes: Sequence[str],
     *,
     graph: Optional[DatasetGraph] = None,
-    probability: float = 1.0,
     random_state: Optional[int] = None,
 ):
     """Build the braindecode Transform that re-references each training sample.
@@ -91,7 +90,7 @@ def make_random_reference_transform(
         operation = staticmethod(_random_reference_op)
 
         def __init__(self):
-            super().__init__(probability=probability, random_state=random_state)
+            super().__init__(probability=1.0, random_state=random_state)
             self._allowed_modes = allowed
             self._graph = graph
             self._mode_rng = np.random.default_rng(random_state)

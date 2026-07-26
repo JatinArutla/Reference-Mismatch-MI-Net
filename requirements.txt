@@ -1,20 +1,14 @@
-# Core (classical CSP+LDA path, references, analysis).
-# moabb pinned for reproducibility of the IV-2a CSP+LDA calibration (65.99%).
+# Pinned: the IV-2a CSP+LDA calibration target (65.99%) was verified on moabb
+# 1.5.0, and braindecode needs mne >= 1.11 to import its preprocessing classes.
 moabb==1.5.0
-mne>=1.5
+mne>=1.11
+braindecode>=1.0
+torch>=2.0
+skorch>=0.15
 pyriemann>=0.5
 scikit-learn>=1.3
 numpy>=1.24
 pandas>=2.0
 scipy>=1.10
 tqdm>=4.60
-matplotlib>=3.5
-
-# Testing
 pytest>=7.0
-
-# Deep-learning path (also an optional extra: pip install -e ".[dl]").
-# mne>=1.11 floor is required by braindecode's dynamic preprocessing imports.
-braindecode>=1.0
-torch>=2.0
-skorch>=0.15

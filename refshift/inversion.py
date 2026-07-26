@@ -28,23 +28,36 @@ from typing import List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from refshift.references import (
-    GRAPH_MODES,
-    REFERENCE_MODES,
-    apply_reference,
-    build_graph,
-)
+from refshift.references import GRAPH_MODES, REFERENCE_MODES, build_graph
 
 
 def operator_matrix(mode: str, graph, n_channels: int) -> np.ndarray:
-    """Recover the C x C matrix M with operator(x) = M @ x by feeding the identity.
+    """The C x C matrix M with operator(x) = M @ x, built in float64.
 
-    Feeding a batch whose single trial is the identity (channel c is the basis
-    vector at time c) returns M directly, since each operator acts as M @ x at
-    every time point. Linear operators only; 'median' has no fixed matrix.
+    Written out rather than recovered by pushing an identity through
+    apply_reference, which works in float32 and would leave the residuals here
+    at ~1e-7 -- the same order as the thresholds we test against.
+    test_inversion.py checks these agree with the real operators.
+    'median' is nonlinear and has no fixed matrix.
     """
-    eye = np.eye(n_channels, dtype=np.float32)[None]  # (1, C, C)
-    return apply_reference(eye, mode, graph=graph)[0].astype(np.float64)
+    C = int(n_channels)
+    if mode == "native":
+        return np.eye(C)
+    if mode == "car":
+        return np.eye(C) - np.ones((C, C)) / C
+    if mode == "rest":
+        return np.asarray(graph.rest_matrix, dtype=np.float64)
+    if mode == "cz_ref":
+        M = np.eye(C)
+        M[:, graph.cz_idx] -= 1.0          # every channel minus Cz; Cz -> 0
+        return M
+    if mode in ("lap_small", "lap_large"):
+        idx = graph.lap_small_idx if mode == "lap_small" else graph.lap_large_idx
+        M = np.eye(C)
+        for i, neighbours in enumerate(idx):
+            M[i, neighbours] -= 1.0 / len(neighbours)
+        return M
+    raise ValueError(f"No fixed matrix for mode {mode!r}")
 
 
 def contrast_recovery_report(

@@ -5,37 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "refshift"
 version = "1.0.0"
-description = "Reference-mismatch experiments for motor-imagery EEG decoding (BCI IV-2a)."
+description = "Reference-mismatch experiments for motor-imagery EEG decoding."
 requires-python = ">=3.10"
 dependencies = [
     # moabb pinned: the IV-2a CSP+LDA calibration target (65.99%) was verified
     # at this version. Loosen only after re-verifying the target.
     "moabb==1.5.0",
-    "mne>=1.5",
+    # braindecode builds its preprocessing classes from mne at import time and
+    # needs >=1.11. Every experiment loads data through braindecode.
+    "mne>=1.11",
+    "braindecode>=1.0",
+    "torch>=2.0",
+    "skorch>=0.15",
     "pyriemann>=0.5",
     "scikit-learn>=1.3",
     "numpy>=1.24",
     "pandas>=2.0",
     "scipy>=1.10",
     "tqdm>=4.60",
-    "matplotlib>=3.5",
 ]
 
 [project.optional-dependencies]
-# Deep-learning dependencies. Install with: pip install -e '.[dl]'
-# mne>=1.11 is REQUIRED here: braindecode builds its preprocessing classes
-# (Filter, Resample, ...) dynamically from mne at import time and needs >=1.11.
-# The base 'mne>=1.5' floor lets a resolver keep an older mne that braindecode
-# cannot import; pinning the floor here forces the upgrade.
-dl = [
-    "braindecode>=1.0",
-    "mne>=1.11",
-    "torch>=2.0",
-    "skorch>=0.15",
-]
-test = [
-    "pytest>=7.0",
-]
+test = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
 include = ["refshift*"]

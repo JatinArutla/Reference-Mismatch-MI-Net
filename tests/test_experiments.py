@@ -15,7 +15,8 @@ from refshift.references import REFERENCE_MODES
 def _fake_jitter_factory(calls):
     def fake_jitter(dataset_id, *, model, condition, holdout_ref="cz_ref",
                     reference_modes=None, test_reference_modes=None,
-                    seeds=(0,), subjects=None, progress=True, **kwargs):
+                    seeds=(0,), subjects=None, progress=True,
+                    results_dir=None, **kwargs):
         train = tuple(reference_modes)
         test = tuple(test_reference_modes) if test_reference_modes is not None else train
         calls.append({"dataset_id": dataset_id, "condition": condition,
@@ -57,7 +58,7 @@ def test_lofo_holds_out_whole_family(monkeypatch):
 
 def test_lofo_rejects_overlapping_families(monkeypatch):
     monkeypatch.setattr(experiments, "run_mismatch_jitter", _fake_jitter_factory([]))
-    with pytest.raises(ValueError, match="at most one family"):
+    with pytest.raises(ValueError, match="in two families"):
         experiments.run_lofo_matrix(
             "iv2a", model="shallow",
             families={"a": ["car"], "b": ["car", "median"]},
@@ -65,11 +66,11 @@ def test_lofo_rejects_overlapping_families(monkeypatch):
         )
 
 
-def test_loro_rejects_unknown_holdout(monkeypatch):
+def test_loro_rejects_unknown_reference(monkeypatch):
     monkeypatch.setattr(experiments, "run_mismatch_jitter", _fake_jitter_factory([]))
     with pytest.raises(ValueError):
         experiments.run_loro_matrix(
-            "iv2a", model="shallow", holdout_modes=("not_a_mode",), progress=False,
+            "iv2a", model="shallow", reference_modes=("not_a_mode",), progress=False,
         )
 
 

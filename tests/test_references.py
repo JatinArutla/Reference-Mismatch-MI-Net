@@ -19,9 +19,7 @@ def _graph(n_channels=22, cz_idx=9):
     idx = np.tile(np.arange(4), (n_channels, 1)).astype(np.int64)
     return DatasetGraph(
         ch_names=[f"c{i}" for i in range(n_channels)],
-        lap_small_idx=idx, lap_large_idx=idx,
-        k_small=4, k_large_skip=4, k_large_use=4,
-        montage="standard_1005", cz_idx=cz_idx,
+        lap_small_idx=idx, lap_large_idx=idx, cz_idx=cz_idx,
     )
 
 
@@ -86,18 +84,18 @@ def test_ea_whitens_to_identity():
 
 
 def test_ea_is_stable_on_rank_deficient_block():
-    # cz_ref / Laplacian operators make R_bar singular. The whitener must stay
-    # finite, drop the null direction (effective_rank < C), and not blow the
-    # zeroed channel up. This guards the rank-aware _ea_fit rewrite.
+    # Every linear operator except 'native' leaves R_bar rank-deficient (cz_ref
+    # zeroes a channel; car, rest and the Laplacians all have the constant
+    # vector in their null space). The whitener must stay finite and must not
+    # blow up the null directions.
     from refshift.references import _ea_fit
 
     rng = np.random.default_rng(1)
     X = rng.standard_normal((30, 6, 128)).astype(np.float32)
     X[:, 2, :] = 0.0  # a single-electrode reference zeroes one channel
 
-    W, diag = _ea_fit(X, return_diagnostics=True)
+    W = _ea_fit(X)
     assert np.isfinite(W).all()
-    assert diag["effective_rank"] == 5  # one direction dropped
     out = euclidean_alignment(X)
     assert np.isfinite(out).all()
     assert np.abs(out[:, 2, :]).max() < 1e-3  # zeroed channel stays zero

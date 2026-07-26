@@ -20,7 +20,7 @@ Two datasets need more than plain symlinking:
     mount, this raises a ``PermissionError`` on first access. We mirror
     the directory tree under writable ``$MNE_DATA`` with per-file symlinks,
     plus a monkey-patch of MOABB's ``download_by_subject`` to skip the
-    re-download step. See KNOWN_LIMITATIONS.md.
+    re-download step.
 
   - **Schirrmeister2017** has a two-subdirectory layout
     (``train/{N}.edf`` + ``test/{N}.edf``) which MOABB expects verbatim.
@@ -111,9 +111,10 @@ def setup_moabb_symlinks(
 
     Returns
     -------
-    dict of {dataset_id: n_new_symlinks}
-        Count of new symlinks created per dataset. 0 means either the
-        source wasn't present or the destination already had all files.
+    dict of {dataset_id: n_links_present}
+        How many linked files exist for each dataset afterwards. 0 means the
+        source was not found. This counts totals, not new links, so calling
+        twice is safe.
     """
     mne_data_path = Path(
         mne_data or os.environ.get("MNE_DATA") or "/kaggle/working/mne_data"
@@ -167,10 +168,10 @@ def setup_moabb_symlinks(
         for f in src_root.glob(entry["pattern"]):
             if _link(f, dst_root / f.name):
                 n_new += 1
-        counts[ds_id] = n_new
+        n_total = sum(1 for _ in dst_root.glob(entry["pattern"])) if dst_root.exists() else 0
+        counts[ds_id] = n_total
         if verbose:
-            n_existing = sum(1 for _ in dst_root.glob(entry["pattern"])) if dst_root.exists() else 0
-            print(f"  {ds_id}: +{n_new} new links ({n_existing} total at {dst_root})")
+            print(f"  {ds_id}: +{n_new} new links ({n_total} total at {dst_root})")
 
     return counts
 
@@ -413,14 +414,11 @@ def _setup_schirrmeister_symlinks(mne_data_path: Path, verbose: bool) -> int:
             if _link(f, dataset_folder / subdir / f.name):
                 n_new += 1
 
+    n_total = sum(1 for _ in dataset_folder.rglob("*.edf")) if dataset_folder.exists() else 0
     if verbose:
-        n_total = sum(
-            1 for _ in dataset_folder.rglob("*.edf")
-        ) if dataset_folder.exists() else 0
-        print(
-            f"  schirrmeister2017: +{n_new} new links ({n_total} total under {dataset_folder})"
-        )
-    return n_new
+        print(f"  schirrmeister2017: +{n_new} new links "
+              f"({n_total} total under {dataset_folder})")
+    return n_total
 
 
 
@@ -483,6 +481,7 @@ def setup_kaggle_env(
     symlink_datasets: Optional[list] = None,
     thread_cap: int = 1,
     verbose: bool = True,
+    require: bool = True,
 ) -> None:
     """One-call setup for Kaggle notebooks.
 
@@ -522,8 +521,18 @@ def setup_kaggle_env(
         print(f"thread cap     = {thread_cap}")
         print("Symlinking Kaggle input datasets into MOABB cache layout:")
 
-    setup_moabb_symlinks(
+    counts = setup_moabb_symlinks(
         datasets=symlink_datasets,
         mne_data=mne_data,
         verbose=verbose,
     )
+    # A missing Kaggle source used to be skipped silently, and MOABB would then
+    # download gigabytes over the network. Fail instead, unless asked not to.
+    if require and symlink_datasets is not None:
+        missing = [d for d in symlink_datasets if counts.get(d, 0) == 0]
+        if missing:
+            raise FileNotFoundError(
+                f"No symlinks created for {missing}. Attach the Kaggle dataset(s) "
+                f"or set REFSHIFT_<NAME>_ROOT. Refusing to let MOABB download. "
+                f"Pass require=False to override."
+            )

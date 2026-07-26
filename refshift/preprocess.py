@@ -1,30 +1,23 @@
-"""Turn a raw subject into windowed trials ready for a model.
+"""Turn a raw subject into windowed trials, and split them into train/test.
 
-This is the whole deep-learning preprocessing pipeline, in order:
+The pipeline, in order:
 
-    1. pick EEG channels            (drop EOG / stim)
-    2. [fixed channel subset]       (Schirrmeister only: 44 motor channels)
-    3. volts -> microvolts          (MOABB returns volts; models expect uV)
-    4. resample                     (to the dataset's rate, default 250 Hz)
-    5. bandpass 8-32 Hz             (the motor-imagery mu/beta band)
-    6. cut into trials              (one window per cue, labelled 0..K-1)
-
-The windows returned here are bandpassed microvolts: NOT z-scored and NOT yet
-referenced.
+    1. pick EEG channels        (drop EOG / EMG / stim)
+    2. [channel subset]         (Schirrmeister only: 44 motor channels)
+    3. volts -> microvolts      (MOABB stores volts; the models expect uV)
+    4. resample to 250 Hz
+    5. bandpass 8-32 Hz         (the motor-imagery mu/beta band)
+    6. cut one window per cue, labelled 0..K-1
 
 Two ordering choices matter:
 
-  * Filtering happens BEFORE the reference operator. References (CAR, Laplacian,
-    ...) are applied later, to the windowed trials, so one preprocessed copy
-    serves every reference.
-  * Per-channel z-scoring is applied AFTER the reference, in the runner (see
-    references.apply_reference_then_ea with zscore=True). The operator therefore
-    acts on raw voltage and each channel is standardised afterwards, which is how
-    a real re-reference is applied and keeps the operator's effect intact.
+  * Filtering happens BEFORE the reference operator, so one preprocessed copy
+    serves every reference. Operators are applied later, to the windows.
+  * Per-channel z-scoring happens AFTER the reference, in the runner. The
+    operator therefore acts on raw voltage, which is how a real re-reference is
+    applied. The windows returned here are NOT z-scored and NOT referenced.
 
-The preprocessed (X, y, metadata, sfreq, ch_names) tuple is cached to disk per
-(dataset, subject, pipeline-params), so repeated runs and multiple seeds reuse
-it instead of re-fetching and re-filtering.
+Results are cached to disk per subject, so extra seeds reuse them.
 """
 
 from __future__ import annotations
@@ -37,202 +30,133 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from refshift.datasets import (
-    classes_for,
-    make_braindecode_dataset,
-    spec,
-    split_strategy_for,
-)
+from refshift.datasets import classes_for, make_braindecode_dataset, spec
 
-# Default pipeline constants. resample is overridden per dataset by its spec.
-BANDPASS_LOW_HZ: float = 8.0
-BANDPASS_HIGH_HZ: float = 32.0
+BANDPASS_LOW_HZ = 8.0
+BANDPASS_HIGH_HZ = 32.0
 
 
 def _volts_to_microvolts(data):
-    """Scale V -> uV. Module-level (not a lambda) so braindecode can pickle it."""
+    """Module-level (not a lambda) so braindecode can pickle it."""
     return data * 1e6
 
 
-# ---------------------------------------------------------------------------
-# Disk cache for the preprocessed tensors
-# ---------------------------------------------------------------------------
-
 def _cache_path(cache_dir: str, dataset_id: str, subject: int, params: dict) -> str:
-    """<cache_dir>/<dataset_id>/sub-<NNN>/<hash>.npz"""
-    key = hashlib.sha1(
-        json.dumps(params, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()[:16]
+    key = hashlib.sha1(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
     subdir = os.path.join(cache_dir, dataset_id, f"sub-{int(subject):03d}")
     os.makedirs(subdir, exist_ok=True)
     return os.path.join(subdir, f"{key}.npz")
 
 
-def _load_cache(path: str):
-    try:
-        npz = np.load(path, allow_pickle=True)
-        metadata = pd.DataFrame({
-            "session": npz["meta_session"],
-            "run": npz["meta_run"],
-            "subject": npz["meta_subject"],
-        })
-        return (npz["X"], npz["y"], metadata,
-                float(npz["sfreq"].item()), list(npz["ch_names"]))
-    except Exception:
-        return None  # corrupt or missing: caller recomputes
-
-
-def _save_cache(path: str, X, y, metadata, sfreq, ch_names):
-    try:
-        np.savez(
-            path[:-len(".npz")],  # np.savez appends .npz
-            X=X, y=y, sfreq=np.float64(sfreq),
-            meta_session=metadata["session"].to_numpy(),
-            meta_run=metadata["run"].to_numpy(),
-            meta_subject=metadata["subject"].to_numpy(),
-            ch_names=np.asarray(ch_names, dtype=object),
-        )
-    except OSError:
-        pass  # cache is best-effort
-
-
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
-
 def load_windows(
     dataset_id: str,
     subject: int,
     *,
-    l_freq: float = BANDPASS_LOW_HZ,
-    h_freq: float = BANDPASS_HIGH_HZ,
     cache_dir: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, float, List[str]]:
-    """Preprocess one subject and return windowed trials.
+    """Preprocess one subject.
 
-    Returns
-    -------
-    X : (n_trials, n_channels, n_times) float32, bandpassed microvolts, NOT
-        z-scored and NOT yet referenced.
-    y : (n_trials,) int64, labels 0..K-1 in the dataset's canonical class order.
-    metadata : DataFrame with 'session', 'run', 'subject' columns.
-    sfreq : float, sampling rate after resampling.
-    ch_names : channel names matching axis 1 of X (graph must use this order).
+    Returns (X, y, metadata, sfreq, ch_names) where X is
+    (n_trials, n_channels, n_times) float32 bandpassed microvolts, y is
+    int64 labels in the dataset's canonical class order, and metadata has
+    'session' and 'run' columns. ch_names matches axis 1 of X, and the
+    neighbour graph must be built from that order.
     """
     s = spec(dataset_id)
     classes = classes_for(dataset_id)
-    resample_hz = float(s.resample_hz)
 
     params = {
-        "dataset_id": dataset_id.lower(), "subject": int(subject),
-        "resample": resample_hz, "l_freq": float(l_freq), "h_freq": float(h_freq),
+        "dataset": dataset_id.lower(), "subject": int(subject),
+        "resample": s.resample_hz, "band": [BANDPASS_LOW_HZ, BANDPASS_HIGH_HZ],
         "channels": list(s.channels) if s.channels else None,
         "classes": list(classes),
-        # windows are no longer z-scored here; this invalidates any old cache.
-        "zscore": False,
     }
     path = _cache_path(cache_dir, dataset_id, subject, params) if cache_dir else None
     if path and os.path.exists(path):
-        cached = _load_cache(path)
-        if cached is not None:
-            return cached
+        npz = np.load(path, allow_pickle=True)
+        metadata = pd.DataFrame({"session": npz["session"], "run": npz["run"]})
+        return (npz["X"], npz["y"], metadata,
+                float(npz["sfreq"]), list(npz["ch_names"]))
 
     from braindecode.preprocessing import (
-        Preprocessor,
-        create_windows_from_events,
-        preprocess,
+        Preprocessor, create_windows_from_events, preprocess,
     )
 
     dataset = make_braindecode_dataset(dataset_id, subject)
 
-    preprocessors = [Preprocessor("pick_types", eeg=True, meg=False, stim=False)]
-    # Fixed channel subset (Schirrmeister motor channels). ordered=True keeps
-    # the user-supplied order so the neighbour graph aligns with X's channels.
+    steps = [Preprocessor("pick_types", eeg=True, meg=False, stim=False)]
     if s.channels:
-        preprocessors.append(Preprocessor(
-            "pick_channels", ch_names=list(s.channels), ordered=True,
-        ))
-    preprocessors.extend([
+        # ordered=True keeps our order so the neighbour graph aligns with X.
+        steps.append(Preprocessor("pick_channels", ch_names=list(s.channels),
+                                  ordered=True))
+    steps += [
         Preprocessor(_volts_to_microvolts, apply_on_array=True),
-        Preprocessor("resample", sfreq=resample_hz),
-        Preprocessor("filter", l_freq=l_freq, h_freq=h_freq),
-    ])
-    preprocess(dataset, preprocessors, n_jobs=1)
+        Preprocessor("resample", sfreq=s.resample_hz),
+        Preprocessor("filter", l_freq=BANDPASS_LOW_HZ, h_freq=BANDPASS_HIGH_HZ),
+    ]
+    preprocess(dataset, steps, n_jobs=1)
 
     sfreq = float(dataset.datasets[0].raw.info["sfreq"])
-    for ds in dataset.datasets:
-        if ds.raw.info["sfreq"] != sfreq:
-            raise RuntimeError(
-                f"Inconsistent sfreq across runs for {dataset_id} subject "
-                f"{subject}: {sfreq} vs {ds.raw.info['sfreq']}"
-            )
     ch_names = list(dataset.datasets[0].raw.info["ch_names"])
 
-    # Map each class name to a stable integer in canonical order.
-    mapping = {name: i for i, name in enumerate(classes)}
     windows = create_windows_from_events(
-        dataset,
-        trial_start_offset_samples=0,
-        trial_stop_offset_samples=0,
-        preload=True,
-        mapping=mapping,
+        dataset, trial_start_offset_samples=0, trial_stop_offset_samples=0,
+        preload=True, mapping={name: i for i, name in enumerate(classes)},
     )
 
-    Xs: List[np.ndarray] = []
-    ys: List[int] = []
-    rows: List[dict] = []
-    for ds_wind in windows.datasets:
-        desc = ds_wind.description
-        sess = str(desc["session"]) if "session" in desc else "0"
-        run = str(desc["run"]) if "run" in desc else "0"
-        for i in range(len(ds_wind)):
-            x, label, _crop = ds_wind[i]
+    Xs, ys, sessions, runs = [], [], [], []
+    for ds in windows.datasets:
+        session = str(ds.description.get("session", "0"))
+        run = str(ds.description.get("run", "0"))
+        for i in range(len(ds)):
+            x, label, _ = ds[i]
             Xs.append(np.asarray(x, dtype=np.float32))
             ys.append(int(label))
-            rows.append({"session": sess, "run": run, "subject": int(subject)})
+            sessions.append(session)
+            runs.append(run)
 
     if not Xs:
-        raise RuntimeError(
-            f"No windows extracted for {dataset_id} subject {subject}. "
-            "Check the MOABB download / cache."
-        )
+        raise RuntimeError(f"No windows for {dataset_id} subject {subject}.")
 
-    X = np.stack(Xs).astype(np.float32, copy=False)
+    X = np.stack(Xs)
     y = np.array(ys, dtype=np.int64)
-    metadata = pd.DataFrame(rows)
+    metadata = pd.DataFrame({"session": sessions, "run": runs})
 
     if path:
-        _save_cache(path, X, y, metadata, sfreq, ch_names)
+        np.savez(path[:-4], X=X, y=y, sfreq=sfreq,
+                 session=metadata["session"].to_numpy(),
+                 run=metadata["run"].to_numpy(),
+                 ch_names=np.asarray(ch_names, dtype=object))
     return X, y, metadata, sfreq, ch_names
 
 
-def split_train_test(
-    X: np.ndarray, y: np.ndarray, metadata: pd.DataFrame, dataset_id: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split one subject into train/test using the dataset's strategy.
+def split_train_test(X, y, metadata, dataset_id):
+    """Split one subject into train and test, the way the dataset intends.
 
-    'session' datasets (iv2a, openbmi, cho2017, dreyer2023): first session is
-    train, the rest test. 'run' datasets (schirrmeister2017): first run
-    (e.g. '0train') is train, the rest ('1test') test.
+    iv2a and openbmi have two recording sessions: the first is train.
+    schirrmeister2017 has one session with a '0train' and a '1test' run.
+    dreyer2023 has one session with 2 calibration runs then 4 online runs;
+    the calibration runs are train.
+    cho2017 has a single session with a single run, so it cannot be split
+    this way at all and is not currently runnable.
     """
-    strategy = split_strategy_for(dataset_id)
+    key = dataset_id.lower()
 
-    if strategy == "session":
+    if key == "schirrmeister2017":
+        train = metadata["run"] == "0train"
+    elif key == "dreyer2023":
+        train = metadata["run"].str.contains("acquisition")
+    else:
         sessions = sorted(metadata["session"].unique())
         if len(sessions) < 2:
             raise RuntimeError(
-                f"{dataset_id}: expected >=2 sessions for a session split, "
-                f"found {sessions}."
+                f"{dataset_id}: needs two sessions to split, found {sessions}. "
+                "cho2017 has only one session and one run, so it has no "
+                "held-out block; use a different dataset."
             )
-        train_mask = (metadata["session"] == sessions[0]).to_numpy()
-    elif strategy == "run":
-        runs = sorted(metadata["run"].unique())
-        if len(runs) < 2:
-            raise RuntimeError(
-                f"{dataset_id}: expected >=2 runs for a run split, found {runs}."
-            )
-        train_mask = (metadata["run"] == runs[0]).to_numpy()
-    else:
-        raise ValueError(f"Unknown split strategy {strategy!r} for {dataset_id}")
+        train = metadata["session"] == sessions[0]
 
-    return X[train_mask], y[train_mask], X[~train_mask], y[~train_mask]
+    train = train.to_numpy()
+    if not train.any() or train.all():
+        raise RuntimeError(f"{dataset_id}: train/test split produced an empty side.")
+    return X[train], y[train], X[~train], y[~train]

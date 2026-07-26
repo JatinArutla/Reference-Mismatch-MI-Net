@@ -50,7 +50,6 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
-from sklearn.base import BaseEstimator, TransformerMixin
 
 # Canonical operator order. Any user-supplied set is sorted into this order so
 # matrices always have the same layout regardless of input ordering.
@@ -162,7 +161,7 @@ def _build_rest_matrix(
     pinvGa = np.linalg.pinv(Ga, rcond=1e-4)
     center = np.eye(C) - np.ones((C, C)) / C
     T = G @ pinvGa @ center
-    return np.ascontiguousarray(T, dtype=np.float32)
+    return np.ascontiguousarray(T, dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -174,24 +173,15 @@ class DatasetGraph:
     Fields
     ------
     ch_names       channel names, matching the channel axis of X.
-    lap_small_idx  (C, k_small) indices of each channel's k nearest neighbours.
-    lap_large_idx  (C, k_large_use) indices of the next ring of neighbours
-                   (ranks k_large_skip .. k_large_skip + k_large_use).
-    k_small        neighbour count for lap_small.
-    k_large_skip   how many nearest neighbours lap_large skips.
-    k_large_use    how many neighbours lap_large then averages.
-    montage        MNE standard montage name used for positions.
+    lap_small_idx  (C, k) indices of each channel's k nearest neighbours.
+    lap_large_idx  (C, k) indices of the next ring of neighbours out.
     rest_matrix    (C, C) REST operator, or None if not requested.
-    rest_cond      condition number of rest_matrix (diagnostic), or None.
-    cz_idx         index of 'Cz' in ch_names (IV-2a always has Cz).
+    rest_cond      condition number of rest_matrix (printed as a diagnostic).
+    cz_idx         index of 'Cz' in ch_names, or None if the montage has none.
     """
     ch_names: List[str]
     lap_small_idx: np.ndarray
     lap_large_idx: np.ndarray
-    k_small: int
-    k_large_skip: int
-    k_large_use: int
-    montage: str
     rest_matrix: Optional[np.ndarray] = field(default=None)
     rest_cond: Optional[float] = field(default=None)
     cz_idx: Optional[int] = field(default=None)
@@ -240,10 +230,6 @@ def build_graph(
         ch_names=list(ch_names),
         lap_small_idx=lap_small,
         lap_large_idx=lap_large,
-        k_small=k_small,
-        k_large_skip=k_large_skip,
-        k_large_use=k_large_use,
-        montage=montage,
         rest_matrix=rest_matrix,
         rest_cond=rest_cond,
         cz_idx=cz_idx,
@@ -330,24 +316,6 @@ def apply_reference(
     return _cz_ref(X, graph.cz_idx)
 
 
-class ReferenceTransformer(BaseEstimator, TransformerMixin):
-    """sklearn transformer wrapping apply_reference, for the CSP+LDA pipeline.
-
-    Stateless: fit does nothing, transform applies the operator. Sits at the
-    front of the pipeline so the reference is swappable per experiment.
-    """
-
-    def __init__(self, mode: str, graph: Optional[DatasetGraph] = None):
-        self.mode = mode
-        self.graph = graph
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        return apply_reference(X, self.mode, graph=self.graph)
-
-
 # ---------------------------------------------------------------------------
 # Euclidean Alignment (He & Wu 2020)
 # ---------------------------------------------------------------------------
@@ -360,12 +328,7 @@ class ReferenceTransformer(BaseEstimator, TransformerMixin):
 # released implementation.
 
 
-def _ea_fit(
-    X: np.ndarray,
-    rel_floor: float = 1e-6,
-    *,
-    return_diagnostics: bool = False,
-):
+def _ea_fit(X: np.ndarray, rel_floor: float = 1e-6) -> np.ndarray:
     """Estimate the EA whitener R_bar^{-1/2} from a block of trials.
 
     R_bar is the mean of per-trial sample covariances. Several reference
@@ -376,13 +339,9 @@ def _ea_fit(
     of being inverted. This is the numerically safe alternative to inverting a
     (near-)singular matrix; unlike a fixed absolute ridge it is scale-invariant
     and does not inject large whitening gains into null directions.
-
-    With return_diagnostics=True, also returns a dict with the effective rank
-    (directions kept) and the condition number over the kept directions, for
-    logging which operators are rank-deficient and how ill-conditioned they are.
     """
     X = _check_3d(X)
-    N, C, T = X.shape
+    N, C, _ = X.shape
     if N == 0:
         raise ValueError("cannot fit EA on an empty block")
 
@@ -399,19 +358,7 @@ def _ea_fit(
 
     inv_sqrt = np.zeros_like(evals)
     inv_sqrt[keep] = evals[keep] ** -0.5
-    R_inv_sqrt = (evecs * inv_sqrt) @ evecs.T
-
-    if not return_diagnostics:
-        return R_inv_sqrt
-
-    kept = evals[keep]
-    diagnostics = {
-        "n_channels": int(C),
-        "effective_rank": int(keep.sum()),
-        "cond": float(kept[-1] / kept[0]) if kept.size else float("inf"),
-        "lambda_max": lam_max,
-    }
-    return R_inv_sqrt, diagnostics
+    return (evecs * inv_sqrt) @ evecs.T
 
 
 def _ea_apply(X: np.ndarray, whitener: np.ndarray) -> np.ndarray:
@@ -458,7 +405,6 @@ def apply_reference_then_ea(
     *,
     zscore: bool = False,
     apply_ea: bool = False,
-    ea_rel_floor: float = 1e-6,
 ) -> np.ndarray:
     """Apply the reference operator, then optionally z-score and Euclidean-align.
 
@@ -473,5 +419,5 @@ def apply_reference_then_ea(
     if zscore:
         Y = _zscore_trials(Y)
     if apply_ea:
-        Y = euclidean_alignment(Y, rel_floor=ea_rel_floor)
+        Y = euclidean_alignment(Y)
     return Y
