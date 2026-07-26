@@ -151,7 +151,7 @@ def run_mismatch(
     seeds: Sequence[int] = (0,),
     reference_modes: Optional[Sequence[str]] = None,
     apply_ea: bool = False,
-    ea_eps: float = 1e-12,
+    ea_rel_floor: float = 1e-6,
     n_filters: int = 6,
     montage: str = "standard_1005",
     laplacian_k: int = 4,
@@ -204,13 +204,13 @@ def run_mismatch(
             n_classes = int(max(y_tr.max(), y_te.max())) + 1
             X_te_by_ref = {
                 m: apply_reference_then_ea(X_te, m, graph=graph, zscore=True,
-                                           apply_ea=apply_ea, ea_eps=ea_eps)
+                                           apply_ea=apply_ea, ea_rel_floor=ea_rel_floor)
                 for m in modes
             }
             for train_ref in modes:
                 X_tr_ref = apply_reference_then_ea(
                     X_tr, train_ref, graph=graph, zscore=True,
-                    apply_ea=apply_ea, ea_eps=ea_eps,
+                    apply_ea=apply_ea, ea_rel_floor=ea_rel_floor,
                 )
                 pipe = make_dl_model(
                     model=model_lc, n_channels=X_tr_ref.shape[1],
@@ -245,12 +245,12 @@ def run_mismatch(
         X_tr, y_tr, X_te, y_te = _moabb_split_csp(X, y, metadata, dataset_id)
         X_te_by_ref = {
             m: apply_reference_then_ea(X_te, m, graph=graph,
-                                       apply_ea=apply_ea, ea_eps=ea_eps)
+                                       apply_ea=apply_ea, ea_rel_floor=ea_rel_floor)
             for m in modes
         }
         for train_ref in modes:
             X_tr_ref = apply_reference_then_ea(
-                X_tr, train_ref, graph=graph, apply_ea=apply_ea, ea_eps=ea_eps,
+                X_tr, train_ref, graph=graph, apply_ea=apply_ea, ea_rel_floor=ea_rel_floor,
             )
             pipe = make_csp_lda_pipeline(reference_mode=None, n_filters=n_filters)
             pipe.fit(X_tr_ref, y_tr)

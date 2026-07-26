@@ -14,6 +14,90 @@ import pandas as pd
 from refshift.references import FAMILIES, REFERENCE_MODES
 
 
+# ---------------------------------------------------------------------------
+# Subject-level statistics
+#
+# The runners save one row per (subject, seed, ...). Seeds are repeated training
+# runs of the SAME subject, not independent observations, so they must be
+# averaged within subject before any across-subject statistic. The unit of
+# inference is the subject. These helpers produce the mean and bootstrap CI over
+# subjects that go in the paper, and the paired within-subject matched-vs-
+# mismatched contrast, instead of pooling (subject x seed) into one mean.
+# ---------------------------------------------------------------------------
+
+def per_subject_values(df, value_fn, *, metric="accuracy"):
+    """Collapse seeds within subject, then apply ``value_fn`` per subject.
+
+    ``value_fn(sub_df) -> float`` computes one scalar per subject from that
+    subject's seed-averaged cells (e.g. its matched-minus-mismatched gap).
+    Returns a Series indexed by subject. This is the object every across-subject
+    statistic below is built from.
+    """
+    per_cell = (
+        df.groupby(["subject", "train_ref", "test_ref"])[metric]
+          .mean()               # average seeds within subject
+          .reset_index()
+    )
+    return per_cell.groupby("subject").apply(value_fn)
+
+
+def bootstrap_ci(values, *, n_boot=10000, ci=95, seed=0):
+    """Mean and percentile bootstrap CI of a per-subject Series/array.
+
+    Resamples subjects (the inference unit) with replacement. Returns
+    (mean, lo, hi). With ~9 subjects the interval is wide on purpose; that
+    width is the honest uncertainty, not a defect to hide.
+    """
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    boot = rng.choice(v, size=(n_boot, v.size), replace=True).mean(axis=1)
+    lo, hi = np.percentile(boot, [(100 - ci) / 2, 100 - (100 - ci) / 2])
+    return float(v.mean()), float(lo), float(hi)
+
+
+def _matched_minus_mismatched(sub_df, *, metric="accuracy"):
+    """One subject's diagonal mean minus off-diagonal mean (the transfer gap)."""
+    M = sub_df.pivot(index="train_ref", columns="test_ref", values=metric)
+    refs = [r for r in M.index if r in M.columns]
+    M = M.reindex(index=refs, columns=refs).to_numpy(dtype=float)
+    off = ~np.eye(M.shape[0], dtype=bool)
+    return float(np.nanmean(np.diag(M)) - np.nanmean(M[off]))
+
+
+def transfer_gap_ci(df, *, metric="accuracy", n_boot=10000, ci=95, seed=0):
+    """Paired within-subject transfer gap with a bootstrap CI over subjects.
+
+    The transfer gap (matched minus mismatched) is computed per subject on that
+    subject's own seed-averaged matrix, so matched and mismatched are paired.
+    Returns dict(mean, lo, hi, n_subjects) in percent. This is the headline
+    number the paper reports for a run_mismatch table.
+    """
+    gaps = per_subject_values(
+        df, lambda d: _matched_minus_mismatched(d, metric=metric), metric=metric,
+    )
+    mean, lo, hi = bootstrap_ci(gaps, n_boot=n_boot, ci=ci, seed=seed)
+    return {
+        "mean": round(mean * 100, 2), "lo": round(lo * 100, 2),
+        "hi": round(hi * 100, 2), "n_subjects": int(gaps.notna().sum()),
+    }
+
+
+def report_transfer_gap(df, *, title, metric="accuracy", n_boot=10000, ci=95, seed=0):
+    """Print the subject-level transfer gap with its bootstrap CI. Returns the dict."""
+    r = transfer_gap_ci(df, metric=metric, n_boot=n_boot, ci=ci, seed=seed)
+    print("=" * 78)
+    print(title + "  -- subject-level transfer gap")
+    print("=" * 78)
+    print(f"    transfer gap = {r['mean']:.2f}%  "
+          f"[{ci}% CI {r['lo']:.2f}, {r['hi']:.2f}]  "
+          f"over n={r['n_subjects']} subjects (seeds averaged within subject)")
+    print()
+    return r
+
+
 def mismatch_matrix(df: pd.DataFrame, *, metric: str = "accuracy") -> pd.DataFrame:
     """Mean ``metric`` as a train_ref x test_ref table."""
     return df.groupby(["train_ref", "test_ref"])[metric].mean().unstack("test_ref")

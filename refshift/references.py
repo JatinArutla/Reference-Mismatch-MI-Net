@@ -360,15 +360,27 @@ class ReferenceTransformer(BaseEstimator, TransformerMixin):
 # released implementation.
 
 
-def _ea_fit(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+def _ea_fit(
+    X: np.ndarray,
+    rel_floor: float = 1e-6,
+    *,
+    return_diagnostics: bool = False,
+):
     """Estimate the EA whitener R_bar^{-1/2} from a block of trials.
 
-    R_bar is the mean of per-trial sample covariances. A tiny ridge (eps) is
-    added before the inverse square root so rank-reducing references (cz_ref,
-    the Laplacians) don't make the matrix power return complex/NaN values.
-    """
-    from scipy.linalg import fractional_matrix_power
+    R_bar is the mean of per-trial sample covariances. Several reference
+    operators are rank-reducing (cz_ref zeroes a channel; the Laplacians are
+    rank C-1), so R_bar is singular or nearly so. We whiten via a symmetric
+    eigendecomposition and truncate: eigen-directions whose eigenvalue is below
+    ``rel_floor * lambda_max`` are dropped from the inverse square root instead
+    of being inverted. This is the numerically safe alternative to inverting a
+    (near-)singular matrix; unlike a fixed absolute ridge it is scale-invariant
+    and does not inject large whitening gains into null directions.
 
+    With return_diagnostics=True, also returns a dict with the effective rank
+    (directions kept) and the condition number over the kept directions, for
+    logging which operators are rank-deficient and how ill-conditioned they are.
+    """
     X = _check_3d(X)
     N, C, T = X.shape
     if N == 0:
@@ -378,12 +390,28 @@ def _ea_fit(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     for i in range(N):
         cov[i] = np.cov(X[i].astype(np.float64))
     R_bar = cov.mean(axis=0)
+    R_bar = 0.5 * (R_bar + R_bar.T)  # symmetrise away fp asymmetry
 
-    if eps:
-        R_bar = R_bar + eps * np.eye(C, dtype=np.float64)
+    evals, evecs = np.linalg.eigh(R_bar)
+    lam_max = float(evals[-1]) if evals.size else 0.0
+    thresh = rel_floor * lam_max
+    keep = evals > thresh
 
-    R_inv_sqrt = fractional_matrix_power(R_bar, -0.5)
-    return np.real(R_inv_sqrt).astype(np.float64)
+    inv_sqrt = np.zeros_like(evals)
+    inv_sqrt[keep] = evals[keep] ** -0.5
+    R_inv_sqrt = (evecs * inv_sqrt) @ evecs.T
+
+    if not return_diagnostics:
+        return R_inv_sqrt
+
+    kept = evals[keep]
+    diagnostics = {
+        "n_channels": int(C),
+        "effective_rank": int(keep.sum()),
+        "cond": float(kept[-1] / kept[0]) if kept.size else float("inf"),
+        "lambda_max": lam_max,
+    }
+    return R_inv_sqrt, diagnostics
 
 
 def _ea_apply(X: np.ndarray, whitener: np.ndarray) -> np.ndarray:
@@ -395,16 +423,18 @@ def _ea_apply(X: np.ndarray, whitener: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
-def euclidean_alignment(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+def euclidean_alignment(X: np.ndarray, rel_floor: float = 1e-6) -> np.ndarray:
     """Euclidean-align a block of trials. Input/output (N, C, T) float32.
 
     Equivalent to _ea_apply(X, _ea_fit(X)): fit the whitener on this block and
-    apply it to the same block.
+    apply it to the same block. ``rel_floor`` sets the relative eigenvalue
+    threshold below which directions are dropped from the whitener (see
+    _ea_fit).
     """
     X = _check_3d(X)
     if X.shape[0] == 0:
         return X.copy()
-    return _ea_apply(X, _ea_fit(X, eps=eps))
+    return _ea_apply(X, _ea_fit(X, rel_floor=rel_floor))
 
 
 def _zscore_trials(X: np.ndarray, eps: float = 1e-7) -> np.ndarray:
@@ -428,7 +458,7 @@ def apply_reference_then_ea(
     *,
     zscore: bool = False,
     apply_ea: bool = False,
-    ea_eps: float = 1e-12,
+    ea_rel_floor: float = 1e-6,
 ) -> np.ndarray:
     """Apply the reference operator, then optionally z-score and Euclidean-align.
 
@@ -443,5 +473,5 @@ def apply_reference_then_ea(
     if zscore:
         Y = _zscore_trials(Y)
     if apply_ea:
-        Y = euclidean_alignment(Y, eps=ea_eps)
+        Y = euclidean_alignment(Y, rel_floor=ea_rel_floor)
     return Y

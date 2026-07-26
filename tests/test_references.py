@@ -77,11 +77,30 @@ def test_unknown_mode_raises():
 
 
 def test_ea_whitens_to_identity():
-    # After EA, the mean trial covariance should be ~ identity.
-    X = np.random.randn(20, 5, 100).astype(np.float32)
+    # After EA, the mean trial covariance should be ~ identity (full-rank case).
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((20, 5, 100)).astype(np.float32)
     out = euclidean_alignment(X)
     covs = np.stack([np.cov(out[i].astype(np.float64)) for i in range(out.shape[0])])
     assert np.allclose(covs.mean(axis=0), np.eye(5), atol=0.1)
+
+
+def test_ea_is_stable_on_rank_deficient_block():
+    # cz_ref / Laplacian operators make R_bar singular. The whitener must stay
+    # finite, drop the null direction (effective_rank < C), and not blow the
+    # zeroed channel up. This guards the rank-aware _ea_fit rewrite.
+    from refshift.references import _ea_fit
+
+    rng = np.random.default_rng(1)
+    X = rng.standard_normal((30, 6, 128)).astype(np.float32)
+    X[:, 2, :] = 0.0  # a single-electrode reference zeroes one channel
+
+    W, diag = _ea_fit(X, return_diagnostics=True)
+    assert np.isfinite(W).all()
+    assert diag["effective_rank"] == 5  # one direction dropped
+    out = euclidean_alignment(X)
+    assert np.isfinite(out).all()
+    assert np.abs(out[:, 2, :]).max() < 1e-3  # zeroed channel stays zero
 
 
 def test_ea_handles_empty_block():

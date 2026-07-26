@@ -26,13 +26,17 @@ Analysis:
 """
 
 from refshift.analysis import (
+    bootstrap_ci,
     mismatch_matrix,
     mismatch_std_matrix,
+    per_subject_values,
     report_families,
     report_jitter_full,
     report_lofo,
     report_loro,
     report_matrix,
+    report_transfer_gap,
+    transfer_gap_ci,
 )
 from refshift.experiments import (
     calibrate_csp_lda,
@@ -41,6 +45,7 @@ from refshift.experiments import (
     run_mismatch,
     run_mismatch_jitter,
 )
+from refshift.inversion import contrast_recovery_report, operator_matrix
 from refshift.kaggle import setup_kaggle_env, setup_moabb_symlinks
 from refshift.references import (
     FAMILIES,
@@ -70,6 +75,8 @@ __all__ = [
     "apply_reference",
     "build_graph",
     "euclidean_alignment",
+    "contrast_recovery_report",
+    "operator_matrix",
     # analysis
     "mismatch_matrix",
     "mismatch_std_matrix",
@@ -78,4 +85,9 @@ __all__ = [
     "report_jitter_full",
     "report_loro",
     "report_lofo",
+    # subject-level statistics
+    "per_subject_values",
+    "bootstrap_ci",
+    "transfer_gap_ci",
+    "report_transfer_gap",
 ]

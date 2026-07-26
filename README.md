@@ -12,7 +12,7 @@ a model invariant to the choice.
 
 ## Results
 
-Fill these in after running `notebooks/consolidated.ipynb`. Each is a mean over
+Fill these in after running `notebooks/refshift-decoder-clean.ipynb`. Each is a mean over
 subjects (and seeds, for the deep nets) on IV-2a.
 
 | Model        | Matched (diag) | Mismatched (off-diag) | Transfer gap |
@@ -38,8 +38,10 @@ refshift/
                   resample, bandpass, z-score, window. Disk-cached per subject.
                   Plus the train/test split (session- or run-based per dataset).
   references.py   The seven reference operators, their families, and Euclidean
-                  Alignment. The numerical core (kept verbatim from the
-                  original repo, annotated).
+                  Alignment (rank-aware whitening).
+  inversion.py    Operator-invertibility control: is each operator canonicalizable
+                  by re-referencing, and are its contrasts recoverable + how well
+                  conditioned (contrast_recovery_report). Data-free, algebraic.
   models.py       Model factories: CSP+LDA, ShallowConvNet, EEGNet, ATCNet.
   jitter.py       Per-sample reference-jitter data augmentation.
   experiments.py  run_mismatch, run_mismatch_jitter, run_loro_matrix,
@@ -48,8 +50,10 @@ refshift/
 tests/            Unit tests (datasets, operators, families, sweeps, reports).
 scripts/
   verify_equivalence.py  Diff the lean pipeline against the original repo.
+  inversion_control.py   Print the operator-invertibility table (IV-2a or --schirr).
 notebooks/
-  consolidated.ipynb     Runs every experiment end to end.
+  refshift-decoder-clean.ipynb        CSP+LDA / Shallow / EEGNet / ATCNet experiments.
+  reve-reference-mismatch-clean.ipynb REVE frozen-probe experiments.
 ```
 
 ### The seven references
@@ -72,7 +76,7 @@ target was verified at that version.
 
 ## Reproduce
 
-1. Open `notebooks/consolidated.ipynb`.
+1. Open `notebooks/refshift-decoder-clean.ipynb`.
 2. Section A: install the package (point `REFSHIFT_SRC` at the attached Kaggle
    dataset folder), then call `setup_kaggle_env()`. This sets `MNE_DATA` and
    thread caps and **symlinks your attached Kaggle datasets into MOABB's cache
