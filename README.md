@@ -86,14 +86,58 @@ Two loading quirks are load-bearing and documented in the code:
 
 ## Reading the output
 
-`report_matrix` prints two numbers that are easy to confuse:
+`report_matrix` prints five blocks.
 
 - `[A] pooled gap` pools every row, then takes diagonal minus off-diagonal.
-  Descriptive only, for reading structure in the matrix.
 - `[D] TRANSFER GAP` computes the gap per subject on that subject's own
   seed-averaged matrix, then bootstraps over subjects. Seeds are repeated runs
   of one subject, not independent samples, so they are averaged first. **This
-  is the number to report.**
+  is the number to report**, because it carries a confidence interval.
+
+In a balanced design `[A]` and `[D]` give the *same point estimate*: the mean of
+per-subject gaps is algebraically equal to the pooled gap. They are not redundant
+and they are not two competing numbers. If they ever disagree, a subject is
+missing cells, so treat a divergence as a data alarm.
+
+- `[B]` per-test-reference view, `[C]` per-cell spread, `[C2]` asymmetry. The
+  matrix is directional: on IV-2a, CSP+LDA transfers `native -> median` at 61.3%
+  and `median -> native` at 28.7%. `[C2]` reports the mean `|M - M^T|` and the
+  worst pair.
+
+Anchored gaps are a different estimator. `report_matrix` averages over all
+train-references; the depth and robustness experiments in the foundation-model
+notebooks train one probe on a single anchor reference. The two numbers are not
+expected to agree, and a mismatch between them is not an inconsistency.
+
+`report_loro` needs the full-jitter table to measure holdout cost correctly:
+
+```python
+report_loro(df_loro, title="LORO", full_jitter=df_jitter)
+```
+
+Without it you get `naive_cost_%`, which compares a held-out reference against
+the same model's other references and so conflates "we never trained on it" with
+"it is intrinsically harder". With it you also get `true_cost_%`, measured
+against the full-jitter model, which differs only in that one reference. On
+IV-2a the two orderings disagree: `lap_small` looks like the fourth-cheapest
+holdout under `naive_cost_%` and is the third most expensive under
+`true_cost_%`.
+
+## Standardisation
+
+The deep nets z-score per channel per trial after referencing; CSP+LDA does not,
+because it is covariance-based and calibrated against MOABB. That is the only
+pipeline difference between the two model families, and the two disagree most on
+`native`, where the shared common-mode component is largest. `run_mismatch` takes
+a `zscore` argument (defaulting to the per-family behaviour above) so you can test
+whether a result is about referencing or about standardisation:
+
+```python
+run_mismatch("iv2a", model="shallow", zscore=False, ...)
+```
+
+Overriding it writes to a separate results filename, so it cannot overwrite an
+existing sweep.
 
 ## Calibration
 

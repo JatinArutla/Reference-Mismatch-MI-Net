@@ -9,6 +9,11 @@ into matrices and print the summaries. Two kinds of number appear:
                 matrix, then bootstrapped over subjects. Seeds are repeated
                 runs of the same subject, not independent samples, so they are
                 averaged within subject first. This is the paper number.
+
+In a balanced design the two point estimates are algebraically identical: the
+mean of per-subject gaps equals the pooled gap. The transfer gap earns its place
+by carrying a confidence interval, not by differing. If the two ever disagree,
+some subject is missing cells -- treat a divergence as a data alarm.
 """
 
 from __future__ import annotations
@@ -106,6 +111,15 @@ def report_matrix(df, *, title, modes=REFERENCE_MODES):
     print("\n[C] Per-cell std over (subject, seed), %:")
     print((S * 100).round(1).to_string())
 
+    # Mismatch is directional: A->B and B->A need not cost the same. A large
+    # asymmetry says the operators are not simply "far apart" in one metric.
+    D = np.abs(A - A.T)
+    i, j = np.unravel_index(np.nanargmax(D), D.shape)
+    print(f"\n[C2] Asymmetry: mean |M - M^T| off-diagonal = {np.nanmean(D[off]) * 100:.2f}pp; "
+          f"largest pair {present[i]}->{present[j]} {A[i, j] * 100:.1f}% "
+          f"vs {present[j]}->{present[i]} {A[j, i] * 100:.1f}% "
+          f"({D[i, j] * 100:.1f}pp)")
+
     if {"subject", "train_ref", "test_ref"}.issubset(df.columns):
         r = transfer_gap_ci(df)
         print(f"\n[D] TRANSFER GAP (paper number) = {r['mean']:.2f}%  "
@@ -181,8 +195,15 @@ def report_jitter_full(df, *, title, modes=REFERENCE_MODES):
     return tbl
 
 
-def report_loro(df, *, title, modes=REFERENCE_MODES):
-    """Leave-one-reference-out: the diagonal is the unseen-reference accuracy."""
+def report_loro(df, *, title, modes=REFERENCE_MODES, full_jitter=None):
+    """Leave-one-reference-out: the diagonal is the unseen-reference accuracy.
+
+    Pass ``full_jitter`` (the run_mismatch_jitter table for condition='full') to
+    get the holdout cost measured properly. Comparing a held-out reference against
+    the same model's other references conflates "we never trained on it" with
+    "it is intrinsically harder"; the full-jitter model differs only in that one
+    reference, so it is the right baseline.
+    """
     present = [m for m in modes if m in df["holdout_ref"].unique()]
     M = (df.groupby(["holdout_ref", "test_ref"])["accuracy"].mean()
            .unstack("test_ref").reindex(index=present, columns=present))
@@ -199,13 +220,37 @@ def report_loro(df, *, title, modes=REFERENCE_MODES):
           f"{(np.nanmean(off) - np.nanmean(diag)) * 100:6.2f}%"
           "  (cost of holding a ref out)")
 
-    print("\n[B] Per-held-out-reference view (cost of never training on each ref)")
-    rows = [{"holdout_ref": h,
-             "unseen_acc_%": round(A[j, j] * 100, 1),
-             "in_mix_acc_%": round(np.nanmean(np.delete(A[j, :], j)) * 100, 1),
-             "cost_%": round((np.nanmean(np.delete(A[j, :], j)) - A[j, j]) * 100, 1)}
-            for j, h in enumerate(present)]
-    print(pd.DataFrame(rows).sort_values("cost_%", ascending=False).to_string(index=False))
+    print("\n[B] Per-held-out-reference view")
+    base = None
+    if full_jitter is not None:
+        base = full_jitter.groupby("test_ref")["accuracy"].mean()
+    rows = []
+    for j, h in enumerate(present):
+        in_mix = np.nanmean(np.delete(A[j, :], j))
+        row = {"holdout_ref": h, "unseen_acc_%": round(A[j, j] * 100, 1),
+               "in_mix_acc_%": round(in_mix * 100, 1),
+               "naive_cost_%": round((in_mix - A[j, j]) * 100, 1)}
+        if base is not None and h in base.index:
+            row["true_cost_%"] = round((base[h] - A[j, j]) * 100, 1)
+        rows.append(row)
+    table = pd.DataFrame(rows)
+    sort_key = "true_cost_%" if "true_cost_%" in table else "naive_cost_%"
+    print(table.sort_values(sort_key, ascending=False).to_string(index=False))
+    if base is None:
+        print("  naive_cost_% mixes holdout cost with intrinsic difficulty; pass "
+              "full_jitter= for true_cost_%.")
+
+    # A reference that drags the mix down shows up as a HIGH in-mix mean when it
+    # is the one held out. Silence here means every reference pulls its weight.
+    if base is not None:
+        overall = float(base.mean())
+        worst = max(range(len(present)),
+                    key=lambda j: np.nanmean(np.delete(A[j, :], j)))
+        lift = (np.nanmean(np.delete(A[worst, :], worst)) - overall) * 100
+        print(f"\n[C] Mix quality: holding out {present[worst]!r} raises the other "
+              f"references by {lift:+.1f}pp vs the full mix ({overall * 100:.1f}%). "
+              "A large positive value means that reference is a distractor, not an "
+              "augmentation.")
     print()
     return M
 

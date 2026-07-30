@@ -121,6 +121,7 @@ def run_mismatch(
     seeds: Sequence[int] = (0,),
     reference_modes: Optional[Sequence[str]] = None,
     apply_ea: bool = False,
+    zscore: Optional[bool] = None,
     max_epochs: int = 200,
     batch_size: int = 32,
     progress: bool = True,
@@ -132,13 +133,21 @@ def run_mismatch(
     ``model`` is 'csp_lda', 'shallow', 'eegnet' or 'atcnet'. With apply_ea=True
     each block is Euclidean-aligned after referencing. CSP+LDA is
     deterministic, so pass a single seed for it.
+
+    ``zscore`` defaults to True for the deep nets and False for CSP+LDA, which
+    is the only pipeline difference between them. Set it explicitly to test
+    whether a result is about referencing or about standardisation -- the two
+    model families disagree most on 'native', where the shared common-mode
+    component is largest.
     """
     model = model.lower()
     is_dl = model != "csp_lda"
     if is_dl and model not in SUPPORTED_DL_MODELS:
         raise ValueError(f"Unknown model {model!r}; use 'csp_lda' or {SUPPORTED_DL_MODELS}")
 
-    name = f"{dataset_id}_{model}_{'EA' if apply_ea else 'noEA'}"
+    zscore = is_dl if zscore is None else bool(zscore)
+    name = (f"{dataset_id}_{model}_{'EA' if apply_ea else 'noEA'}"
+            + ("" if zscore == is_dl else f"_zscore{int(zscore)}"))
     path = _cache_path(results_dir, name)
     cached = _load_cached(path, name)
     if cached is not None:
@@ -167,13 +176,13 @@ def run_mismatch(
         X_tr, y_tr, X_te, y_te = split_train_test(X, y, metadata, dataset_id)
         n_classes = int(max(y_tr.max(), y_te.max())) + 1
         X_te_by_ref = {
-            m: apply_reference_then_ea(X_te, m, graph=graph, zscore=is_dl,
+            m: apply_reference_then_ea(X_te, m, graph=graph, zscore=zscore,
                                        apply_ea=apply_ea)
             for m in modes
         }
         for train_ref in modes:
             X_tr_ref = apply_reference_then_ea(
-                X_tr, train_ref, graph=graph, zscore=is_dl, apply_ea=apply_ea)
+                X_tr, train_ref, graph=graph, zscore=zscore, apply_ea=apply_ea)
 
             if is_dl:
                 pipe = make_dl_model(

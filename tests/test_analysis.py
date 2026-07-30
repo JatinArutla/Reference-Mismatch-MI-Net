@@ -75,3 +75,45 @@ def test_report_lofo_family_matrix():
     M = report_lofo(df, title="t")
     assert M.shape == (3, 3)
     assert list(M.index) == ["global", "single", "spatial"]
+
+
+def test_report_loro_true_cost_uses_the_full_jitter_baseline():
+    # A reference can be intrinsically hard AND cheap to hold out. The naive cost
+    # confuses the two; the full-jitter baseline separates them.
+    rng = np.random.default_rng(3)
+    loro = pd.DataFrame([
+        {"subject": s, "holdout_ref": h, "test_ref": te,
+         "accuracy": (0.50 if te == h else 0.62) + rng.normal(0, 0.005)}
+        for s in (1, 2) for h in REFERENCE_MODES for te in REFERENCE_MODES
+    ])
+    # native is hard for everyone, not just when held out
+    full = pd.DataFrame([
+        {"subject": s, "test_ref": te,
+         "accuracy": (0.51 if te == "native" else 0.62) + rng.normal(0, 0.005)}
+        for s in (1, 2) for te in REFERENCE_MODES
+    ])
+    report_loro(loro, title="t", full_jitter=full)
+    A = report_loro(loro, title="t").to_numpy(dtype=float)
+    j = list(REFERENCE_MODES).index("native")
+    naive = np.nanmean(np.delete(A[j, :], j)) - A[j, j]
+    true_cost = 0.51 - A[j, j]
+    assert true_cost < naive, "true cost must strip out intrinsic difficulty"
+
+
+def test_report_matrix_reports_asymmetry():
+    # A -> B and B -> A can differ; nothing used to surface that.
+    rng = np.random.default_rng(4)
+    rows = []
+    for s in (1, 2, 3):
+        for tr in REFERENCE_MODES:
+            for te in REFERENCE_MODES:
+                acc = 0.70 if tr == te else (0.60 if tr == "native" else 0.35)
+                rows.append({"subject": s, "seed": 0, "train_ref": tr,
+                             "test_ref": te, "accuracy": acc + rng.normal(0, 0.005)})
+    M = report_matrix(pd.DataFrame(rows), title="t").to_numpy(dtype=float)
+    D = np.abs(M - M.T)
+    # only the native row/column is asymmetric here, so check the worst pair
+    # rather than the mean, which the 36 symmetric pairs dilute.
+    i, j = np.unravel_index(np.nanargmax(D), D.shape)
+    assert "native" in (REFERENCE_MODES[i], REFERENCE_MODES[j])
+    assert D[i, j] > 0.20
